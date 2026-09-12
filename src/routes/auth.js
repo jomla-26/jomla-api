@@ -3,7 +3,7 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, generateOtp, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
-import { signToken } from "../middleware/auth.js";
+import { signToken, authenticate } from "../middleware/auth.js";
 
 export const authRouter = Router();
 
