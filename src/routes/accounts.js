@@ -6,7 +6,52 @@ import { authenticate, requirePermission } from "../middleware/auth.js";
 import { queueNotification } from "../lib/notify.js";
 
 export const accountsRouter = Router();
+
+const registerSchema = z.object({
+  businessName: z.string().min(2),
+  phone: z.string().min(9),
+  address: z.string().optional(),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+  ownerName: z.string().optional(),
+  contactPerson: z.string().optional(),
+});
+
+accountsRouter.post("/:kind/register", asyncRoute(async (req, res) => {
+  const cfg = assertKind(req.params.kind);
+  const body = registerSchema.parse(req.body);
+  const phone = normalizePhone(body.phone);
+
+  const created = await withTransaction(async (client) => {
+    const dup = await client.query(`SELECT id FROM ${cfg.table} WHERE phone = $1`, [phone]);
+    if (dup.rows.length) throw new ApiError(409, "رقم الهاتف مسجّل مسبقًا");
+
+    const columns = req.params.kind === "customer"
+      ? { extra: "owner_name", value: body.ownerName ?? null }
+      : { extra: "contact_person", value: body.contactPerson ?? null };
+
+    const { rows } = await client.query(
+      `INSERT INTO ${cfg.table}
+         (business_name, phone, address, latitude, longitude, status, joined_via, ${columns.extra})
+       VALUES ($1,$2,$3,$4,$5,'pending','self',$6)
+       RETURNING *`,
+      [body.businessName, phone, body.address ?? null, body.latitude ?? null, body.longitude ?? null, columns.value]
+    );
+    const row = rows[0];
+
+    await writeAudit(client, {
+      actorType: req.params.kind, actorId: row.id, actorName: body.businessName,
+      action: `${req.params.kind}.self_registered`, entityType: req.params.kind, entityId: row.id,
+      entityLabel: body.businessName, after: row, ip: req.ip,
+    });
+    return row;
+  });
+
+  res.status(201).json(created);
+}));
+
 accountsRouter.use(authenticate);
+
 
 const ENTITY = {
   customer: { table: "customers", sectionTable: "customer_sections", idCol: "customer_id" },
