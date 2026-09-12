@@ -102,7 +102,7 @@ authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
   res.json({ token, actor: { id: user.id, type: accountType, name: user.name, role } });
 }));
 
-authRouter.get("/me", asyncRoute(async (req, res) => {
+authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
   if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
 
   if (req.actor.type === "customer") {
