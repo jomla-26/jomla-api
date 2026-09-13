@@ -15,6 +15,7 @@ const registerSchema = z.object({
   longitude: z.number().min(-180).max(180).optional(),
   ownerName: z.string().optional(),
   contactPerson: z.string().optional(),
+  businessTypes: z.array(z.string()).optional(),
 });
 
 accountsRouter.post("/:kind/register", asyncRoute(async (req, res) => {
