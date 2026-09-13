@@ -100,6 +100,104 @@ accountsRouter.get("/:kind", requirePermission("accounts.approve"), asyncRoute(a
   res.json(withSections);
 }));
 
+const updateSchema = z.object({
+  businessName: z.string().min(2).optional(),
+  phone: z.string().min(9).optional(),
+  address: z.string().optional(),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+  businessTypes: z.array(z.string()).optional(),
+  ownerName: z.string().optional(),
+  contactPerson: z.string().optional(),
+  paymentTerms: z.string().optional(),
+});
+
+accountsRouter.patch("/:kind/:id", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
+  const cfg = assertKind(req.params.kind);
+  const body = updateSchema.parse(req.body);
+
+  if (Object.keys(body).length === 0) {
+    throw new ApiError(400, "لا توجد بيانات للتعديل");
+  }
+
+  const result = await withTransaction(async (client) => {
+    const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
+
+    if (body.phone) {
+      const normalized = normalizePhone(body.phone);
+      const dup = await client.query(
+        `SELECT id FROM ${cfg.table} WHERE phone = $1 AND id != $2`,
+        [normalized, req.params.id]
+      );
+      if (dup.rows.length) throw new ApiError(409, "رقم الهاتف مسجّل مسبقًا لحساب آخر");
+      body.phone = normalized;
+    }
+
+    const fieldMap = {
+      businessName: "business_name",
+      phone: "phone",
+      address: "address",
+      latitude: "latitude",
+      longitude: "longitude",
+      businessTypes: "business_types",
+      ownerName: "owner_name",
+      contactPerson: "contact_person",
+      paymentTerms: "payment_terms",
+    };
+
+    const setClauses = [];
+    const values = [req.params.id];
+    let i = 2;
+    for (const [key, col] of Object.entries(fieldMap)) {
+      if (body[key] !== undefined) {
+        setClauses.push(`${col} = $${i}`);
+        values.push(body[key]);
+        i++;
+      }
+    }
+
+    const { rows } = await client.query(
+      `UPDATE ${cfg.table} SET ${setClauses.join(", ")} WHERE id = $1 RETURNING *`,
+      values
+    );
+    const updated = rows[0];
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: `${req.params.kind}.updated`, entityType: req.params.kind, entityId: req.params.id,
+      entityLabel: updated.business_name, before: before.rows[0], after: updated, ip: req.ip,
+    });
+
+    return { ...updated, sections: await fetchSections(client, cfg, req.params.id) };
+  });
+
+  res.json(result);
+}));
+
+accountsRouter.delete("/:kind/:id", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
+  const cfg = assertKind(req.params.kind);
+
+  const result = await withTransaction(async (client) => {
+    const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
+
+    const { rows } = await client.query(
+      `UPDATE ${cfg.table} SET status = 'deleted' WHERE id = $1 RETURNING id, business_name, status`,
+      [req.params.id]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: `${req.params.kind}.deleted`, entityType: req.params.kind, entityId: req.params.id,
+      entityLabel: before.rows[0].business_name, before: before.rows[0], after: rows[0], ip: req.ip,
+    });
+    return rows[0];
+  });
+
+  res.json(result);
+}));
+
 accountsRouter.get("/:kind/:id", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
   const cfg = assertKind(req.params.kind);
   const { rows } = await query(`SELECT * FROM ${cfg.table} WHERE id = $1`, [req.params.id]);
