@@ -33,10 +33,15 @@ accountsRouter.post("/:kind/register", asyncRoute(async (req, res) => {
 
     const { rows } = await client.query(
       `INSERT INTO ${cfg.table}
-         (business_name, phone, address, latitude, longitude, status, joined_via, ${columns.extra})
-       VALUES ($1,$2,$3,$4,$5,'pending','self',$6)
+              (business_name, phone,
+               address, latitude, longitude, status,
+               joined_via, business_types, ${columns.extra})
+
+            VALUES ($1,$2,$3,$4,$5,'pending','self',$6,$7)
        RETURNING *`,
-      [body.businessName, phone, body.address ?? null, body.latitude ?? null, body.longitude ?? null, columns.value]
+             [body.businessName, phone,
+              body.address ?? null, body.latitude ?? null, body.longitude ?? null,
+              body.businessTypes ?? null, columns.value]
     );
     const row = rows[0];
 
