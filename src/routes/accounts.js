@@ -82,15 +82,16 @@ async function fetchSections(client, cfg, entityId) {
 
 accountsRouter.get("/:kind", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
   const cfg = assertKind(req.params.kind);
-  const { status, search } = req.query;
+  const { status, search, includeDeleted } = req.query;
 
   const nameCol = req.params.kind === "customer" ? "business_name" : "business_name";
   const { rows } = await query(
     `SELECT * FROM ${cfg.table}
       WHERE ($1::TEXT IS NULL OR status = $1)
+        AND ($3::BOOLEAN = TRUE OR status != 'deleted' OR $1 = 'deleted')
         AND ($2::TEXT IS NULL OR ${nameCol} ILIKE '%'||$2||'%' OR phone ILIKE '%'||$2||'%')
       ORDER BY created_at DESC`,
-    [status || null, search || null]
+    [status || null, search || null, includeDeleted === "true"]
   );
 
   const withSections = await Promise.all(
