@@ -183,7 +183,7 @@ accountsRouter.delete("/:kind/:id", requirePermission("accounts.approve"), async
     if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
 
     const { rows } = await client.query(
-      `UPDATE ${cfg.table} SET status = 'deleted' WHERE id = $1 RETURNING id, business_name, status`,
+            `UPDATE ${cfg.table} SET status = 'suspended' WHERE id = $1 RETURNING id, business_name, status`,
       [req.params.id]
     );
 
