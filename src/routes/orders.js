@@ -327,6 +327,60 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
   res.json(result);
 }));
 
+// تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
+orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const { orderIds, status, note } = z.object({
+    orderIds: z.array(z.string().uuid()).min(1),
+    status: z.string(),
+    note: z.string().optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const updated = [];
+    const skipped = [];
+
+    for (const orderId of orderIds) {
+      const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
+      if (!rows.length) { skipped.push({ orderId, reason: "غير موجودة" }); continue; }
+      const order = rows[0];
+
+      if (["delivered", "cancelled", "closed"].includes(order.status)) {
+        skipped.push({ orderId, orderNumber: order.order_number, reason: "مغلقة أو ملغاة" });
+        continue;
+      }
+      if (order.status === status) {
+        skipped.push({ orderId, orderNumber: order.order_number, reason: "بالفعل في هذه الحالة" });
+        continue;
+      }
+
+      const { rows: [u] } = await client.query(
+        `UPDATE orders SET status = $2 WHERE id = $1 RETURNING *`, [orderId, status]
+      );
+      await recordStatus(client, { orderId, from: order.status, to: status, actor: req.actor, note });
+      await writeAudit(client, {
+        actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+        action: "order.status_changed", entityType: "order", entityId: orderId,
+        entityLabel: order.order_number, before: order, after: u, ip: req.ip,
+      });
+      await queueNotification(client, {
+        templateCode: "order.status", recipientType: "customer",
+        recipientId: order.customer_id, orderId,
+        vars: { order_number: order.order_number, status },
+      });
+      updated.push(u);
+    }
+
+    return { updated, skipped };
+  });
+
+  res.json({
+    updatedCount: result.updated.length,
+    skippedCount: result.skipped.length,
+    updated: result.updated,
+    skipped: result.skipped,
+  });
+}));
+
 orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const body = z.object({
     items: z.array(z.object({
