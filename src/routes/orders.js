@@ -16,6 +16,30 @@ async function recordStatus(client, { orderId, orderSupplierId = null, from, to,
     [orderId, orderSupplierId, from, to, actor.id, actor.name, note]
   );
 }
+// إعادة حساب إجمالي كل جزء (مورد) وإجمالي الطلبية كاملة بعد أي تعديل على الأصناف
+async function recalcOrderTotals(client, orderId) {
+  await client.query(
+    `UPDATE order_suppliers os SET subtotal = sub.total
+       FROM (SELECT order_supplier_id, COALESCE(SUM(line_total),0) AS total
+               FROM order_items WHERE order_id = $1 GROUP BY order_supplier_id) sub
+      WHERE os.id = sub.order_supplier_id`,
+    [orderId]
+  );
+  await client.query(
+    `UPDATE orders o SET
+       items_subtotal = sub.total,
+       grand_total    = sub.total + o.delivery_fee
+     FROM (SELECT order_id, COALESCE(SUM(line_total),0) AS total
+             FROM order_items WHERE order_id = $1 GROUP BY order_id) sub
+     WHERE o.id = $1 AND sub.order_id = o.id`,
+    [orderId]
+  );
+  await client.query(
+    `UPDATE orders SET items_subtotal = 0, grand_total = delivery_fee
+      WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = $1)`,
+    [orderId]
+  );
+}
 
 const createSchema = z.object({
   fulfillment: z.enum(["delivery", "pickup"]),
@@ -797,3 +821,179 @@ orderRouter.get("/:id/receipts", asyncRoute(async (req, res) => {
   const { rows } = await query(`SELECT * FROM order_receipts WHERE order_id = $1 ORDER BY issued_at DESC`, [req.params.id]);
   res.json(rows);
 }));
+
+// إضافة صنف جديد لفاتورة طلبية بعد اعتمادها
+orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    productId: z.string().uuid(),
+    qty: z.number().positive(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows: orderRows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = orderRows[0];
+    if (["delivered", "cancelled", "closed"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل فاتورة طلبية تم تسليمها أو إلغاؤها");
+    }
+
+    const { rows: prodRows } = await client.query(
+      `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost,
+              p.availability, s.status AS supplier_status
+         FROM products p JOIN suppliers s ON s.id = p.supplier_id
+        WHERE p.id = $1 AND p.is_active`,
+      [body.productId]
+    );
+    if (!prodRows.length) throw new ApiError(404, "الصنف غير موجود");
+    const p = prodRows[0];
+    if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
+    if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+
+    await assertCustomerSection(order.customer_id, p.section_id);
+    const price = await resolvePrice(client, {
+      productId: p.id, customerId: order.customer_id, qty: body.qty,
+    });
+
+    const { rows: osRows } = await client.query(
+      `SELECT id FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2`,
+      [order.id, p.supplier_id]
+    );
+    let orderSupplierId;
+    if (osRows.length) {
+      orderSupplierId = osRows[0].id;
+    } else {
+      const { rows: createdOs } = await client.query(
+        `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, status)
+         VALUES ($1,$2,0, CASE WHEN $3 = 'under_review' THEN 'pending' ELSE 'sent' END)
+         RETURNING id`,
+        [order.id, p.supplier_id, order.status]
+      );
+      orderSupplierId = createdOs[0].id;
+    }
+
+    const lineTotal = price * body.qty;
+    const { rows: [item] } = await client.query(
+      `INSERT INTO order_items
+         (order_id, order_supplier_id, product_id, product_name, unit,
+          unit_price, purchase_cost, qty_requested, qty_confirmed, availability, line_total)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'full',$9) RETURNING *`,
+      [order.id, orderSupplierId, p.id, p.name, p.unit, price, p.purchase_cost, body.qty, lineTotal]
+    );
+
+    await recalcOrderTotals(client, order.id);
+
+    await recordStatus(client, {
+      orderId: order.id, from: order.status, to: order.status, actor: req.actor,
+      note: `تمت إضافة صنف: ${p.name} × ${body.qty} ${p.unit}`,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order_item.added", entityType: "order_item", entityId: item.id,
+      entityLabel: `${order.order_number} — ${p.name}`, after: item, ip: req.ip,
+    });
+
+    const { rows: [updatedOrder] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
+    return { item, order: updatedOrder };
+  });
+
+  res.status(201).json(result);
+}));
+
+// تعديل كمية صنف موجود في فاتورة طلبية
+orderRouter.patch("/:id/items/:itemId", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const { qty } = z.object({ qty: z.number().positive() }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows: orderRows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = orderRows[0];
+    if (["delivered", "cancelled", "closed"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل فاتورة طلبية تم تسليمها أو إلغاؤها");
+    }
+
+    const { rows: itemRows } = await client.query(
+      `SELECT * FROM order_items WHERE id = $1 AND order_id = $2 FOR UPDATE`,
+      [req.params.itemId, order.id]
+    );
+    if (!itemRows.length) throw new ApiError(404, "الصنف غير موجود في هذه الطلبية");
+    const before = itemRows[0];
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE order_items SET qty_requested = $2, qty_confirmed = $2, line_total = unit_price * $2
+        WHERE id = $1 RETURNING *`,
+      [before.id, qty]
+    );
+
+    await recalcOrderTotals(client, order.id);
+
+    await recordStatus(client, {
+      orderId: order.id, from: order.status, to: order.status, actor: req.actor,
+      note: `تم تعديل كمية صنف: ${before.product_name} — من ${before.qty_requested} إلى ${qty}`,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order_item.qty_updated", entityType: "order_item", entityId: before.id,
+      entityLabel: before.product_name, before, after: updated, ip: req.ip,
+    });
+
+    const { rows: [updatedOrder] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
+    return { item: updated, order: updatedOrder };
+  });
+
+  res.json(result);
+}));
+
+// حذف صنف من فاتورة طلبية
+orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const { rows: orderRows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = orderRows[0];
+    if (["delivered", "cancelled", "closed"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل فاتورة طلبية تم تسليمها أو إلغاؤها");
+    }
+
+    const { rows: itemRows } = await client.query(
+      `SELECT * FROM order_items WHERE id = $1 AND order_id = $2 FOR UPDATE`,
+      [req.params.itemId, order.id]
+    );
+    if (!itemRows.length) throw new ApiError(404, "الصنف غير موجود في هذه الطلبية");
+    const item = itemRows[0];
+
+    const { rows: [{ total }] } = await client.query(
+      `SELECT COUNT(*)::INT AS total FROM order_items WHERE order_id = $1`, [order.id]
+    );
+    if (Number(total) <= 1) {
+      throw new ApiError(400, "لا يمكن حذف آخر صنف في الطلبية — استخدم إلغاء الطلبية بدلاً من ذلك");
+    }
+
+    const { rows: [{ count: partCount }] } = await client.query(
+      `SELECT COUNT(*)::INT AS count FROM order_items WHERE order_supplier_id = $1`,
+      [item.order_supplier_id]
+    );
+
+    await client.query(`DELETE FROM order_items WHERE id = $1`, [item.id]);
+
+    if (Number(partCount) <= 1) {
+      await client.query(`DELETE FROM order_suppliers WHERE id = $1`, [item.order_supplier_id]);
+    }
+
+    await recalcOrderTotals(client, order.id);
+
+    await recordStatus(client, {
+      orderId: order.id, from: order.status, to: order.status, actor: req.actor,
+      note: `تم حذف صنف: ${item.product_name} × ${item.qty_requested} ${item.unit}`,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order_item.removed", entityType: "order_item", entityId: item.id,
+      entityLabel: item.product_name, before: item, ip: req.ip,
+    });
+
+    const { rows: [updatedOrder] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
+    return { removed: true, order: updatedOrder };
+  });
+
+  res.json(result);
+}));
+
