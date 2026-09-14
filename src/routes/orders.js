@@ -119,6 +119,105 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
   res.status(201).json(order);
 }));
 
+// إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
+const adminCreateSchema = createSchema.extend({
+  customerId: z.string().uuid(),
+});
+
+orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = adminCreateSchema.parse(req.body);
+
+  const cust = await query(`SELECT id, status FROM customers WHERE id = $1`, [body.customerId]);
+  if (!cust.rows.length) throw new ApiError(404, "العميل غير موجود");
+  if (cust.rows[0].status !== "approved") throw new ApiError(400, "لا يمكن إنشاء طلبية لعميل غير معتمد");
+
+  const order = await withTransaction(async (client) => {
+    const enriched = [];
+    for (const item of body.items) {
+      const { rows } = await client.query(
+        `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost,
+                p.availability, s.status AS supplier_status
+           FROM products p JOIN suppliers s ON s.id = p.supplier_id
+          WHERE p.id = $1 AND p.is_active`,
+        [item.productId]
+      );
+      if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
+      const p = rows[0];
+      if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
+      if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+
+      await assertCustomerSection(body.customerId, p.section_id);
+      const price = await resolvePrice(client, {
+        productId: p.id, customerId: body.customerId, qty: item.qty,
+      });
+      enriched.push({ ...p, qty: item.qty, price });
+    }
+
+    const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
+    const itemsSubtotal = enriched.reduce((s, i) => s + i.price * i.qty, 0);
+
+    const deliveryFee = body.fulfillment === "delivery"
+      ? await calcDeliveryFee(client, {
+          zoneId: body.deliveryZoneId,
+          vehicleTypeId: body.vehicleTypeId,
+          vehiclesCount: body.vehiclesCount,
+          supplierCount: supplierIds.length,
+        })
+      : 0;
+
+    const orderNumber = await nextDocNumber(client, {
+      table: "orders", column: "order_number", prefix: "JOMLA", start: 3000,
+    });
+
+    const { rows: [created] } = await client.query(
+      `INSERT INTO orders
+         (order_number, customer_id, status, fulfillment, payment_method,
+          items_subtotal, delivery_fee, grand_total,
+          delivery_zone_id, vehicle_type_id, vehicles_count)
+       VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [orderNumber, body.customerId, body.fulfillment, body.paymentMethod,
+       itemsSubtotal, deliveryFee, itemsSubtotal + deliveryFee,
+       body.deliveryZoneId ?? null, body.vehicleTypeId ?? null, body.vehiclesCount]
+    );
+
+    for (const supplierId of supplierIds) {
+      const mine = enriched.filter((i) => i.supplier_id === supplierId);
+      const subtotal = mine.reduce((s, i) => s + i.price * i.qty, 0);
+
+      const { rows: [os] } = await client.query(
+        `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, supplier_note)
+         VALUES ($1,$2,$3,$4) RETURNING id`,
+        [created.id, supplierId, subtotal, body.supplierNotes?.[supplierId] ?? null]
+      );
+
+      for (const i of mine) {
+        await client.query(
+          `INSERT INTO order_items
+             (order_id, order_supplier_id, product_id, product_name, unit,
+              unit_price, purchase_cost, qty_requested, line_total)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty]
+        );
+      }
+    }
+
+    await recordStatus(client, {
+      orderId: created.id, from: "draft", to: "under_review", actor: req.actor,
+      note: "أُنشئت بواسطة الدعم الفني نيابة عن العميل",
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.created_by_admin", entityType: "order", entityId: created.id,
+      entityLabel: orderNumber, after: created, ip: req.ip,
+    });
+
+    return { ...created, supplierCount: supplierIds.length };
+  });
+
+  res.status(201).json(order);
+}));
+
 orderRouter.get("/", asyncRoute(async (req, res) => {
   const { status } = req.query;
   const a = req.actor;
