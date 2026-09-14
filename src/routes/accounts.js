@@ -273,7 +273,7 @@ accountsRouter.post("/:kind/:id/approve", requirePermission("accounts.approve"),
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
-    if (before.rows[0].status !== "pending") throw new ApiError(400, "الحساب ليس بانتظار الاعتماد");
+        if (!["pending", "suspended"].includes(before.rows[0].status)) throw new ApiError(400, "الحساب ليس بانتظار الاعتماد أو متوقفًا");
 
     const { rows } = await client.query(
       `UPDATE ${cfg.table} SET status = 'approved', approved_by = $2, approved_at = now()
