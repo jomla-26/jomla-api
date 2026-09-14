@@ -28,14 +28,32 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
   const { accountType, phone } = requestSchema.parse(req.body);
   const cfg = TABLES[accountType];
   const normalized = normalizePhone(phone);
+  const statusCol = accountType === "employee" ? "is_active" : "status";
 
   const { rows } = await query(
-    `SELECT id, ${cfg.nameCol} AS name FROM ${cfg.table}
-      WHERE phone = $1 ${cfg.activeClause} LIMIT 1`,
+    `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status
+       FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
     [normalized]
   );
 
   if (!rows.length) {
+    return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
+  }
+
+  const user = rows[0];
+  const isBlocked = accountType === "employee"
+    ? user.account_status === false
+    : user.account_status === "suspended";
+
+  if (isBlocked) {
+    throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
+  }
+
+  const isApproved = accountType === "employee"
+    ? user.account_status === true
+    : user.account_status === "approved";
+
+  if (!isApproved) {
     return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
   }
 
@@ -45,7 +63,7 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
     `UPDATE ${cfg.table}
         SET otp_hash = $1, otp_expires_at = now() + interval '5 minutes'
       WHERE id = $2`,
-    [hash, rows[0].id]
+    [hash, user.id]
   );
 
   if (process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
@@ -59,15 +77,24 @@ authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
   const { accountType, phone, otp } = verifySchema.parse(req.body);
   const cfg = TABLES[accountType];
   const normalized = normalizePhone(phone);
+  const statusCol = accountType === "employee" ? "is_active" : "status";
 
   const { rows } = await query(
-    `SELECT id, ${cfg.nameCol} AS name, otp_hash, otp_expires_at
-       FROM ${cfg.table}
-      WHERE phone = $1 ${cfg.activeClause} LIMIT 1`,
+    `SELECT id, ${cfg.nameCol} AS name, otp_hash, otp_expires_at, ${statusCol} AS account_status
+       FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
     [normalized]
   );
 
   const user = rows[0];
+
+  const isBlocked = user && (accountType === "employee"
+    ? user.account_status === false
+    : user.account_status === "suspended");
+
+  if (isBlocked) {
+    throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
+  }
+
   if (!user?.otp_hash || new Date(user.otp_expires_at) < new Date()) {
     throw new ApiError(401, "الرمز غير صالح أو منتهي الصلاحية");
   }
