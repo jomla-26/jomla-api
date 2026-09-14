@@ -13,11 +13,16 @@ employeeRouter.get("/roles", asyncRoute(async (_req, res) => {
 }));
 
 employeeRouter.get("/", requireAnyPermission("employees.manage", "finance.salaries"), asyncRoute(async (req, res) => {
+  const { status } = req.query; // "active" (افتراضي) | "inactive" | "all"
+  const activeFilter = status === "inactive" ? "NOT e.is_active"
+    : status === "all" ? "TRUE"
+    : "e.is_active";
+
   const { rows } = await query(
-    `SELECT e.id, e.name, e.phone, e.monthly_salary, e.started_on, e.last_login_at,
+    `SELECT e.id, e.name, e.phone, e.monthly_salary, e.started_on, e.last_login_at, e.is_active,
             r.code AS role_code, r.name AS role_name
        FROM employees e JOIN roles r ON r.id = e.role_id
-      WHERE e.is_active
+      WHERE ${activeFilter}
       ORDER BY e.name`
   );
   res.json(rows);
@@ -57,31 +62,77 @@ employeeRouter.post("/", requirePermission("employees.manage"), asyncRoute(async
 
 employeeRouter.patch("/:id", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
-    isActive: z.boolean().optional(),
+    name: z.string().min(2).optional(),
+    phone: z.string().min(9).optional(),
+    roleCode: z.string().optional(),
     monthlySalary: z.number().nonnegative().optional(),
+    isActive: z.boolean().optional(),
   }).parse(req.body);
 
+  if (Object.keys(body).length === 0) {
+    throw new ApiError(400, "لا توجد بيانات للتعديل");
+  }
+
   const updated = await withTransaction(async (client) => {
-    const before = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    const before = await client.query(
+      `SELECT e.*, r.code AS role_code FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
     if (!before.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+    let roleId = before.rows[0].role_id;
+    if (body.roleCode) {
+      const role = await client.query(`SELECT id FROM roles WHERE code = $1`, [body.roleCode]);
+      if (!role.rows.length) throw new ApiError(400, "الوظيفة غير معروفة");
+      roleId = role.rows[0].id;
+    }
 
     const { rows } = await client.query(
       `UPDATE employees SET
-         is_active      = COALESCE($2, is_active),
-         monthly_salary = COALESCE($3, monthly_salary)
-       WHERE id = $1 RETURNING id, name, phone, monthly_salary, is_active`,
-      [req.params.id, body.isActive ?? null, body.monthlySalary ?? null]
+         name           = COALESCE($2, name),
+         phone          = COALESCE($3, phone),
+         role_id        = $4,
+         monthly_salary = COALESCE($5, monthly_salary),
+         is_active      = COALESCE($6, is_active)
+       WHERE id = $1
+       RETURNING id, name, phone, monthly_salary, is_active, started_on, role_id`,
+      [req.params.id, body.name ?? null, body.phone ?? null, roleId,
+       body.monthlySalary ?? null, body.isActive ?? null]
     );
+
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "employee.updated", entityType: "employee", entityId: req.params.id,
-      entityLabel: before.rows[0].name, before: before.rows[0], after: rows[0], ip: req.ip,
+      entityLabel: rows[0].name, before: before.rows[0], after: rows[0], ip: req.ip,
     });
     return rows[0];
   });
 
   res.json(updated);
 }));
+
+// "حذف" الموظف = تعطيله، عشان جداول attendance وemployee_reviews مربوطة بـ employee_id
+employeeRouter.delete("/:id", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const before = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!before.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+    const { rows } = await client.query(
+      `UPDATE employees SET is_active = FALSE WHERE id = $1 RETURNING id, name, is_active`,
+      [req.params.id]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "employee.deactivated", entityType: "employee", entityId: req.params.id,
+      entityLabel: before.rows[0].name, before: before.rows[0], after: rows[0], ip: req.ip,
+    });
+    return rows[0];
+  });
+
+  res.json(result);
+}));
+
 
 employeeRouter.post("/:id/attendance", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
