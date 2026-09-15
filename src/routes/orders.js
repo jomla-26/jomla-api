@@ -450,6 +450,65 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
   res.json(result);
 }));
 
+// تغيير طريقة تسليم الطلبية (استلام شخصي ↔ توصيل) — قبل إسناد مندوب
+orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    fulfillment: z.enum(["delivery", "pickup"]),
+    deliveryZoneId: z.string().uuid().optional(),
+    vehicleTypeId: z.string().uuid().optional(),
+    vehiclesCount: z.number().int().min(1).default(1),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+
+    if (["delivered", "cancelled", "closed"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل طريقة تسليم طلبية تم تسليمها أو إلغاؤها");
+    }
+    if (order.driver_id) {
+      throw new ApiError(400, "لا يمكن تغيير طريقة التسليم بعد إسناد الطلبية لمندوب");
+    }
+
+    let deliveryFee = 0;
+    if (body.fulfillment === "delivery") {
+      const { rows: [{ count }] } = await client.query(
+        `SELECT COUNT(*)::INT AS count FROM order_suppliers WHERE order_id = $1`, [order.id]
+      );
+      deliveryFee = await calcDeliveryFee(client, {
+        zoneId: body.deliveryZoneId, vehicleTypeId: body.vehicleTypeId,
+        vehiclesCount: body.vehiclesCount, supplierCount: count,
+      });
+    }
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET
+         fulfillment = $2, delivery_fee = $3, grand_total = items_subtotal + $3,
+         delivery_zone_id = $4, vehicle_type_id = $5, vehicles_count = $6
+       WHERE id = $1 RETURNING *`,
+      [order.id, body.fulfillment, deliveryFee,
+       body.fulfillment === "delivery" ? (body.deliveryZoneId ?? null) : null,
+       body.fulfillment === "delivery" ? (body.vehicleTypeId ?? null) : null,
+       body.fulfillment === "delivery" ? body.vehiclesCount : 1]
+    );
+
+    await recordStatus(client, {
+      orderId: order.id, from: order.status, to: order.status, actor: req.actor,
+      note: `تم تغيير طريقة التسليم إلى: ${body.fulfillment === "delivery" ? "توصيل" : "استلام شخصي"}`,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.fulfillment_changed", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
+    });
+
+    return updated;
+  });
+
+  res.json(result);
+}));
+
 // تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
 orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const { orderIds, status, note } = z.object({
