@@ -452,7 +452,9 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
 
 // تغيير طريقة تسليم الطلبية (استلام شخصي ↔ توصيل) — قبل إسناد مندوب
 orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  console.log("[fulfillment] وصل الطلب:", JSON.stringify(req.body));
   const body = z.object({
+
     fulfillment: z.enum(["delivery", "pickup"]),
     deliveryZoneId: z.string().uuid().optional(),
     vehicleTypeId: z.string().uuid().optional(),
