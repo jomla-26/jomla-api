@@ -26,6 +26,7 @@ app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(",") ?? true, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
+app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.path}`); next(); });
 app.use(rateLimit({ windowMs: 60_000, max: 300 }));
 app.use("/uploads", express.static(process.env.UPLOAD_DIR || "uploads"));
 
