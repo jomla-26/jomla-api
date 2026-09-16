@@ -105,6 +105,7 @@ const productSchema = z.object({
   purchaseCost: z.number().nonnegative().optional(),
   stockQty: z.number().nonnegative().default(0),
   imageUrl: z.string().url().optional(),
+  supplierSku: z.string().trim().max(100).optional(),
 });
 
 catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
@@ -119,10 +120,11 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
   const product = await withTransaction(async (client) => {
     const { rows } = await client.query(
       `INSERT INTO products
-         (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, added_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+         (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, supplier_sku, added_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [body.sectionId, supplierId, body.name, body.unit, body.basePrice,
        body.purchaseCost ?? null, body.stockQty, body.imageUrl ?? null,
+       body.supplierSku || null,
        req.actor.type === "employee" ? req.actor.id : null]
     );
     await writeAudit(client, {
@@ -142,6 +144,7 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
     purchaseCost: z.number().nonnegative().optional(),
     stockQty: z.number().nonnegative().optional(),
     isActive: z.boolean().optional(),
+    supplierSku: z.string().trim().max(100).optional(),
   }).parse(req.body);
 
   const updated = await withTransaction(async (client) => {
@@ -158,10 +161,11 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
          base_price    = COALESCE($2, base_price),
          purchase_cost = COALESCE($3, purchase_cost),
          stock_qty     = COALESCE($4, stock_qty),
-         is_active     = COALESCE($5, is_active)
+         is_active     = COALESCE($5, is_active),
+         supplier_sku  = COALESCE($6, supplier_sku)
        WHERE id = $1 RETURNING *`,
       [req.params.id, body.basePrice ?? null, body.purchaseCost ?? null,
-       body.stockQty ?? null, body.isActive ?? null]
+       body.stockQty ?? null, body.isActive ?? null, body.supplierSku ?? null]
     );
 
     if (body.basePrice && body.basePrice !== before.base_price) {
