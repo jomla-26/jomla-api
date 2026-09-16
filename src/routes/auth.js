@@ -131,6 +131,18 @@ authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
 
 authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
   if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
+ 
+  if (req.actor.type === "supplier") {
+    const { rows } = await query(
+      `SELECT s.id, s.name, s.slug
+         FROM supplier_sections ss
+         JOIN sections s ON s.id = ss.section_id
+        WHERE ss.supplier_id = $1 AND ss.enabled AND s.is_active
+        ORDER BY s.sort_order`,
+      [req.actor.id]
+    );
+    return res.json({ actor: req.actor, sections: rows });
+  }
 
   if (req.actor.type === "customer") {
     const { rows } = await query(
