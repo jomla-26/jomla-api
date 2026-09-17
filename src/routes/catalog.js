@@ -238,12 +238,14 @@ catalogRouter.get("/products/me/report", requireActorType("supplier"), asyncRout
   const period = z.enum(["today", "week", "month"]).default("week").parse(req.query.period);
   const interval = period === "today" ? "1 day" : period === "week" ? "7 days" : "30 days";
 
+  // العمولة تُحسب على أساس صافي كل فاتورة (order_suppliers.subtotal × نسبتها الفعلية،
+  // اللي ممكن تكون نسبة استثنائية لهذه الفاتورة بس، مش بالضرورة نسبة المورد الأساسية)
   const totals = await query(
-    `SELECT COUNT(DISTINCT oi.order_id)::INT AS orders_count,
-            COALESCE(SUM(oi.line_total), 0) AS total_sales
-       FROM order_items oi
-       JOIN order_suppliers os ON os.id = oi.order_supplier_id
-       JOIN orders o           ON o.id  = oi.order_id
+    `SELECT COUNT(DISTINCT os.id)::INT AS orders_count,
+            COALESCE(SUM(os.subtotal), 0) AS total_sales,
+            COALESCE(SUM(os.subtotal * os.commission_rate / 100.0), 0) AS total_commission
+       FROM order_suppliers os
+       JOIN orders o ON o.id = os.order_id
       WHERE os.supplier_id = $1
         AND o.status IN ('delivered','closed')
         AND o.delivered_at >= now() - $2::INTERVAL`,
@@ -265,9 +267,14 @@ catalogRouter.get("/products/me/report", requireActorType("supplier"), asyncRout
     [req.actor.id, interval]
   );
 
+  const totalSales = Number(totals.rows[0].total_sales);
+  const totalCommission = Number(totals.rows[0].total_commission);
+
   res.json({
     ordersCount: totals.rows[0].orders_count,
-    totalSales: totals.rows[0].total_sales,
+    totalSales,
+    totalCommission,
+    netSales: totalSales - totalCommission,
     topProducts: topProducts.rows,
   });
 }));
