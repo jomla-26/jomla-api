@@ -855,6 +855,10 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
     if (!rows.length) throw new ApiError(404, "الجزء غير موجود");
     const part = rows[0];
 
+    if (part.status !== "ready") {
+      throw new ApiError(400, "لازم تعلّم الفاتورة كجاهزة أولًا قبل تأكيد حضور العميل");
+    }
+
     if (!paymentReceived && part.payment_method !== "deferred") {
       throw new ApiError(400, "يلزم تأكيد استلام قيمة الفاتورة أو اعتماد الحوالة");
     }
@@ -889,9 +893,9 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
   res.json(result);
 }));
 
-// المورد يعلن إنه خلّص تجهيز فاتورته (طلبية توصيل، مش استلام شخصي) — يحوّل حالة
-// جزئه إلى "جاهز"، ولو كل أجزاء الطلبية بقت جاهزة، تتحول حالة الطلبية كاملة
-// تلقائيًا إلى "جاهزة للتوصيل" عشان الأدمن يقدر يسند مندوب
+// المورد يعلن إنه خلّص تجهيز فاتورته — يحوّل حالة جزئه إلى "جاهز"، ولو كل أجزاء
+// الطلبية بقت جاهزة، تتحول حالة الطلبية كاملة تلقائيًا: "جاهزة للتوصيل" (لو توصيل،
+// عشان الأدمن يسند مندوب) أو "جاهزة للاستلام" (لو استلام شخصي، بانتظار حضور العميل)
 orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
@@ -920,11 +924,12 @@ orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"
     );
 
     let orderReady = false;
-    if (pending.remaining === 0 && part.fulfillment === "delivery"
+    const nextOrderStatus = part.fulfillment === "delivery" ? "ready_for_delivery" : "ready_for_pickup";
+    if (pending.remaining === 0
         && ["sent_to_supplier", "supplier_preparing", "shortage"].includes(part.order_status)) {
-      await client.query(`UPDATE orders SET status = 'ready_for_delivery' WHERE id = $1`, [part.order_id]);
+      await client.query(`UPDATE orders SET status = $2 WHERE id = $1`, [part.order_id, nextOrderStatus]);
       await recordStatus(client, {
-        orderId: part.order_id, from: part.order_status, to: "ready_for_delivery", actor: req.actor,
+        orderId: part.order_id, from: part.order_status, to: nextOrderStatus, actor: req.actor,
       });
       orderReady = true;
     }
