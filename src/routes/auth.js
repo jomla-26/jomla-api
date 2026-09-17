@@ -78,7 +78,12 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
         phone: normalized,
         message: `رمز التحقق الخاص بك في جملة: ${otp}\nصالح لمدة 5 دقائق. لا تشاركه مع أي شخص.`,
       }),
-    }).catch((err) => console.error("فشل إرسال رمز التحقق عبر واتساب:", err));
+    }).then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      console.log(`[WHATSAPP] استجابة السيرفس (${r.status}):`, JSON.stringify(body));
+    }).catch((err) => console.error("[WHATSAPP] فشل الاتصال بسيرفس واتساب:", err));
+  } else {
+    console.log("[WHATSAPP] المتغيرات غير موجودة — تم تجاوز الإرسال");
   }
 
   res.json({ sent: true, message: "تم إرسال رمز التحقق" });
