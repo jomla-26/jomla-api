@@ -889,6 +889,52 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
   res.json(result);
 }));
 
+// المورد يعلن إنه خلّص تجهيز فاتورته (طلبية توصيل، مش استلام شخصي) — يحوّل حالة
+// جزئه إلى "جاهز"، ولو كل أجزاء الطلبية بقت جاهزة، تتحول حالة الطلبية كاملة
+// تلقائيًا إلى "جاهزة للتوصيل" عشان الأدمن يقدر يسند مندوب
+orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"), asyncRoute(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT os.*, o.order_number, o.fulfillment, o.status AS order_status
+         FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+        WHERE os.id = $1 AND os.supplier_id = $2 FOR UPDATE`,
+      [req.params.osId, req.actor.id]
+    );
+    if (!rows.length) throw new ApiError(404, "الجزء غير موجود");
+    const part = rows[0];
+
+    if (part.status !== "preparing") {
+      throw new ApiError(400, "لا يمكن تعليم هذا الجزء كجاهز في حالته الحالية");
+    }
+
+    await client.query(`UPDATE order_suppliers SET status = 'ready' WHERE id = $1`, [part.id]);
+    await recordStatus(client, {
+      orderId: part.order_id, orderSupplierId: part.id,
+      from: "preparing", to: "ready", actor: req.actor,
+    });
+
+    const { rows: [pending] } = await client.query(
+      `SELECT COUNT(*)::INT AS remaining FROM order_suppliers
+        WHERE order_id = $1 AND status NOT IN ('ready','picked_up')`,
+      [part.order_id]
+    );
+
+    let orderReady = false;
+    if (pending.remaining === 0 && part.fulfillment === "delivery"
+        && ["sent_to_supplier", "supplier_preparing", "shortage"].includes(part.order_status)) {
+      await client.query(`UPDATE orders SET status = 'ready_for_delivery' WHERE id = $1`, [part.order_id]);
+      await recordStatus(client, {
+        orderId: part.order_id, from: part.order_status, to: "ready_for_delivery", actor: req.actor,
+      });
+      orderReady = true;
+    }
+
+    return { orderSupplierId: part.id, status: "ready", orderReady };
+  });
+
+  res.json(result);
+}));
+
 orderRouter.post("/:id/receipt", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const receipt = await withTransaction(async (client) => {
     const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
@@ -1115,4 +1161,3 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
 
   res.json(result);
 }));
-
