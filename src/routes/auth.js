@@ -68,6 +68,19 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
 
   if (process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
 
+  // إرسال الرمز عبر واتساب (سيرفس Baileys المستقل) — لا نوقف الطلب لو فشل الإرسال،
+  // فقط نسجّل الخطأ، عشان مشكلة مؤقتة بواتساب ما توقفش تسجيل الدخول بالكامل
+  if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
+    fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-secret-key": process.env.WHATSAPP_SECRET_KEY },
+      body: JSON.stringify({
+        phone: normalized,
+        message: `رمز التحقق الخاص بك في جملة: ${otp}\nصالح لمدة 5 دقائق. لا تشاركه مع أي شخص.`,
+      }),
+    }).catch((err) => console.error("فشل إرسال رمز التحقق عبر واتساب:", err));
+  }
+
   res.json({ sent: true, message: "تم إرسال رمز التحقق" });
 }));
 
