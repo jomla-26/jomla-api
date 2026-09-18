@@ -198,6 +198,7 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
     purchaseCost: z.number().nonnegative().optional(),
     isActive: z.boolean().optional(),
     supplierSku: z.string().trim().max(100).optional(),
+    imageUrl: z.string().url().optional(),
   }).parse(req.body);
 
   const updated = await withTransaction(async (client) => {
@@ -214,10 +215,11 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
          base_price    = COALESCE($2, base_price),
          purchase_cost = COALESCE($3, purchase_cost),
          is_active     = COALESCE($4, is_active),
-         supplier_sku  = COALESCE($5, supplier_sku)
+         supplier_sku  = COALESCE($5, supplier_sku),
+         image_url     = COALESCE($6, image_url)
        WHERE id = $1 RETURNING *`,
       [req.params.id, body.basePrice ?? null, body.purchaseCost ?? null,
-       body.isActive ?? null, body.supplierSku ?? null]
+       body.isActive ?? null, body.supplierSku ?? null, body.imageUrl ?? null]
     );
 
     if (body.basePrice && body.basePrice !== before.base_price) {
