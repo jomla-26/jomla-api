@@ -425,3 +425,65 @@ financeRouter.get("/expenses/summary", requirePermission("finance.expenses"), as
   );
   res.json(rows.map((r) => ({ ...r, categoryLabel: EXPENSE_CATEGORIES[r.category] })));
 }));
+
+// كشف أرباح جملة: عمولة الموردين المحصّلة (من الطلبيات المسلَّمة/المقفولة) ناقص
+// المصروفات المسجّلة، خلال فترة محدَّدة. يدعم تجميع الفترة (يومي/شهري/سنوي) لعرض بياني
+financeRouter.get("/profit-report", requirePermission("finance.expenses"), asyncRoute(async (req, res) => {
+  const { from, to, groupBy } = z.object({
+    from: z.string().optional(),
+    to: z.string().optional(),
+    groupBy: z.enum(["day", "month", "year"]).default("day"),
+  }).parse(req.query);
+
+  const totals = await query(
+    `SELECT
+        COALESCE((
+          SELECT SUM(os.subtotal * os.commission_rate / 100.0)
+            FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+           WHERE o.status IN ('delivered','closed')
+             AND ($1::DATE IS NULL OR o.delivered_at::DATE >= $1)
+             AND ($2::DATE IS NULL OR o.delivered_at::DATE <= $2)
+        ), 0) AS total_commission,
+        COALESCE((
+          SELECT SUM(amount) FROM expenses e
+           WHERE ($1::DATE IS NULL OR e.expense_date >= $1)
+             AND ($2::DATE IS NULL OR e.expense_date <= $2)
+        ), 0) AS total_expenses`,
+    [from || null, to || null]
+  );
+
+  const series = await query(
+    `SELECT bucket, SUM(commission) AS commission, SUM(expenses) AS expenses
+       FROM (
+         SELECT date_trunc($3, o.delivered_at)::DATE AS bucket,
+                os.subtotal * os.commission_rate / 100.0 AS commission, 0 AS expenses
+           FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+          WHERE o.status IN ('delivered','closed')
+            AND ($1::DATE IS NULL OR o.delivered_at::DATE >= $1)
+            AND ($2::DATE IS NULL OR o.delivered_at::DATE <= $2)
+         UNION ALL
+         SELECT date_trunc($3, e.expense_date)::DATE AS bucket, 0 AS commission, e.amount AS expenses
+           FROM expenses e
+          WHERE ($1::DATE IS NULL OR e.expense_date >= $1)
+            AND ($2::DATE IS NULL OR e.expense_date <= $2)
+       ) x
+      GROUP BY bucket
+      ORDER BY bucket`,
+    [from || null, to || null, groupBy]
+  );
+
+  const totalCommission = Number(totals.rows[0].total_commission);
+  const totalExpenses = Number(totals.rows[0].total_expenses);
+
+  res.json({
+    totalCommission,
+    totalExpenses,
+    netProfit: totalCommission - totalExpenses,
+    series: series.rows.map((r) => ({
+      bucket: r.bucket,
+      commission: Number(r.commission),
+      expenses: Number(r.expenses),
+      netProfit: Number(r.commission) - Number(r.expenses),
+    })),
+  });
+}));
