@@ -733,7 +733,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
 
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
-      `SELECT sh.*, oi.order_id FROM order_shortages sh
+      `SELECT sh.*, oi.order_id, oi.order_supplier_id FROM order_shortages sh
          JOIN order_items oi ON oi.id = sh.order_item_id
         WHERE sh.id = $1 FOR UPDATE`,
       [req.params.id]
@@ -766,6 +766,23 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
        WHERE o.id = $1`,
       [shortage.order_id]
     );
+
+    // بعد ما يتحل النقص، لو ما بقاش عندنا نواقص أخرى معلّقة لنفس فاتورة المورد،
+    // نرجّع حالتها من "يوجد نقص" إلى "قيد التجهيز" عشان المورد يقدر يكمل ويعلّمها جاهزة
+    if (shortage.order_supplier_id) {
+      const { rows: [pending] } = await client.query(
+        `SELECT COUNT(*)::INT AS remaining FROM order_shortages sh
+           JOIN order_items oi ON oi.id = sh.order_item_id
+          WHERE oi.order_supplier_id = $1 AND sh.resolved_at IS NULL`,
+        [shortage.order_supplier_id]
+      );
+      if (pending.remaining === 0) {
+        await client.query(
+          `UPDATE order_suppliers SET status = 'preparing' WHERE id = $1 AND status = 'shortage'`,
+          [shortage.order_supplier_id]
+        );
+      }
+    }
 
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
