@@ -3,7 +3,7 @@ import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, resolvePrice, nextDocNumber } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
-import { notifySectionArrival } from "../lib/notify.js";
+import { notifyFavoriteRestock } from "../lib/notify.js";
 
 export const catalogRouter = Router();
 catalogRouter.use(authenticate);
@@ -105,6 +105,10 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
         WHERE p.section_id = $1
           AND p.is_active
           AND s.status = 'approved'
+          AND EXISTS (
+                SELECT 1 FROM supplier_sections ss
+                 WHERE ss.supplier_id = p.supplier_id AND ss.section_id = p.section_id AND ss.enabled
+              )
           AND ($2::UUID IS NULL OR p.supplier_id = $2)
           AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%')
         ORDER BY p.name`,
@@ -181,11 +185,6 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
       action: "product.created", entityType: "product", entityId: rows[0].id,
       entityLabel: body.name, after: rows[0], ip: req.ip,
     });
-
-    const { rows: sec } = await client.query(`SELECT name FROM sections WHERE id = $1`, [body.sectionId]);
-    if (sec.length) {
-      await notifySectionArrival(client, { sectionId: body.sectionId, sectionName: sec[0].name });
-    }
 
     return rows[0];
   });
@@ -397,6 +396,10 @@ catalogRouter.post("/products/:id/stock-movements", asyncRoute(async (req, res, 
       });
     }
 
+    if (Number(product.stock_qty) === 0 && newQty > 0) {
+      await notifyFavoriteRestock(client, { productId: product.id, productName: product.name });
+    }
+
     return { movement, product: updated };
   });
 
@@ -481,6 +484,11 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
           [product.id, newQty, row.basePrice]
         );
         updated.push(saved);
+
+        if (Number(product.stock_qty) === 0 && newQty > 0) {
+          await notifyFavoriteRestock(client, { productId: product.id, productName: product.name });
+        }
+
         continue;
       }
 
@@ -564,12 +572,6 @@ catalogRouter.post("/products/import/confirm-new", asyncRoute(async (req, res, n
       entityLabel: `إضافة ${created.length} صنف جديد عبر إكسل`, after: { count: created.length }, ip: req.ip,
     });
 
-    const distinctSectionIds = [...new Set(created.map((p) => p.section_id))];
-    for (const sid of distinctSectionIds) {
-      const { rows: sec } = await client.query(`SELECT name FROM sections WHERE id = $1`, [sid]);
-      if (sec.length) await notifySectionArrival(client, { sectionId: sid, sectionName: sec[0].name });
-    }
-
     return { created, voucher };
   });
 
@@ -631,6 +633,10 @@ catalogRouter.post("/stock-vouchers", asyncRoute(async (req, res, next) => {
       );
       await client.query(`UPDATE products SET stock_qty = $2 WHERE id = $1`, [product.id, newQty]);
       lines.push({ ...movement, product_name: product.name, unit: product.unit, supplier_sku: product.supplier_sku });
+
+      if (Number(product.stock_qty) === 0 && newQty > 0) {
+        await notifyFavoriteRestock(client, { productId: product.id, productName: product.name });
+      }
     }
 
     await writeAudit(client, {
