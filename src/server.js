@@ -18,7 +18,7 @@ import { deliveryRouter } from "./routes/delivery.js";
 import { engagementRouter } from "./routes/engagement.js";
 import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
-import { dispatchWhatsappQueue, runCreditDueReminders } from "./lib/notify.js";
+import { dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport } from "./lib/notify.js";
 
 const app = express();
 
@@ -87,10 +87,16 @@ const remindersTimer = setInterval(() => {
   runCreditDueReminders().catch((e) => console.error("[Reminders]", e.message));
 }, 6 * 60 * 60 * 1000);
 
+// يفحص كل 5 دقايق لو حان وقت تقرير الأرباح اليومي (~23:50 بتوقيت ليبيا)، ويبعته مرة واحدة بس
+const dailyReportTimer = setInterval(() => {
+  maybeSendDailyProfitReport().catch((e) => console.error("[DailyReport]", e.message));
+}, 5 * 60 * 1000);
+
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
     clearInterval(remindersTimer);
+    clearInterval(dailyReportTimer);
     server.close(() => pool.end().then(() => process.exit(0)));
   });
 }
