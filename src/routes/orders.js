@@ -571,11 +571,18 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
 
 // تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
 orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const { orderIds, status, note } = z.object({
+  const { orderIds, status, note, driverId } = z.object({
     orderIds: z.array(z.string().uuid()).min(1),
     status: z.string(),
     note: z.string().optional(),
+    driverId: z.string().uuid().optional(),
   }).parse(req.body);
+
+  // التحويل الجماعي إلى "مسندة لمندوب" يحتاج مندوبًا محددًا، ويتخطى تلقائيًا
+  // أي طلبية استلام شخصي ضمن التحديد (ما تحتاجش مندوب أصلًا)
+  if (status === "assigned_to_driver" && !driverId) {
+    throw new ApiError(400, "يلزم اختيار مندوب للتحويل الجماعي إلى هذه الحالة");
+  }
 
   const result = await withTransaction(async (client) => {
     const updated = [];
@@ -592,6 +599,37 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
       }
       if (order.status === status) {
         skipped.push({ orderId, orderNumber: order.order_number, reason: "بالفعل في هذه الحالة" });
+        continue;
+      }
+
+      if (status === "assigned_to_driver") {
+        if (order.fulfillment !== "delivery") {
+          skipped.push({ orderId, orderNumber: order.order_number, reason: "طلبية استلام شخصي، تم تخطيها" });
+          continue;
+        }
+
+        const cod = order.payment_method === "deferred"
+          ? Number(order.deposit_due_at_delivery || 0)
+          : Number(order.grand_total) - Number(order.paid_amount);
+
+        const { rows: [u] } = await client.query(
+          `UPDATE orders SET driver_id = $2, assigned_at = now(),
+                  status = 'assigned_to_driver', cod_amount = $3
+           WHERE id = $1 RETURNING *`,
+          [orderId, driverId, cod > 0 ? cod : 0]
+        );
+        await recordStatus(client, { orderId, from: order.status, to: status, actor: req.actor, note });
+        await writeAudit(client, {
+          actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+          action: "order.driver_assigned", entityType: "order", entityId: orderId,
+          entityLabel: order.order_number, before: order, after: u, ip: req.ip,
+        });
+        await queueNotification(client, {
+          templateCode: "delivery.scheduled", recipientType: "customer",
+          recipientId: order.customer_id, orderId,
+          vars: { order_number: order.order_number },
+        });
+        updated.push(u);
         continue;
       }
 
@@ -808,14 +846,16 @@ orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver")
       ? Number(order.deposit_due_at_delivery || 0)
       : Number(order.grand_total) - Number(order.paid_amount);
 
+    // الإسناد لا يبدأ التوصيل فعليًا — بس يربط الطلبية بالمندوب وتصير تظهرله في تطبيقه
+    // تحت "المسندة إليّ". المندوب نفسه هو اللي يضغط "بدء التوصيل" لما يطلع فعليًا بالطلبية
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET driver_id = $2, assigned_at = now(),
-              status = 'out_for_delivery', cod_amount = $3
+              status = 'assigned_to_driver', cod_amount = $3
        WHERE id = $1 RETURNING *`,
       [order.id, driverId, cod > 0 ? cod : 0]
     );
     await recordStatus(client, {
-      orderId: order.id, from: order.status, to: "out_for_delivery", actor: req.actor,
+      orderId: order.id, from: order.status, to: "assigned_to_driver", actor: req.actor,
     });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -826,6 +866,45 @@ orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver")
       templateCode: "delivery.scheduled", recipientType: "customer",
       recipientId: order.customer_id, orderId: order.id,
       vars: { order_number: order.order_number },
+    });
+    return updated;
+  });
+
+  res.json(result);
+}));
+
+// المندوب يضغط هذا الزر لما يطلع فعليًا من المخزن بالطلبية — هنا بس تتحول الحالة
+// إلى "في الطريق" فعليًا، بعد ما كانت مجرد "مسندة إليه"
+orderRouter.post("/:id/start-delivery", requireActorType("employee"), asyncRoute(async (req, res) => {
+  if (req.actor.role !== "driver") throw new ApiError(403, "هذا الإجراء مخصص لمندوبي التوصيل");
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE id = $1 AND driver_id = $2 FOR UPDATE`,
+      [req.params.id, req.actor.id]
+    );
+    if (!rows.length) throw new ApiError(404, "الطلبية غير مسندة إليك");
+    const order = rows[0];
+    if (order.status !== "assigned_to_driver") {
+      throw new ApiError(400, "لا يمكن بدء التوصيل في حالة هذه الطلبية الحالية");
+    }
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET status = 'out_for_delivery' WHERE id = $1 RETURNING *`,
+      [order.id]
+    );
+    await recordStatus(client, {
+      orderId: order.id, from: "assigned_to_driver", to: "out_for_delivery", actor: req.actor,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.delivery_started", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, after: updated, ip: req.ip,
+    });
+    await queueNotification(client, {
+      templateCode: "order.status", recipientType: "customer",
+      recipientId: order.customer_id, orderId: order.id,
+      vars: { order_number: order.order_number, status: "في الطريق إليك" },
     });
     return updated;
   });
@@ -844,6 +923,9 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
     );
     if (!rows.length) throw new ApiError(404, "الطلبية غير مسندة إليك");
     const order = rows[0];
+    if (order.status !== "out_for_delivery") {
+      throw new ApiError(400, "لازم تبدأ التوصيل أولًا قبل تأكيد التسليم");
+    }
 
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET status = 'delivered', delivered_at = now(),
