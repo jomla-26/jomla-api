@@ -134,6 +134,97 @@ employeeRouter.delete("/:id", requirePermission("employees.manage"), asyncRoute(
 }));
 
 
+// كل الصلاحيات المعرّفة بالمنظومة — تُستخدم لبناء قائمة checkboxes في شاشة
+// "الصلاحيات الفردية" بلوحة الإدارة
+employeeRouter.get("/permissions", requirePermission("employees.manage"), asyncRoute(async (_req, res) => {
+  const { rows } = await query(`SELECT id, code, name FROM permissions ORDER BY name`);
+  res.json(rows);
+}));
+
+// صلاحيات موظف معيّن: صلاحيات دوره الأساسية + أي استثناءات فردية مضافة له بعينه
+employeeRouter.get("/:id/permissions", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const emp = await query(
+    `SELECT e.id, e.name, r.code AS role_code, r.name AS role_name
+       FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1`,
+    [req.params.id]
+  );
+  if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+  const all = await query(`SELECT id, code, name FROM permissions ORDER BY name`);
+  const roleGranted = await query(
+    `SELECT p.code FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id
+       JOIN employees e ON e.role_id = rp.role_id
+      WHERE e.id = $1`,
+    [req.params.id]
+  );
+  const overrides = await query(
+    `SELECT p.code, ovr.granted FROM employee_permission_overrides ovr
+       JOIN permissions p ON p.id = ovr.permission_id
+      WHERE ovr.employee_id = $1`,
+    [req.params.id]
+  );
+
+  res.json({
+    employee: emp.rows[0],
+    permissions: all.rows,
+    roleGrantedCodes: roleGranted.rows.map((r) => r.code),
+    overrides: Object.fromEntries(overrides.rows.map((o) => [o.code, o.granted])),
+  });
+}));
+
+// تحديث الاستثناءات الفردية لموظف: كل عنصر إما true (منح إضافي فوق دوره)،
+// false (سحب صلاحية كانت متاحة له عبر دوره)، أو null (إلغاء أي استثناء والرجوع لوضع دوره الافتراضي)
+employeeRouter.patch("/:id/permissions", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    overrides: z.array(z.object({
+      permissionCode: z.string(),
+      granted: z.boolean().nullable(),
+    })),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const emp = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+    for (const o of body.overrides) {
+      const perm = await client.query(`SELECT id FROM permissions WHERE code = $1`, [o.permissionCode]);
+      if (!perm.rows.length) continue;
+      const permissionId = perm.rows[0].id;
+
+      if (o.granted === null) {
+        await client.query(
+          `DELETE FROM employee_permission_overrides WHERE employee_id = $1 AND permission_id = $2`,
+          [req.params.id, permissionId]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO employee_permission_overrides (employee_id, permission_id, granted, assigned_by)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (employee_id, permission_id) DO UPDATE SET granted = $3, assigned_by = $4`,
+          [req.params.id, permissionId, o.granted, req.actor.id]
+        );
+      }
+    }
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "employee.permissions_updated", entityType: "employee", entityId: req.params.id,
+      entityLabel: emp.rows[0].name, after: { overrides: body.overrides }, ip: req.ip,
+    });
+
+    const overrides = await client.query(
+      `SELECT p.code, ovr.granted FROM employee_permission_overrides ovr
+         JOIN permissions p ON p.id = ovr.permission_id
+        WHERE ovr.employee_id = $1`,
+      [req.params.id]
+    );
+    return Object.fromEntries(overrides.rows.map((o) => [o.code, o.granted]));
+  });
+
+  res.json({ overrides: result });
+}));
+
 employeeRouter.post("/:id/attendance", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     workDate: z.string(),
