@@ -394,6 +394,17 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
       vars: { order_number: order.order_number, status: "مرسلة إلى المورد" },
     });
 
+    const { rows: suppliers } = await client.query(
+      `SELECT DISTINCT supplier_id FROM order_suppliers WHERE order_id = $1`, [order.id]
+    );
+    for (const s of suppliers) {
+      await queueNotification(client, {
+        templateCode: "order.new_for_supplier", recipientType: "supplier",
+        recipientId: s.supplier_id, orderId: order.id,
+        vars: { order_number: order.order_number },
+      });
+    }
+
     return updated;
   });
 
@@ -836,6 +847,22 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
       action: "order.delivered", entityType: "order", entityId: order.id,
       entityLabel: order.order_number, after: updated, ip: req.ip,
     });
+
+    const { rows: supplierNames } = await client.query(
+      `SELECT DISTINCT s.business_name FROM order_suppliers os
+         JOIN suppliers s ON s.id = os.supplier_id WHERE os.order_id = $1`,
+      [order.id]
+    );
+    await queueNotification(client, {
+      templateCode: "order.delivered_thanks", recipientType: "customer",
+      recipientId: order.customer_id, orderId: order.id,
+      vars: {
+        order_number: order.order_number,
+        total: Number(updated.grand_total).toFixed(2),
+        suppliers: supplierNames.map((s) => s.business_name).join("، "),
+      },
+    });
+
     return updated;
   });
 
@@ -878,12 +905,27 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
     );
 
     if (pending.remaining === 0) {
-      await client.query(
-        `UPDATE orders SET status = 'delivered', delivered_at = now() WHERE id = $1`,
+      const { rows: [deliveredOrder] } = await client.query(
+        `UPDATE orders SET status = 'delivered', delivered_at = now() WHERE id = $1 RETURNING *`,
         [part.order_id]
       );
       await recordStatus(client, {
         orderId: part.order_id, from: "awaiting_pickup", to: "delivered", actor: req.actor,
+      });
+
+      const { rows: supplierNames } = await client.query(
+        `SELECT DISTINCT s.business_name FROM order_suppliers os
+           JOIN suppliers s ON s.id = os.supplier_id WHERE os.order_id = $1`,
+        [part.order_id]
+      );
+      await queueNotification(client, {
+        templateCode: "order.delivered_thanks", recipientType: "customer",
+        recipientId: deliveredOrder.customer_id, orderId: part.order_id,
+        vars: {
+          order_number: part.order_number,
+          total: Number(deliveredOrder.grand_total).toFixed(2),
+          suppliers: supplierNames.map((s) => s.business_name).join("، "),
+        },
       });
     }
 
@@ -1166,3 +1208,4 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
 
   res.json(result);
 }));
+
