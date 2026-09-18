@@ -73,6 +73,28 @@ export async function runCreditDueReminders() {
   return rows.length;
 }
 
+// ينظّف رقم الهاتف الليبي لنفس الصيغة اللي يفهمها سيرفس واتساب (مطابق للمنطق في auth.js)
+function normalizePhoneForWhatsapp(rawPhone) {
+  let p = String(rawPhone).replace(/\D/g, "");
+  if (p.startsWith("00")) p = p.slice(2);
+  if (p.startsWith("0")) p = "218" + p.slice(1);
+  if (!p.startsWith("218")) p = "218" + p;
+  return p;
+}
+
+async function sendWhatsapp(phone, message) {
+  if (!process.env.WHATSAPP_SERVICE_URL || !process.env.WHATSAPP_SECRET_KEY) {
+    throw new Error("متغيرات سيرفس واتساب غير مضبوطة");
+  }
+  const res = await fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-secret-key": process.env.WHATSAPP_SECRET_KEY },
+    body: JSON.stringify({ phone: normalizePhoneForWhatsapp(phone), message }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `فشل الإرسال (${res.status})`);
+}
+
 export async function dispatchWhatsappQueue() {
   const { rows } = await query(
     `SELECT n.id, n.body, n.recipient_type, n.recipient_id
@@ -89,9 +111,7 @@ export async function dispatchWhatsappQueue() {
       const { rows: p } = await query(`SELECT phone FROM ${table} WHERE id = $1`, [n.recipient_id]);
       if (!p.length) throw new Error("رقم المستلم غير موجود");
 
-      if (process.env.NODE_ENV !== "production") {
-        console.log(`[WhatsApp] ${p[0].phone}: ${n.body}`);
-      }
+      await sendWhatsapp(p[0].phone, n.body);
 
       await query(
         `UPDATE notifications SET whatsapp_status = 'sent', whatsapp_sent_at = now() WHERE id = $1`,
