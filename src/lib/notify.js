@@ -45,6 +45,27 @@ export async function notifySectionArrival(client, { sectionId, sectionName }) {
   return rows.length;
 }
 
+// إشعار "رجوع التوفر" — يُستخدم بس لما صنف كانت كميته صفر ورجعت موجبة، وبس
+// للعملاء اللي عندهم هذا الصنف بالذات في المفضلة (مش لكل عملاء القسم)
+export async function notifyFavoriteRestock(client, { productId, productName }) {
+  const { rows } = await client.query(
+    `SELECT cf.customer_id FROM customer_favorites cf
+       JOIN customers c ON c.id = cf.customer_id
+      WHERE cf.product_id = $1 AND c.status = 'approved'`,
+    [productId]
+  );
+
+  for (const r of rows) {
+    await queueNotification(client, {
+      templateCode: "product.restocked",
+      recipientType: "customer",
+      recipientId: r.customer_id,
+      vars: { product_name: productName },
+    });
+  }
+  return rows.length;
+}
+
 export async function runCreditDueReminders() {
   const { rows } = await query(
     `SELECT o.id, o.order_number, o.customer_id, o.deferred_due_date,
@@ -125,4 +146,50 @@ export async function dispatchWhatsappQueue() {
     }
   }
   return rows.length;
+}
+
+// رسالة مباشرة لرقم المدير المسؤول (WHATSAPP_MANAGER_PHONE) — مالهاش علاقة بجدول
+// الإشعارات، تُستخدم لإشعارات الإدارة الداخلية (إيصالات، تقرير يومي)
+export async function notifyManager(message) {
+  if (!process.env.WHATSAPP_MANAGER_PHONE) return;
+  try {
+    await sendWhatsapp(process.env.WHATSAPP_MANAGER_PHONE, message);
+  } catch (err) {
+    console.error("[إشعار المدير]", err.message);
+  }
+}
+
+// تقرير أرباح مختصر لليوم الحالي — عمولة جملة المحصّلة ناقص المصروفات، يُبعث للمدير
+export async function sendDailyProfitReport() {
+  const { rows } = await query(
+    `SELECT
+        COALESCE((
+          SELECT SUM(os.subtotal * os.commission_rate / 100.0)
+            FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+           WHERE o.status IN ('delivered','closed') AND o.delivered_at::DATE = CURRENT_DATE
+        ), 0) AS commission,
+        COALESCE((SELECT SUM(amount) FROM expenses WHERE expense_date = CURRENT_DATE), 0) AS expenses`
+  );
+  const commission = Number(rows[0].commission);
+  const expenses = Number(rows[0].expenses);
+  const dateLabel = new Date().toLocaleDateString("ar-LY", { day: "numeric", month: "long", year: "numeric" });
+
+  await notifyManager(
+    `تقرير أرباح جملة اليومي — ${dateLabel}\n` +
+    `عمولة محصّلة: ${commission.toFixed(2)} د.ل\n` +
+    `مصروفات: ${expenses.toFixed(2)} د.ل\n` +
+    `صافي الربح: ${(commission - expenses).toFixed(2)} د.ل`
+  );
+}
+
+// يشغّل تقرير اليوم مرة واحدة فقط قريب من نهاية اليوم بتوقيت ليبيا (UTC+2)
+let lastDailyReportSentOn = null;
+export async function maybeSendDailyProfitReport() {
+  const now = new Date();
+  const libyaHour = (now.getUTCHours() + 2) % 24;
+  const todayKey = now.toISOString().slice(0, 10);
+  if (libyaHour === 23 && now.getUTCMinutes() >= 50 && lastDailyReportSentOn !== todayKey) {
+    lastDailyReportSentOn = todayKey;
+    await sendDailyProfitReport();
+  }
 }
