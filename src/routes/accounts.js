@@ -7,6 +7,24 @@ import { queueNotification } from "../lib/notify.js";
 
 export const accountsRouter = Router();
 
+// سجل تدقيق عام لكل العمليات المسجّلة في المنظومة (اعتماد، تعديل، حذف...) — عرض فقط
+// لازم يكون معرّف قبل مسارات "/:kind" العامة تحت، وإلا Express يفهم "audit/logs"
+// كإنه kind="audit" و id="logs" ويرفضها بدل ما يوصل لهذا المسار
+accountsRouter.get("/audit/logs", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
+  const { entityType, search, limit, actorId, entityId } = req.query;
+  const { rows } = await query(
+    `SELECT * FROM audit_log
+      WHERE ($1::TEXT IS NULL OR entity_type = $1)
+        AND ($2::TEXT IS NULL OR actor_name ILIKE '%'||$2||'%' OR entity_label ILIKE '%'||$2||'%' OR action ILIKE '%'||$2||'%')
+        AND ($4::UUID IS NULL OR actor_id = $4)
+        AND ($5::UUID IS NULL OR entity_id = $5)
+      ORDER BY created_at DESC
+      LIMIT $3`,
+    [entityType || null, search || null, Math.min(Number(limit) || 200, 500), actorId || null, entityId || null]
+  );
+  res.json(rows);
+}));
+
 const registerSchema = z.object({
   businessName: z.string().min(2),
   phone: z.string().min(9),
@@ -411,20 +429,6 @@ accountsRouter.patch("/customer/:id/credit", requirePermission("accounts.approve
   });
 
   res.json(result);
-}));
-
-// سجل تدقيق عام لكل العمليات المسجّلة في المنظومة (اعتماد، تعديل، حذف...) — عرض فقط
-accountsRouter.get("/audit/logs", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
-  const { entityType, search, limit } = req.query;
-  const { rows } = await query(
-    `SELECT * FROM audit_log
-      WHERE ($1::TEXT IS NULL OR entity_type = $1)
-        AND ($2::TEXT IS NULL OR actor_name ILIKE '%'||$2||'%' OR entity_label ILIKE '%'||$2||'%' OR action ILIKE '%'||$2||'%')
-      ORDER BY created_at DESC
-      LIMIT $3`,
-    [entityType || null, search || null, Math.min(Number(limit) || 200, 500)]
-  );
-  res.json(rows);
 }));
 accountsRouter.patch("/supplier/:id/commission-rate", requirePermission("finance.commission"), asyncRoute(async (req, res) => {
   const { commissionRate } = z.object({
