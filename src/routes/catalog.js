@@ -3,6 +3,7 @@ import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, resolvePrice, nextDocNumber } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
+import { notifySectionArrival } from "../lib/notify.js";
 
 export const catalogRouter = Router();
 catalogRouter.use(authenticate);
@@ -180,6 +181,12 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
       action: "product.created", entityType: "product", entityId: rows[0].id,
       entityLabel: body.name, after: rows[0], ip: req.ip,
     });
+
+    const { rows: sec } = await client.query(`SELECT name FROM sections WHERE id = $1`, [body.sectionId]);
+    if (sec.length) {
+      await notifySectionArrival(client, { sectionId: body.sectionId, sectionName: sec[0].name });
+    }
+
     return rows[0];
   });
 
@@ -556,6 +563,12 @@ catalogRouter.post("/products/import/confirm-new", asyncRoute(async (req, res, n
       action: "products.imported_new", entityType: "product", entityId: supplierId,
       entityLabel: `إضافة ${created.length} صنف جديد عبر إكسل`, after: { count: created.length }, ip: req.ip,
     });
+
+    const distinctSectionIds = [...new Set(created.map((p) => p.section_id))];
+    for (const sid of distinctSectionIds) {
+      const { rows: sec } = await client.query(`SELECT name FROM sections WHERE id = $1`, [sid]);
+      if (sec.length) await notifySectionArrival(client, { sectionId: sid, sectionName: sec[0].name });
+    }
 
     return { created, voucher };
   });
