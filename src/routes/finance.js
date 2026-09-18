@@ -63,6 +63,17 @@ financeRouter.post("/vouchers", requirePermission("finance.vouchers"), asyncRout
       );
     }
 
+    if (approvalStatus === "approved" && body.partyId && (body.partyType === "customer" || body.partyType === "supplier")) {
+      await queueNotification(client, {
+        templateCode: "voucher.recorded", recipientType: body.partyType,
+        recipientId: body.partyId, orderId: body.orderId ?? null,
+        vars: {
+          voucher_number: number, amount: Number(body.amount).toFixed(2),
+          voucher_type_label: body.voucherType === "receipt" ? "قبض" : "دفع",
+        },
+      });
+    }
+
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "voucher.issued", entityType: "voucher", entityId: voucher.id,
@@ -110,11 +121,20 @@ financeRouter.post("/vouchers/:id/decide", requirePermission("finance.vouchers")
       before: v, after: updated, ip: req.ip,
     });
 
-    if (v.party_type === "customer" && v.party_id) {
+    if (approve && v.party_id && (v.party_type === "customer" || v.party_type === "supplier")) {
+      await queueNotification(client, {
+        templateCode: "voucher.recorded", recipientType: v.party_type,
+        recipientId: v.party_id, orderId: v.order_id,
+        vars: {
+          voucher_number: v.voucher_number, amount: Number(v.amount).toFixed(2),
+          voucher_type_label: v.voucher_type === "receipt" ? "قبض" : "دفع",
+        },
+      });
+    } else if (!approve && v.party_type === "customer" && v.party_id) {
       await queueNotification(client, {
         templateCode: "transfer.decision", recipientType: "customer",
         recipientId: v.party_id, orderId: v.order_id,
-        vars: { decision: approve ? "اعتماد" : "رفض", order_number: v.voucher_number },
+        vars: { decision: "رفض", order_number: v.voucher_number },
       });
     }
     return updated;
