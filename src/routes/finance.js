@@ -3,7 +3,7 @@ import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType } from "../middleware/auth.js";
-import { queueNotification } from "../lib/notify.js";
+import { queueNotification, notifyManager } from "../lib/notify.js";
 
 export const financeRouter = Router();
 financeRouter.use(authenticate);
@@ -82,6 +82,13 @@ financeRouter.post("/vouchers", requirePermission("finance.vouchers"), asyncRout
     return voucher;
   });
 
+  if (voucher.approval_status === "approved") {
+    notifyManager(
+      `إيصال ${voucher.voucher_type === "receipt" ? "قبض" : "دفع"} جديد\n` +
+      `رقم: ${voucher.voucher_number}\nباسم: ${voucher.party_name}\nبقيمة: ${Number(voucher.amount).toFixed(2)} د.ل`
+    ).catch(() => {});
+  }
+
   res.status(201).json(voucher);
 }));
 
@@ -139,6 +146,13 @@ financeRouter.post("/vouchers/:id/decide", requirePermission("finance.vouchers")
     }
     return updated;
   });
+
+  if (approve) {
+    notifyManager(
+      `إيصال ${result.voucher_type === "receipt" ? "قبض" : "دفع"} معتمد\n` +
+      `رقم: ${result.voucher_number}\nباسم: ${result.party_name}\nبقيمة: ${Number(result.amount).toFixed(2)} د.ل`
+    ).catch(() => {});
+  }
 
   res.json(result);
 }));
