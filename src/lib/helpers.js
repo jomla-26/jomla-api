@@ -54,9 +54,12 @@ export async function resolvePrice(client, { productId, customerId, qty }) {
   return base.rows[0].base_price;
 }
 
+// خزينة الحوالات (hawala) تستقبل/تُخصم منها أي عملية بطريقة "حوالة مصرفية"،
+// سواء كانت قبض أو دفع — قبل هذا الإصلاح كل عمليات القبض كانت تذهب لخزينة
+// المبيعات (sales) دائمًا بدون التحقق من الطريقة
 export function resolveTreasuryCode(direction, method) {
-  if (direction === "receipt") return "sales";
-  return method === "transfer" ? "hawala" : "main";
+  if (method === "transfer") return "hawala";
+  return direction === "receipt" ? "sales" : "main";
 }
 
 export async function calcDeliveryFee(client, { zoneId, vehicleTypeId, vehiclesCount, supplierCount }) {
