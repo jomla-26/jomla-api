@@ -25,9 +25,18 @@ async function assertThreadAccess(actor, orderId, threadType, orderSupplierId) {
   throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
 }
 
+// المحادثة إما مع العميل (customer_support) أو مع مورد معيّن (supplier_admin).
+// المورد نفسه دايمًا في محادثته الخاصة، والأدمن يحدد أي محادثة يقصدها بوجود
+// orderSupplierId من عدمه — بدل ما كل شي كان يسقط على محادثة العميل افتراضيًا
+function resolveThreadType(actor, orderSupplierId) {
+  if (actor.type === "supplier") return "supplier_admin";
+  if (actor.type === "employee" && orderSupplierId) return "supplier_admin";
+  return "customer_support";
+}
+
 engagementRouter.get("/orders/:orderId/messages", asyncRoute(async (req, res) => {
-  const threadType = req.actor.type === "supplier" ? "supplier_admin" : "customer_support";
   const orderSupplierId = req.query.orderSupplierId || null;
+  const threadType = resolveThreadType(req.actor, orderSupplierId);
   await assertThreadAccess(req.actor, req.params.orderId, threadType, orderSupplierId);
 
   const { rows } = await query(
@@ -47,7 +56,7 @@ const messageSchema = z.object({
 
 engagementRouter.post("/orders/:orderId/messages", asyncRoute(async (req, res) => {
   const parsed = messageSchema.parse(req.body);
-  const threadType = req.actor.type === "supplier" ? "supplier_admin" : "customer_support";
+  const threadType = resolveThreadType(req.actor, parsed.orderSupplierId || null);
   await assertThreadAccess(req.actor, req.params.orderId, threadType, parsed.orderSupplierId || null);
 
   const { rows } = await query(
@@ -157,6 +166,38 @@ engagementRouter.patch("/feedback/:id/resolve", requirePermission("orders.review
   }
 
   res.json(rows[0]);
+}));
+
+// جرس الإشعارات — كل حساب (مورد/عميل/موظف) يشوف إشعاراته هو بس
+engagementRouter.get("/notifications", asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `SELECT * FROM notifications
+      WHERE recipient_type = $1 AND recipient_id = $2
+      ORDER BY created_at DESC
+      LIMIT 100`,
+    [req.actor.type, req.actor.id]
+  );
+  const unreadCount = rows.filter((n) => !n.in_app_read_at).length;
+  res.json({ notifications: rows, unreadCount });
+}));
+
+engagementRouter.patch("/notifications/:id/read", asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `UPDATE notifications SET in_app_read_at = now()
+      WHERE id = $1 AND recipient_type = $2 AND recipient_id = $3 AND in_app_read_at IS NULL
+     RETURNING *`,
+    [req.params.id, req.actor.type, req.actor.id]
+  );
+  res.json(rows[0] || { alreadyRead: true });
+}));
+
+engagementRouter.post("/notifications/read-all", asyncRoute(async (req, res) => {
+  await query(
+    `UPDATE notifications SET in_app_read_at = now()
+      WHERE recipient_type = $1 AND recipient_id = $2 AND in_app_read_at IS NULL`,
+    [req.actor.type, req.actor.id]
+  );
+  res.json({ done: true });
 }));
 
 engagementRouter.get("/favorites", asyncRoute(async (req, res) => {
