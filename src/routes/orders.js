@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
-import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee } from "../lib/helpers.js";
+import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
 import { queueNotification } from "../lib/notify.js";
 
@@ -410,6 +410,65 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
     }
 
     return updated;
+  });
+
+  res.json(result);
+}));
+
+// تأكيد قيمة حوالة مصرفية دخلت فعليًا لحساب الشركة (بعد ما يتأكد الأدمن منها بنفسه بالبنك) —
+// يسجّل إيصال قبض معتمد فورًا في خزينة الحوالات، ويحدّث المبلغ المدفوع على الطلبية،
+// عشان "المبلغ المطلوب من المندوب" بعدين يُحسب صح (المتبقي بس، مش المبلغ كامل)
+orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const { amount } = z.object({ amount: z.number().positive() }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]
+    );
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+    if (order.payment_method !== "transfer") throw new ApiError(400, "الطلبية ليست بطريقة الحوالة المصرفية");
+
+    const remaining = Number(order.grand_total) - Number(order.paid_amount);
+    // الزيادة عن قيمة الفاتورة تُسجَّل بالكامل في الإيصال (تظهر كرصيد للعميل بكشف حسابه)،
+    // بس المُطبَّق على هذي الطلبية بالذات محدود بالمتبقي عليها بس
+    const appliedToOrder = Math.min(amount, Math.max(remaining, 0));
+
+    const { rows: cust } = await client.query(`SELECT business_name FROM customers WHERE id = $1`, [order.customer_id]);
+
+    const { rows: tr } = await client.query(
+      `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("receipt", "transfer")]
+    );
+    if (!tr.length) throw new ApiError(400, "الخزينة غير معروفة");
+
+    const vNumber = await nextDocNumber(client, {
+      table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+    });
+    const { rows: [voucher] } = await client.query(
+      `INSERT INTO vouchers
+         (voucher_number, voucher_type, party_type, party_id, party_name,
+          amount, method, treasury_id, order_id, approval_status, approved_by, approved_at, note, created_by)
+       VALUES ($1,'receipt','customer',$2,$3,$4,'transfer',$5,$6,'approved',$7,now(),$8,$7)
+       RETURNING *`,
+      [vNumber, order.customer_id, cust[0]?.business_name ?? "عميل", amount, tr[0].id, order.id,
+       req.actor.id, `تأكيد حوالة — طلبية ${order.order_number}`]
+    );
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET
+         paid_amount = paid_amount + $2,
+         payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
+       WHERE id = $1 RETURNING *`,
+      [order.id, appliedToOrder]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.transfer_confirmed", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
+    });
+
+    return { order: updated, voucher, excessAsCredit: Math.max(0, amount - remaining) };
   });
 
   res.json(result);
