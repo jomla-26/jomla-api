@@ -658,8 +658,46 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
   res.json(result);
 }));
 
-// تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
-orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+// تعديل يدوي لرسوم التوصيل — حسب الاتفاق مع العميل، بدل الاعتماد حصرًا على حساب
+// المنطقة+نوع السيارة الثابت. متاح لأي طلبية توصيل لسا ما اتسلّمتش أو اتلغتش
+orderRouter.patch("/:id/delivery-fee", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const { deliveryFee, note } = z.object({
+    deliveryFee: z.number().nonnegative(),
+    note: z.string().optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+
+    if (["delivered", "cancelled", "closed"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل رسوم التوصيل لطلبية تم تسليمها أو إلغاؤها");
+    }
+    if (order.fulfillment !== "delivery") {
+      throw new ApiError(400, "هذي طلبية استلام شخصي، لا رسوم توصيل عليها");
+    }
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET delivery_fee = $2, grand_total = items_subtotal + $2 WHERE id = $1 RETURNING *`,
+      [order.id, deliveryFee]
+    );
+
+    await recordStatus(client, {
+      orderId: order.id, from: order.status, to: order.status, actor: req.actor,
+      note: note || `تعديل رسوم التوصيل يدويًا إلى ${deliveryFee} د.ل`,
+    });
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.delivery_fee_updated", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
+    });
+
+    return updated;
+  });
+
+  res.json(result);
+}));
   const { orderIds, status, note, driverId } = z.object({
     orderIds: z.array(z.string().uuid()).min(1),
     status: z.string(),
