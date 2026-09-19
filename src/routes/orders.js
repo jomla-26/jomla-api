@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
-import { authenticate, requirePermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
+import { authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
 import { queueNotification } from "../lib/notify.js";
 
 export const orderRouter = Router();
@@ -307,7 +307,21 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
       ORDER BY o.created_at DESC`,
     [status || null]
   );
-  res.json(rows);
+
+  const scope = await getEmployeeSectionScope(a.id);
+  if (scope === null) return res.json(rows);
+
+  // موظف مقيّد بأقسام يشوف بس الطلبيات اللي كل أصنافها ضمن نطاقه
+  const filtered = [];
+  for (const o of rows) {
+    const { rows: secs } = await query(
+      `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = $1`,
+      [o.id]
+    );
+    if (secs.every((s) => scope.has(s.section_id))) filtered.push(o);
+  }
+  res.json(filtered);
 }));
 
 orderRouter.get("/:id", asyncRoute(async (req, res) => {
@@ -355,6 +369,18 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
     depositDueAtDelivery: z.number().nonnegative().optional(),
     deferredDueDate: z.string().optional(),
   }).parse(req.body ?? {});
+
+  const scope = await getEmployeeSectionScope(req.actor.id);
+  if (scope !== null) {
+    const { rows: secs } = await query(
+      `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = $1`,
+      [req.params.id]
+    );
+    if (!secs.every((s) => scope.has(s.section_id))) {
+      throw new ApiError(403, "الطلبية تحتوي على صنف من قسم خارج نطاق صلاحياتك");
+    }
+  }
 
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
