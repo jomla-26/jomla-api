@@ -11,7 +11,7 @@ catalogRouter.use(authenticate);
 catalogRouter.get("/sections", asyncRoute(async (req, res) => {
   if (req.actor.type === "customer") {
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug
+      `SELECT s.id, s.name, s.slug, s.image_url
          FROM customer_sections cs
          JOIN sections s ON s.id = cs.section_id
         WHERE cs.customer_id = $1 AND cs.enabled AND s.is_active
@@ -22,7 +22,7 @@ catalogRouter.get("/sections", asyncRoute(async (req, res) => {
   }
   if (req.actor.type === "supplier") {
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug, s.is_active
+      `SELECT s.id, s.name, s.slug, s.image_url, s.is_active
          FROM supplier_sections ss
          JOIN sections s ON s.id = ss.section_id
         WHERE ss.supplier_id = $1 AND s.is_active
@@ -32,7 +32,7 @@ catalogRouter.get("/sections", asyncRoute(async (req, res) => {
     return res.json(rows);
   }
   const { rows } = await query(
-    `SELECT id, name, slug, is_active FROM sections ORDER BY sort_order`
+    `SELECT id, name, slug, image_url, is_active FROM sections ORDER BY sort_order`
   );
   res.json(rows);
 }));
@@ -42,13 +42,14 @@ catalogRouter.post("/sections", requirePermission("accounts.sections"), asyncRou
     name: z.string().min(2),
     slug: z.string().min(2).regex(/^[a-z0-9-]+$/),
     sortOrder: z.number().int().optional(),
+    imageUrl: z.string().url().optional(),
   }).parse(req.body);
 
   const section = await withTransaction(async (client) => {
     const { rows } = await client.query(
-      `INSERT INTO sections (name, slug, sort_order, created_by)
-       VALUES ($1,$2,COALESCE($3, 0),$4) RETURNING *`,
-      [body.name, body.slug, body.sortOrder, req.actor.id]
+      `INSERT INTO sections (name, slug, sort_order, image_url, created_by)
+       VALUES ($1,$2,COALESCE($3, 0),$4,$5) RETURNING *`,
+      [body.name, body.slug, body.sortOrder, body.imageUrl ?? null, req.actor.id]
     );
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -65,6 +66,7 @@ catalogRouter.patch("/sections/:id", requirePermission("accounts.sections"), asy
   const body = z.object({
     name: z.string().min(2).optional(),
     isActive: z.boolean().optional(),
+    imageUrl: z.string().url().optional(),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -74,9 +76,10 @@ catalogRouter.patch("/sections/:id", requirePermission("accounts.sections"), asy
     const { rows } = await client.query(
       `UPDATE sections SET
          name = COALESCE($2, name),
-         is_active = COALESCE($3, is_active)
+         is_active = COALESCE($3, is_active),
+         image_url = COALESCE($4, image_url)
        WHERE id = $1 RETURNING *`,
-      [req.params.id, body.name ?? null, body.isActive ?? null]
+      [req.params.id, body.name ?? null, body.isActive ?? null, body.imageUrl ?? null]
     );
 
     await writeAudit(client, {
