@@ -312,7 +312,8 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
 
 orderRouter.get("/:id", asyncRoute(async (req, res) => {
   const { rows } = await query(
-    `SELECT o.*, c.business_name AS customer_name, c.phone AS customer_phone, c.address
+    `SELECT o.*, c.business_name AS customer_name, c.phone AS customer_phone,
+            c.address, c.latitude AS customer_latitude, c.longitude AS customer_longitude
        FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE o.id = $1`,
     [req.params.id]
@@ -325,7 +326,8 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
   }
 
   const suppliers = await query(
-    `SELECT os.*, s.business_name AS supplier_name
+    `SELECT os.*, s.business_name AS supplier_name, s.phone AS supplier_phone,
+            s.address AS supplier_address, s.latitude AS supplier_latitude, s.longitude AS supplier_longitude
        FROM order_suppliers os JOIN suppliers s ON s.id = os.supplier_id
       WHERE os.order_id = $1`,
     [req.params.id]
@@ -339,10 +341,12 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
 
   res.json({
     ...order,
-    suppliers: suppliers.rows.map((s) => ({
-      ...s,
-      items: items.rows.filter((i) => i.order_supplier_id === s.id),
-    })),
+    suppliers: suppliers.rows
+      .map((s) => ({
+        ...s,
+        items: items.rows.filter((i) => i.order_supplier_id === s.id),
+      }))
+      .filter((s) => s.items.length > 0),
     history: history.rows,
   });
 }));
@@ -779,6 +783,22 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
     if (!rows.length) throw new ApiError(404, "سجل النقص غير موجود");
     const shortage = rows[0];
 
+    if (body.resolution === "cancel_item") {
+      // "إلغاء الصنف" يشيله فعليًا من الفاتورة فورًا (مش بس يصفّره وينتظر حذف يدوي لاحقًا) —
+      // هذا يمنع بقاء أصناف صفرية عالقة تظهر بالغلط في الفاتورة وعند مندوب التوصيل
+      await client.query(`DELETE FROM order_shortages WHERE order_item_id = $1`, [shortage.order_item_id]);
+      await client.query(`DELETE FROM order_items WHERE id = $1`, [shortage.order_item_id]);
+      await recalcOrderTotals(client, shortage.order_id);
+
+      await writeAudit(client, {
+        actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+        action: "shortage.resolved_cancel_item", entityType: "order_shortage", entityId: shortage.id,
+        before: shortage, ip: req.ip,
+      });
+
+      return { orderId: shortage.order_id, resolution: "cancel_item", itemRemoved: true };
+    }
+
     const { rows: [updated] } = await client.query(
       `UPDATE order_shortages SET
          resolution = $2, substitute_product_id = $3,
@@ -787,13 +807,6 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
        WHERE id = $1 RETURNING *`,
       [shortage.id, body.resolution, body.substituteProductId ?? null, req.actor.id]
     );
-
-    if (body.resolution === "cancel_item") {
-      await client.query(
-        `UPDATE order_items SET qty_confirmed = 0, line_total = 0 WHERE id = $1`,
-        [shortage.order_item_id]
-      );
-    }
 
     await client.query(
       `UPDATE orders o SET
@@ -1278,16 +1291,15 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
       throw new ApiError(400, "لا يمكن حذف آخر صنف في الطلبية — استخدم إلغاء الطلبية بدلاً من ذلك");
     }
 
-    const { rows: [{ count: partCount }] } = await client.query(
-      `SELECT COUNT(*)::INT AS count FROM order_items WHERE order_supplier_id = $1`,
-      [item.order_supplier_id]
-    );
-
+    // لازم نحذف أي سجل نقص مرتبط بهذا الصنف أول، وإلا الحذف يترفض بسبب قيد
+    // المفتاح الأجنبي (يصير هذا كثير مع أصناف مرّت بمسار "نقص" قبل كذا)
+    await client.query(`DELETE FROM order_shortages WHERE order_item_id = $1`, [item.id]);
     await client.query(`DELETE FROM order_items WHERE id = $1`, [item.id]);
 
-    if (Number(partCount) <= 1) {
-      await client.query(`DELETE FROM order_suppliers WHERE id = $1`, [item.order_supplier_id]);
-    }
+    // ملاحظة: ما نحذفش صف "فاتورة المورد" (order_suppliers) حتى لو صار فاضي من كل
+    // الأصناف — هذا الصف مربوط بسجل حالة الطلبية (order_status_history) وغيره، وحذفه
+    // كان يفشل بنفس مشكلة قيد المفتاح الأجنبي. بدل كده، أي مورد فاضي من الأصناف
+    // يُستثنى تلقائيًا من الفاتورة وقائمة مواقع الاستلام عند المندوب (انظر GET /:id)
 
     await recalcOrderTotals(client, order.id);
 
