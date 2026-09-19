@@ -137,7 +137,7 @@ employeeRouter.delete("/:id", requirePermission("employees.manage"), asyncRoute(
 // كل الصلاحيات المعرّفة بالمنظومة — تُستخدم لبناء قائمة checkboxes في شاشة
 // "الصلاحيات الفردية" بلوحة الإدارة
 employeeRouter.get("/permissions", requirePermission("employees.manage"), asyncRoute(async (_req, res) => {
-  const { rows } = await query(`SELECT id, code, name FROM permissions ORDER BY name`);
+  const { rows } = await query(`SELECT id, code, description FROM permissions ORDER BY description`);
   res.json(rows);
 }));
 
@@ -150,7 +150,7 @@ employeeRouter.get("/:id/permissions", requirePermission("employees.manage"), as
   );
   if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
 
-  const all = await query(`SELECT id, code, name FROM permissions ORDER BY name`);
+  const all = await query(`SELECT id, code, description FROM permissions ORDER BY description`);
   const roleGranted = await query(
     `SELECT p.code FROM role_permissions rp
        JOIN permissions p ON p.id = rp.permission_id
@@ -199,10 +199,10 @@ employeeRouter.patch("/:id/permissions", requirePermission("employees.manage"), 
         );
       } else {
         await client.query(
-          `INSERT INTO employee_permission_overrides (employee_id, permission_id, granted, assigned_by)
-           VALUES ($1,$2,$3,$4)
-           ON CONFLICT (employee_id, permission_id) DO UPDATE SET granted = $3, assigned_by = $4`,
-          [req.params.id, permissionId, o.granted, req.actor.id]
+          `INSERT INTO employee_permission_overrides (employee_id, permission_id, granted)
+           VALUES ($1,$2,$3)
+           ON CONFLICT (employee_id, permission_id) DO UPDATE SET granted = $3`,
+          [req.params.id, permissionId, o.granted]
         );
       }
     }
