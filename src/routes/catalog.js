@@ -334,6 +334,42 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
     [supplierId || null, sectionId || null]
   );
 
+  // أصناف راكدة: مافيهاش أي حركة مخزون (إضافة/خصم) آخر 30 يوم — تشمل مافيهاش
+  // حركة أبدًا منذ إضافتها. تفيد لمعرفة الأصناف اللي ما تتحرّكش عشان مراجعتها
+  const staleItems = await query(
+    `SELECT p.id, p.name, p.unit, p.stock_qty, p.supplier_sku,
+            s.business_name AS supplier_name, sec.name AS section_name,
+            lm.last_movement_at
+       FROM products p
+       JOIN suppliers s  ON s.id  = p.supplier_id
+       JOIN sections sec ON sec.id = p.section_id
+       LEFT JOIN (
+         SELECT product_id, MAX(created_at) AS last_movement_at
+           FROM stock_movements GROUP BY product_id
+       ) lm ON lm.product_id = p.id
+      WHERE p.is_active
+        AND (lm.last_movement_at IS NULL OR lm.last_movement_at < now() - interval '30 days')
+        AND ($1::UUID IS NULL OR p.supplier_id = $1)
+        AND ($2::UUID IS NULL OR p.section_id  = $2)
+      ORDER BY lm.last_movement_at ASC NULLS FIRST
+      LIMIT 100`,
+    [supplierId || null, sectionId || null]
+  );
+
+  // حركة المخزون اليومية آخر 30 يوم (إضافة مقابل خصم) — لمتابعة نشاط المخزون عبر الوقت
+  const movementSeries = await query(
+    `SELECT date_trunc('day', sm.created_at)::DATE AS day,
+            COALESCE(SUM(change_qty) FILTER (WHERE change_qty > 0), 0) AS stock_in,
+            COALESCE(SUM(-change_qty) FILTER (WHERE change_qty < 0), 0) AS stock_out
+       FROM stock_movements sm
+       JOIN products p ON p.id = sm.product_id
+      WHERE sm.created_at >= now() - interval '30 days'
+        AND ($1::UUID IS NULL OR p.supplier_id = $1)
+        AND ($2::UUID IS NULL OR p.section_id  = $2)
+      GROUP BY day ORDER BY day`,
+    [supplierId || null, sectionId || null]
+  );
+
   res.json({
     productsCount: totals.rows[0].products_count,
     totalUnits: totals.rows[0].total_units,
@@ -342,6 +378,8 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
     lowStockCount: totals.rows[0].low_stock_count,
     bySupplier: bySupplier.rows,
     lowStockItems: lowStockItems.rows,
+    staleItems: staleItems.rows,
+    movementSeries: movementSeries.rows,
   });
 }));
 
