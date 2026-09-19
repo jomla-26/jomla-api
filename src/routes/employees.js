@@ -225,6 +225,57 @@ employeeRouter.patch("/:id/permissions", requirePermission("employees.manage"), 
   res.json({ overrides: result });
 }));
 
+// نطاق الأقسام المخصّص لموظف — لو رجّع sectionIds فاضية يبقى الموظف غير مقيّد
+// (يشتغل على كل الأقسام زي أي موظف عادي)
+employeeRouter.get("/:id/section-scope", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const emp = await query(`SELECT id, name FROM employees WHERE id = $1`, [req.params.id]);
+  if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+  const scope = await query(
+    `SELECT s.id, s.name FROM employee_section_scope ess
+       JOIN sections s ON s.id = ess.section_id
+      WHERE ess.employee_id = $1
+      ORDER BY s.sort_order`,
+    [req.params.id]
+  );
+  res.json({ employee: emp.rows[0], sections: scope.rows });
+}));
+
+// تحديث نطاق الأقسام: sectionIds فاضية = إلغاء التقييد بالكامل (يرجع موظف عادي غير مقيّد)
+employeeRouter.patch("/:id/section-scope", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const { sectionIds } = z.object({ sectionIds: z.array(z.string().uuid()) }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const emp = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
+
+    await client.query(`DELETE FROM employee_section_scope WHERE employee_id = $1`, [req.params.id]);
+    for (const sectionId of sectionIds) {
+      await client.query(
+        `INSERT INTO employee_section_scope (employee_id, section_id, assigned_by) VALUES ($1,$2,$3)`,
+        [req.params.id, sectionId, req.actor.id]
+      );
+    }
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "employee.section_scope_updated", entityType: "employee", entityId: req.params.id,
+      entityLabel: emp.rows[0].name, after: { sectionIds }, ip: req.ip,
+    });
+
+    const scope = await client.query(
+      `SELECT s.id, s.name FROM employee_section_scope ess
+         JOIN sections s ON s.id = ess.section_id
+        WHERE ess.employee_id = $1
+        ORDER BY s.sort_order`,
+      [req.params.id]
+    );
+    return scope.rows;
+  });
+
+  res.json({ sections: result });
+}));
+
 employeeRouter.post("/:id/attendance", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     workDate: z.string(),
