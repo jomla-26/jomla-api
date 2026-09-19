@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, normalizePhone } from "../lib/helpers.js";
-import { authenticate, requirePermission } from "../middleware/auth.js";
+import { authenticate, requirePermission, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
 import { queueNotification } from "../lib/notify.js";
 
 export const accountsRouter = Router();
@@ -109,6 +109,14 @@ async function fetchSections(client, cfg, entityId) {
   return rows;
 }
 
+// موظف مقيّد بأقسام يقدر دايمًا يشوف الحسابات "بانتظار الاعتماد" (ما عندهاش أقسام
+// معيّنة بعد أصلًا)، بس الحسابات المعتمدة/الموقوفة يشوف بس اللي فيها قسم من نطاقه
+function withinScope(account, scope) {
+  if (scope === null) return true;
+  if (account.status === "pending") return true;
+  return (account.sections || []).some((s) => scope.has(s.id));
+}
+
 accountsRouter.get("/:kind", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
   const cfg = assertKind(req.params.kind);
   const { status, search, includeDeleted } = req.query;
@@ -126,7 +134,9 @@ accountsRouter.get("/:kind", requirePermission("accounts.approve"), asyncRoute(a
 const withSections = await Promise.all(
     rows.map(async (r) => ({ ...r, sections: await fetchSections(pool, cfg, r.id).catch(() => []) }))
   );
-  res.json(withSections);
+
+  const scope = await getEmployeeSectionScope(req.actor.id);
+  res.json(withSections.filter((r) => withinScope(r, scope)));
 }));
 
 const updateSchema = z.object({
@@ -152,6 +162,12 @@ accountsRouter.patch("/:kind/:id", requirePermission("accounts.approve"), asyncR
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
+
+    const beforeSections = await fetchSections(client, cfg, req.params.id);
+    const scope = await getEmployeeSectionScope(req.actor.id);
+    if (!withinScope({ ...before.rows[0], sections: beforeSections }, scope)) {
+      throw new ApiError(403, "لا تملك صلاحية على هذا الحساب");
+    }
 
     if (body.phone) {
       const normalized = normalizePhone(body.phone);
@@ -211,6 +227,12 @@ accountsRouter.delete("/:kind/:id", requirePermission("accounts.approve"), async
     const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الحساب غير موجود");
 
+    const beforeSections = await fetchSections(client, cfg, req.params.id);
+    const scope = await getEmployeeSectionScope(req.actor.id);
+    if (!withinScope({ ...before.rows[0], sections: beforeSections }, scope)) {
+      throw new ApiError(403, "لا تملك صلاحية على هذا الحساب");
+    }
+
     const { rows } = await client.query(
             `UPDATE ${cfg.table} SET status = 'suspended' WHERE id = $1 RETURNING id, business_name, status`,
       [req.params.id]
@@ -232,6 +254,12 @@ accountsRouter.get("/:kind/:id", requirePermission("accounts.approve"), asyncRou
   const { rows } = await query(`SELECT * FROM ${cfg.table} WHERE id = $1`, [req.params.id]);
   if (!rows.length) throw new ApiError(404, "الحساب غير موجود");
   const sections = await fetchSections(pool, cfg, req.params.id);
+
+  const scope = await getEmployeeSectionScope(req.actor.id);
+  if (!withinScope({ ...rows[0], sections }, scope)) {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذا الحساب");
+  }
+
   res.json({ ...rows[0], sections });
 }));
 
@@ -256,6 +284,9 @@ accountsRouter.post("/:kind", requirePermission("accounts.approve"), asyncRoute(
   if (req.params.kind === "supplier" && body.commissionRate === undefined) {
     throw new ApiError(400, "نسبة العمولة مطلوبة عند إضافة مورد");
   }
+
+  // موظف مقيّد بأقسام يقدر بس ينشئ حساب ويمنحه أقسامًا داخل نطاقه هو
+  await assertSectionScope(req.actor.id, body.sectionIds);
 
   const account = await withTransaction(async (client) => {
     const dup = await client.query(`SELECT id FROM ${cfg.table} WHERE phone = $1`, [phone]);
@@ -303,6 +334,10 @@ accountsRouter.post("/:kind", requirePermission("accounts.approve"), asyncRoute(
 accountsRouter.post("/:kind/:id/approve", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
   const cfg = assertKind(req.params.kind);
   const { sectionIds } = z.object({ sectionIds: z.array(z.string().uuid()).default([]) }).parse(req.body ?? {});
+
+  // موظف مقيّد بأقسام يقدر بس يعتمد الحساب ضمن أقسام نطاقه — لازم يحدد قسم وحد
+  // على الأقل من نطاقه، وما يقدرش يمنح أي قسم خارج نطاقه
+  await assertSectionScope(req.actor.id, sectionIds);
 
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM ${cfg.table} WHERE id = $1 FOR UPDATE`, [req.params.id]);
@@ -376,6 +411,9 @@ accountsRouter.post("/:kind/:id/reject", requirePermission("accounts.approve"), 
 accountsRouter.patch("/:kind/:id/sections", requirePermission("accounts.sections"), asyncRoute(async (req, res) => {
   const cfg = assertKind(req.params.kind);
   const { sectionIds } = z.object({ sectionIds: z.array(z.string().uuid()) }).parse(req.body);
+
+  // موظف مقيّد بأقسام ما يقدرش يمنح الحساب أي قسم خارج نطاقه
+  await assertSectionScope(req.actor.id, sectionIds);
 
   const sections = await withTransaction(async (client) => {
     const exists = await client.query(`SELECT id FROM ${cfg.table} WHERE id = $1`, [req.params.id]);
