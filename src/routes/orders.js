@@ -698,6 +698,9 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.review"), async
 
   res.json(result);
 }));
+
+// تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
+orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const { orderIds, status, note, driverId } = z.object({
     orderIds: z.array(z.string().uuid()).min(1),
     status: z.string(),
