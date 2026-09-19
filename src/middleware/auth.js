@@ -100,3 +100,25 @@ export async function assertCustomerSection(customerId, sectionId) {
   );
   if (!rows.length) throw new ApiError(403, "هذا القسم غير مفعّل لحسابك");
 }
+
+// نطاق الأقسام المخصّص لموظف معيّن (لتقييد عمله على موردين/طلبيات أقسام بعينها).
+// إرجاع null يعني "غير مقيّد" — الموظف ما عندهوش صفوف بالجدول، فيشتغل على كل الأقسام
+// زي أي موظف عادي (وهذا يحافظ على سلوك كل الموظفين الحاليين بدون تغيير حتى نخصص أحدهم فعليًا)
+export async function getEmployeeSectionScope(employeeId) {
+  const { rows } = await query(
+    `SELECT section_id FROM employee_section_scope WHERE employee_id = $1`,
+    [employeeId]
+  );
+  return rows.length ? new Set(rows.map((r) => r.section_id)) : null;
+}
+
+// يتحقق إن كل قسم من الأقسام المطلوبة (sectionIds) داخل نطاق الموظف — يُستخدم وقت
+// اعتماد حساب أو تعديل أقسامه، عشان موظف مقيّد ما يقدرش يمنح/يعتمد قسم مو مخصص له
+export async function assertSectionScope(employeeId, sectionIds) {
+  const scope = await getEmployeeSectionScope(employeeId);
+  if (scope === null) return; // غير مقيّد
+  const ids = sectionIds ?? [];
+  if (!ids.length || !ids.every((id) => scope.has(id))) {
+    throw new ApiError(403, "لا تملك صلاحية على أحد الأقسام المطلوبة");
+  }
+}
