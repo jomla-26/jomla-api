@@ -18,6 +18,7 @@ import { deliveryRouter } from "./routes/delivery.js";
 import { engagementRouter } from "./routes/engagement.js";
 import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
+import { bannerRouter } from "./routes/banners.js";
 import { dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport } from "./lib/notify.js";
 
 const app = express();
@@ -50,6 +51,7 @@ app.use("/api/delivery", deliveryRouter);
 app.use("/api/engagement", engagementRouter);
 app.use("/api/assets", assetsRouter);
 app.use("/api/uploads", uploadRouter);
+app.use("/api/banners", bannerRouter);
 
 app.use((_req, res) => res.status(404).json({ error: "المسار غير موجود" }));
 
