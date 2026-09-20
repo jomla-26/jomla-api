@@ -79,6 +79,7 @@ uploadRouter.post("/image", (req, res, next) => {
       const { data } = supabase.storage.from(BUCKET).getPublicUrl(filename);
       res.status(201).json({ url: data.publicUrl });
     } catch (e) {
+      console.error("[UPLOAD]", e);
       next(new ApiError(500, "تعذّر رفع الصورة، يرجى المحاولة لاحقًا"));
     }
   });
