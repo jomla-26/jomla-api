@@ -1,124 +1,190 @@
-import jwt from "jsonwebtoken";
-import { query } from "../lib/db.js";
-import { ApiError } from "../lib/helpers.js";
+import { Router } from "express";
+import rateLimit from "express-rate-limit";
+import { z } from "zod";
+import { query, withTransaction, writeAudit } from "../lib/db.js";
+import { ApiError, asyncRoute, generateOtp, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
+import { signToken, authenticate } from "../middleware/auth.js";
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) throw new Error("JWT_SECRET غير معرّف في متغيرات البيئة");
+export const authRouter = Router();
 
-export function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "12h" });
-}
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: "محاولات كثيرة، يرجى المحاولة بعد قليل" },
+});
 
-export function authenticate(req, _res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token) return next(new ApiError(401, "يلزم تسجيل الدخول"));
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.actor = {
-      type: decoded.type,
-      id: decoded.sub,
-      name: decoded.name,
-      role: decoded.role || null,
-    };
-    next();
-  } catch {
-    next(new ApiError(401, "الجلسة منتهية، يرجى تسجيل الدخول من جديد"));
-  }
-}
-
-export const requireActorType = (...types) => (req, _res, next) => {
-  if (!req.actor || !types.includes(req.actor.type)) {
-    return next(new ApiError(403, "لا تملك صلاحية الوصول لهذه الشاشة"));
-  }
-  next();
+const TABLES = {
+  employee: { table: "employees", nameCol: "name",          activeClause: "AND is_active" },
+  customer: { table: "customers", nameCol: "business_name", activeClause: "AND status = 'approved'" },
+  supplier: { table: "suppliers", nameCol: "business_name", activeClause: "AND status = 'approved'" },
 };
 
-export const requirePermission = (permissionCode) => async (req, _res, next) => {
-  try {
-    if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
-    if (req.actor.type !== "employee") throw new ApiError(403, "هذا الإجراء مخصص لموظفي الشركة");
+const requestSchema = z.object({
+  accountType: z.enum(["employee", "customer", "supplier"]),
+  phone: z.string().min(9),
+});
 
-    const { rows } = await query(
-      `SELECT COALESCE(ovr.granted, TRUE) AS allowed
-         FROM employees e
-         JOIN roles r                 ON r.id = e.role_id
-         LEFT JOIN role_permissions rp ON rp.role_id = r.id
-         LEFT JOIN permissions p       ON p.id = rp.permission_id AND p.code = $2
-         LEFT JOIN employee_permission_overrides ovr
-                ON ovr.employee_id = e.id
-               AND ovr.permission_id = (SELECT id FROM permissions WHERE code = $2)
-        WHERE e.id = $1
-          AND e.is_active
-          AND (p.code IS NOT NULL OR ovr.granted IS TRUE)
-        LIMIT 1`,
-      [req.actor.id, permissionCode]
+authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
+  const { accountType, phone } = requestSchema.parse(req.body);
+  const cfg = TABLES[accountType];
+  const normalized = normalizePhone(phone);
+  const statusCol = accountType === "employee" ? "is_active" : "status";
+
+  const { rows } = await query(
+    `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status
+       FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
+    [normalized]
+  );
+
+  if (!rows.length) {
+    return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
+  }
+
+  const user = rows[0];
+  const isBlocked = accountType === "employee"
+    ? user.account_status === false
+    : user.account_status === "suspended";
+
+  if (isBlocked) {
+    throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
+  }
+
+  const isApproved = accountType === "employee"
+    ? user.account_status === true
+    : user.account_status === "approved";
+
+  if (!isApproved) {
+    return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
+  }
+
+  const otp = generateOtp();
+  const hash = await hashOtp(otp);
+  await query(
+    `UPDATE ${cfg.table}
+        SET otp_hash = $1, otp_expires_at = now() + interval '5 minutes'
+      WHERE id = $2`,
+    [hash, user.id]
+  );
+
+  if (process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
+
+  // إرسال الرمز عبر واتساب (سيرفس Baileys المستقل) — لا نوقف الطلب لو فشل الإرسال،
+  // فقط نسجّل الخطأ، عشان مشكلة مؤقتة بواتساب ما توقفش تسجيل الدخول بالكامل
+  if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
+    fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-secret-key": process.env.WHATSAPP_SECRET_KEY },
+      body: JSON.stringify({
+        phone: normalized,
+        message: `رمز التحقق الخاص بك في جملة: ${otp}\nصالح لمدة 5 دقائق. لا تشاركه مع أي شخص.`,
+      }),
+    }).then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      console.log(`[WHATSAPP] استجابة السيرفس (${r.status}):`, JSON.stringify(body));
+    }).catch((err) => console.error("[WHATSAPP] فشل الاتصال بسيرفس واتساب:", err));
+  } else {
+    console.log("[WHATSAPP] المتغيرات غير موجودة — تم تجاوز الإرسال");
+  }
+
+  res.json({ sent: true, message: "تم إرسال رمز التحقق" });
+}));
+
+const verifySchema = requestSchema.extend({ otp: z.string().length(4) });
+
+authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
+  const { accountType, phone, otp } = verifySchema.parse(req.body);
+  const cfg = TABLES[accountType];
+  const normalized = normalizePhone(phone);
+  const statusCol = accountType === "employee" ? "is_active" : "status";
+
+  const { rows } = await query(
+    `SELECT id, ${cfg.nameCol} AS name, otp_hash, otp_expires_at, ${statusCol} AS account_status
+       FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
+    [normalized]
+  );
+
+  const user = rows[0];
+
+  const isBlocked = user && (accountType === "employee"
+    ? user.account_status === false
+    : user.account_status === "suspended");
+
+  if (isBlocked) {
+    throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
+  }
+
+  if (!user?.otp_hash || new Date(user.otp_expires_at) < new Date()) {
+    throw new ApiError(401, "الرمز غير صالح أو منتهي الصلاحية");
+  }
+  if (!(await verifyOtp(otp, user.otp_hash))) {
+    throw new ApiError(401, "الرمز غير صحيح");
+  }
+
+  let role = null;
+  if (accountType === "employee") {
+    const r = await query(
+      `SELECT r.code FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1`,
+      [user.id]
     );
-
-    if (!rows.length || rows[0].allowed !== true) {
-      throw new ApiError(403, "لا تملك صلاحية تنفيذ هذا الإجراء");
-    }
-    next();
-  } catch (err) {
-    next(err);
+    role = r.rows[0]?.code || null;
   }
-};
 
-export const requireAnyPermission = (...permissionCodes) => async (req, _res, next) => {
-  try {
-    if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
-    if (req.actor.type !== "employee") throw new ApiError(403, "هذا الإجراء مخصص لموظفي الشركة");
+  await withTransaction(async (client) => {
+    await client.query(
+      `UPDATE ${cfg.table} SET otp_hash = NULL, otp_expires_at = NULL
+       ${accountType === "employee" ? ", last_login_at = now()" : ""}
+        WHERE id = $1`,
+      [user.id]
+    );
+    await writeAudit(client, {
+      actorType: accountType, actorId: user.id, actorName: user.name,
+      action: "auth.login", entityType: accountType, entityId: user.id,
+      entityLabel: user.name, ip: req.ip,
+    });
+  });
 
+  const token = signToken({ sub: user.id, type: accountType, name: user.name, role });
+  res.json({ token, actor: { id: user.id, type: accountType, name: user.name, role } });
+}));
+
+authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
+  if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
+
+  if (req.actor.type === "supplier") {
     const { rows } = await query(
-      `SELECT 1
+      `SELECT s.id, s.name, s.slug, s.image_url
+         FROM supplier_sections ss
+         JOIN sections s ON s.id = ss.section_id
+        WHERE ss.supplier_id = $1 AND ss.enabled AND s.is_active
+        ORDER BY s.sort_order`,
+      [req.actor.id]
+    );
+    return res.json({ actor: req.actor, sections: rows });
+  }
+
+  if (req.actor.type === "customer") {
+    const { rows } = await query(
+      `SELECT s.id, s.name, s.slug, s.image_url
+         FROM customer_sections cs
+         JOIN sections s ON s.id = cs.section_id
+        WHERE cs.customer_id = $1 AND cs.enabled AND s.is_active
+        ORDER BY s.sort_order`,
+      [req.actor.id]
+    );
+    return res.json({ actor: req.actor, sections: rows });
+  }
+
+  if (req.actor.type === "employee") {
+    const { rows } = await query(
+      `SELECT p.code
          FROM employees e
          JOIN role_permissions rp ON rp.role_id = e.role_id
-         JOIN permissions p       ON p.id = rp.permission_id AND p.code = ANY($2::TEXT[])
-        WHERE e.id = $1 AND e.is_active
-        UNION
-       SELECT 1
-         FROM employee_permission_overrides ovr
-         JOIN permissions p ON p.id = ovr.permission_id AND p.code = ANY($2::TEXT[])
-        WHERE ovr.employee_id = $1 AND ovr.granted = TRUE
-        LIMIT 1`,
-      [req.actor.id, permissionCodes]
+         JOIN permissions p       ON p.id = rp.permission_id
+        WHERE e.id = $1`,
+      [req.actor.id]
     );
-
-    if (!rows.length) throw new ApiError(403, "لا تملك صلاحية تنفيذ هذا الإجراء");
-    next();
-  } catch (err) {
-    next(err);
+    return res.json({ actor: req.actor, permissions: rows.map((r) => r.code) });
   }
-};
 
-export async function assertCustomerSection(customerId, sectionId) {
-  const { rows } = await query(
-    `SELECT 1 FROM customer_sections
-      WHERE customer_id = $1 AND section_id = $2 AND enabled`,
-    [customerId, sectionId]
-  );
-  if (!rows.length) throw new ApiError(403, "هذا القسم غير مفعّل لحسابك");
-}
-
-// نطاق الأقسام المخصّص لموظف معيّن (لتقييد عمله على موردين/طلبيات أقسام بعينها).
-// إرجاع null يعني "غير مقيّد" — الموظف ما عندهوش صفوف بالجدول، فيشتغل على كل الأقسام
-// زي أي موظف عادي (وهذا يحافظ على سلوك كل الموظفين الحاليين بدون تغيير حتى نخصص أحدهم فعليًا)
-export async function getEmployeeSectionScope(employeeId) {
-  const { rows } = await query(
-    `SELECT section_id FROM employee_section_scope WHERE employee_id = $1`,
-    [employeeId]
-  );
-  return rows.length ? new Set(rows.map((r) => r.section_id)) : null;
-}
-
-// يتحقق إن كل قسم من الأقسام المطلوبة (sectionIds) داخل نطاق الموظف — يُستخدم وقت
-// اعتماد حساب أو تعديل أقسامه، عشان موظف مقيّد ما يقدرش يمنح/يعتمد قسم مو مخصص له
-export async function assertSectionScope(employeeId, sectionIds) {
-  const scope = await getEmployeeSectionScope(employeeId);
-  if (scope === null) return; // غير مقيّد
-  const ids = sectionIds ?? [];
-  if (!ids.length || !ids.every((id) => scope.has(id))) {
-    throw new ApiError(403, "لا تملك صلاحية على أحد الأقسام المطلوبة");
-  }
-}
+  res.json({ actor: req.actor });
+}));
