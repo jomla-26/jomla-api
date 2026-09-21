@@ -378,14 +378,27 @@ financeRouter.get("/ledger/supplier/:id", asyncRoute(async (req, res) => {
   }));
 }));
 
-// جلب بيانات إيصال قبض/صرف واحد يخص المورد نفسه — تُستخدم لبناء صفحة طباعة PDF من جانب تطبيق المورد
-financeRouter.get("/vouchers/me/:id", requireActorType("supplier"), asyncRoute(async (req, res) => {
+// جلب بيانات إيصال قبض/صرف واحد يخص المورد أو العميل نفسه — تُستخدم لبناء صفحة
+// طباعة PDF من جانب تطبيق المورد أو تطبيق العميل
+financeRouter.get("/vouchers/me/:id", requireActorType("supplier", "customer"), asyncRoute(async (req, res) => {
   const { rows } = await query(
-    `SELECT * FROM vouchers WHERE id = $1 AND party_type = 'supplier' AND party_id = $2`,
-    [req.params.id, req.actor.id]
+    `SELECT * FROM vouchers WHERE id = $1 AND party_type = $2 AND party_id = $3`,
+    [req.params.id, req.actor.type, req.actor.id]
   );
   if (!rows.length) throw new ApiError(404, "الإيصال غير موجود");
   res.json(rows[0]);
+}));
+
+// قائمة سندات القبض/الصرف المعتمدة الخاصة بالمورد أو العميل نفسه — تُستخدم لعرض
+// شاشة "سنداتي" بتطبيق المورد أو تطبيق العميل
+financeRouter.get("/vouchers/mine", requireActorType("supplier", "customer"), asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `SELECT * FROM vouchers
+      WHERE party_type = $1 AND party_id = $2 AND approval_status = 'approved'
+      ORDER BY created_at DESC LIMIT 200`,
+    [req.actor.type, req.actor.id]
+  );
+  res.json(rows);
 }));
 
 const EXPENSE_CATEGORIES = {
