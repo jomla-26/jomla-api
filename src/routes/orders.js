@@ -144,6 +144,11 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       action: "order.submitted", entityType: "order", entityId: created.id,
       entityLabel: orderNumber, after: created, ip: req.ip,
     });
+        await notifyStaffWithPermission(client, {
+      permissionCode: "orders.review", templateCode: "order.new_pending_review",
+      orderId: created.id,
+      vars: { order_number: orderNumber, customer_name: req.actor.name, total: (itemsSubtotal + deliveryFee).toFixed(2) },
+    });
 
     return { ...created, supplierCount: supplierIds.length };
   });
@@ -151,7 +156,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
   res.status(201).json(order);
 }));
 
-await notifyStaffWithPermission(client, { permissionCode: "orders.review", templateCode: "order.new_pending_review", orderId: created.id, vars: { order_number: orderNumber, customer_name: req.actor.name, total: (itemsSubtotal + deliveryFee).toFixed(2) } }); // إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
+// إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
 const adminCreateSchema = createSchema.extend({
   customerId: z.string().uuid(),
 });
