@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import crypto from "node:crypto";
+import sharp from "sharp";
 import { createClient } from "@supabase/supabase-js";
 import ws from "ws";
 import { authenticate } from "../middleware/auth.js";
@@ -30,48 +31,43 @@ const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  // نسمح بملف أصلي لحد 15 ميجا (صور كاميرا الجوال الحديثة، خصوصًا آيفون، تطلع كبيرة)
+  // وبعدين نضغطها احنا لحجم أصغر بكثير قبل التخزين النهائي
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
-
-// التحقق من نوع الملف عبر "البصمة" الحقيقية للبايتات الأولى، مش النوع المُعلَن
-// من المتصفح (mimetype) — ده سهل تزويره بتغيير اسم/امتداد الملف بس. بدون هذا
-// التحقق، حد يقدر يرفع ملف تنفيذي أو HTML ضار متنكّر في شكل "صورة"
-function detectImageType(buffer) {
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return { mime: "image/jpeg", ext: "jpg" };
-  }
-  if (
-    buffer.length >= 8 &&
-    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
-    buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
-  ) {
-    return { mime: "image/png", ext: "png" };
-  }
-  if (
-    buffer.length >= 12 &&
-    buffer.toString("ascii", 0, 4) === "RIFF" &&
-    buffer.toString("ascii", 8, 12) === "WEBP"
-  ) {
-    return { mime: "image/webp", ext: "webp" };
-  }
-  return null;
-}
 
 uploadRouter.post("/image", (req, res, next) => {
   upload.single("image")(req, res, async (err) => {
-    if (err instanceof multer.MulterError) return next(new ApiError(400, "تعذّر رفع الملف — تحقق من الحجم والنوع"));
+    if (err instanceof multer.MulterError) {
+      const message =
+        err.code === "LIMIT_FILE_SIZE"
+          ? "حجم الصورة كبير جدًا — الحد الأقصى 15 ميجابايت"
+          : "تعذّر رفع الملف";
+      return next(new ApiError(400, message));
+    }
     if (err) return next(err);
     if (!req.file) return next(new ApiError(400, "لم يتم إرفاق صورة"));
 
-    const detected = detectImageType(req.file.buffer);
-    if (!detected) {
-      return next(new ApiError(400, "نوع الملف غير مدعوم — jpg أو png أو webp فقط"));
+    // نمرّر أي صيغة صورة يقدر Sharp يفكّها (JPG, PNG, WEBP, GIF, BMP, TIFF, وكمان
+    // HEIC/HEIF اللي تطلعها كاميرا الآيفون افتراضيًا) ونحوّلها كلها لصيغة JPEG
+    // موحّدة، ونصغّر أي صورة أعرض من 1920px — هذا يحل مشكلة "نوع غير مدعوم" اللي
+    // كانت تطلع مع صور الآيفون، ويقلل حجم التخزين والتحميل بكثير
+    let outputBuffer;
+    try {
+      outputBuffer = await sharp(req.file.buffer)
+        .rotate()
+        .resize({ width: 1920, height: 1920, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+    } catch (e) {
+      console.error("[UPLOAD] فشل تحويل الصورة:", e);
+      return next(new ApiError(400, "تعذّر التعرّف على نوع الصورة — جرّب صورة jpg أو png أو webp"));
     }
 
     try {
-      const filename = `${crypto.randomUUID()}.${detected.ext}`;
-      const { error } = await supabase.storage.from(BUCKET).upload(filename, req.file.buffer, {
-        contentType: detected.mime,
+      const filename = `${crypto.randomUUID()}.jpg`;
+      const { error } = await supabase.storage.from(BUCKET).upload(filename, outputBuffer, {
+        contentType: "image/jpeg",
         upsert: false,
       });
       if (error) throw error;
