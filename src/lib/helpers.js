@@ -12,6 +12,7 @@ export const asyncRoute = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 export async function nextDocNumber(client, { table, column, prefix, start = 1000 }) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`${table}.${column}`]);
   const { rows } = await client.query(
     `SELECT COALESCE(MAX(NULLIF(regexp_replace(${column}, '\\D', '', 'g'), '')::BIGINT), $1) AS last
        FROM ${table}`,
