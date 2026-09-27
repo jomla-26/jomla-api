@@ -3,7 +3,7 @@ import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
-import { queueNotification } from "../lib/notify.js";
+import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 
 export const orderRouter = Router();
 orderRouter.use(authenticate);
@@ -151,7 +151,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
   res.status(201).json(order);
 }));
 
-// إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
+await notifyStaffWithPermission(client, { permissionCode: "orders.review", templateCode: "order.new_pending_review", orderId: created.id, vars: { order_number: orderNumber, customer_name: req.actor.name, total: (itemsSubtotal + deliveryFee).toFixed(2) } }); // إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
 const adminCreateSchema = createSchema.extend({
   customerId: z.string().uuid(),
 });
