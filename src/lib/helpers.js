@@ -77,7 +77,7 @@ export async function calcDeliveryFee(client, { zoneId, vehicleTypeId, vehiclesC
     if (rows.length) fee = rows[0].base_fee;
   }
 
-  fee *= Math.max(1, vehiclesCount || 1);
+  if (!fee && vehicleTypeId) { const { rows: vt } = await client.query(`SELECT trip_cost FROM vehicle_types WHERE id = $1`, [vehicleTypeId]); if (vt.length) fee = Number(vt[0].trip_cost) || 0; } fee *= Math.max(1, vehiclesCount || 1);
 
   if (supplierCount > 1) {
     const { rows } = await client.query(`SELECT extra_pickup_point_fee FROM delivery_settings WHERE id = 1`);
