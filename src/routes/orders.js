@@ -737,6 +737,10 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
         skipped.push({ orderId, orderNumber: order.order_number, reason: "بالفعل في هذه الحالة" });
         continue;
       }
+      if (order.status === "under_review" && Number(order.grand_total) < 1000) {
+        skipped.push({ orderId, orderNumber: order.order_number, reason: "أقل من 1000 دينار، لا يمكن الموافقة" });
+        continue;
+      }
 
       if (status === "assigned_to_driver") {
         if (order.fulfillment !== "delivery") {
