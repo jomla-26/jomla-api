@@ -9,7 +9,7 @@ export const authRouter = Router();
 
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100, // TEMP_LOAD_TEST_REVERT_TO_5
+  max: 5,
   message: { error: "محاولات كثيرة، يرجى المحاولة بعد قليل" },
 });
 
