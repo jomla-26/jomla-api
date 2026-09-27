@@ -910,25 +910,6 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
   res.json(result);
 }));
 
-orderRouter.post("/admin/backfill-supplier-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const result = await withTransaction(async (client) => {
-    const { rowCount: cancelledFixed } = await client.query(
-      `UPDATE order_suppliers os SET status = 'cancelled'
-        FROM orders o
-        WHERE os.order_id = o.id AND o.status = 'cancelled'
-          AND os.status NOT IN ('cancelled')`
-    );
-    const { rowCount: closedFixed } = await client.query(
-      `UPDATE order_suppliers os SET status = 'closed'
-        FROM orders o
-        WHERE os.order_id = o.id AND o.status IN ('delivered','closed')
-          AND os.status NOT IN ('closed','cancelled')`
-    );
-    return { cancelledFixed, closedFixed };
-  });
-  res.json(result);
-}));
-
 orderRouter.get("/:id/shortages", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const { rows } = await query(
     `SELECT sh.*, oi.product_name, oi.unit, oi.qty_requested, os.supplier_id, s.business_name AS supplier_name
