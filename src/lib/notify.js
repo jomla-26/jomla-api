@@ -193,3 +193,24 @@ export async function maybeSendDailyProfitReport() {
     await sendDailyProfitReport();
   }
 }
+
+// إشعار كل الموظفين الفعّالين اللي عندهم صلاحية معيّنة (مثلاً مراجعة الطلبيات، اعتماد الحسابات) —
+// يُستخدم لتنبيه لوحة الإدارة بأحداث جديدة (طلبية جديدة، تسجيل حساب جديد) بدل ما تفضل فارغة
+export async function notifyStaffWithPermission(client, {
+  permissionCode, templateCode, orderId = null, sectionId = null, vars = {},
+}) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT e.id
+       FROM employees e
+       JOIN role_permissions rp ON rp.role_id = e.role_id
+       JOIN permissions p       ON p.id = rp.permission_id AND p.code = $1
+      WHERE e.is_active`,
+    [permissionCode]
+  );
+  for (const row of rows) {
+    await queueNotification(client, {
+      templateCode, recipientType: "employee", recipientId: row.id,
+      orderId, sectionId, vars,
+    });
+  }
+}
