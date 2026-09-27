@@ -526,6 +526,13 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
       [order.id, to, reason]
     );
     await recordStatus(client, { orderId: order.id, from: order.status, to, actor: req.actor, note: reason });
+    if (to === "cancelled") {
+      await client.query(
+        `UPDATE order_suppliers SET status = 'cancelled'
+          WHERE order_id = $1 AND status NOT IN ('picked_up','closed','cancelled')`,
+        [order.id]
+      );
+    }
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: postpone ? "order.postponed" : "order.cancelled",
@@ -1107,6 +1114,11 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
       orderId: order.id, from: order.status, to: "delivered", actor: req.actor,
       note: collected ? `تم تحصيل ${order.cod_amount}` : "تسليم بدون تحصيل",
     });
+    await client.query(
+      `UPDATE order_suppliers SET status = 'closed'
+        WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
+      [order.id]
+    );
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "order.delivered", entityType: "order", entityId: order.id,
