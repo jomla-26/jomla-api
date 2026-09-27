@@ -363,6 +363,40 @@ financeRouter.get("/ledger/customer/:id", asyncRoute(async (req, res) => {
   }));
 }));
 
+// رصيد كل عميل مجمّعًا من كشف حسابه الكامل (وليس من إجمالي الطلبيات فقط) —
+// يشمل سندات القبض غير المرتبطة بطلبية، فيعكس الرصيد الفعلي: مدين (يدين للشركة)
+// أو دائن (الشركة مدينة له) لو دفع أكثر من المطلوب
+financeRouter.get("/balances/customers", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
+  const { rows } = await query(
+    `SELECT c.id, c.business_name AS name, c.phone,
+            COALESCE(SUM(l.debit),0)::numeric  AS total_debit,
+            COALESCE(SUM(l.credit),0)::numeric AS total_credit
+       FROM customers c
+       LEFT JOIN v_customer_ledger l ON l.customer_id = c.id
+      GROUP BY c.id, c.business_name, c.phone`
+  );
+  res.json(rows.map((r) => ({
+    id: r.id, name: r.name, phone: r.phone,
+    balance: Number(r.total_debit) - Number(r.total_credit),
+  })));
+}));
+
+// نفس الفكرة للموردين — بالاتجاه المعاكس (دائن = الشركة مدينة للمورد، الوضع الطبيعي)
+financeRouter.get("/balances/suppliers", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
+  const { rows } = await query(
+    `SELECT s.id, s.business_name AS name, s.phone,
+            COALESCE(SUM(l.debit),0)::numeric  AS total_debit,
+            COALESCE(SUM(l.credit),0)::numeric AS total_credit
+       FROM suppliers s
+       LEFT JOIN v_supplier_ledger l ON l.supplier_id = s.id
+      GROUP BY s.id, s.business_name, s.phone`
+  );
+  res.json(rows.map((r) => ({
+    id: r.id, name: r.name, phone: r.phone,
+    balance: Number(r.total_credit) - Number(r.total_debit),
+  })));
+}));
+
 financeRouter.get("/ledger/supplier/:id", asyncRoute(async (req, res) => {
   if (req.actor.type === "supplier" && req.actor.id !== req.params.id) {
     throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذا الكشف");
