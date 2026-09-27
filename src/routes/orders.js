@@ -866,6 +866,7 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
       orderId: part.order_id, orderSupplierId: part.id,
       from: part.status, to: newStatus, actor: req.actor,
     });
+    await recalcOrderTotals(client, part.order_id);
 
     if (hasShortage) {
       await client.query(`UPDATE orders SET status = 'shortage' WHERE id = $1`, [part.order_id]);
