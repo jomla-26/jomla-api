@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { query, pool, withTransaction, writeAudit } from "../lib/db.js";
-import { ApiError, asyncRoute, nextDocNumber } from "../lib/helpers.js";
+import { ApiError, asyncRoute, nextDocNumber, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission } from "../middleware/auth.js";
 import { queueNotification } from "../lib/notify.js";
 
@@ -315,16 +315,45 @@ engagementRouter.patch("/returns/:id/status", requirePermission("orders.review")
     if (!before.rows.length) throw new ApiError(404, "طلب الإرجاع غير موجود");
 
     let refundAmount = before.rows[0].refund_amount;
+    let refundVoucherId = before.rows[0].refund_voucher_id;
     if (body.status === "refunded") {
       const total = await client.query(`SELECT SUM(line_total) AS total FROM return_items WHERE return_id = $1`, [req.params.id]);
       refundAmount = Number(total.rows[0].total || 0);
+      
+if (refundAmount > 0 && body.refundMethod === "credit_note") {
+await client.query(
+`UPDATE orders SET paid_amount = paid_amount + $2,
+payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
+WHERE id = $1`,
+[before.rows[0].order_id, refundAmount]
+);
+} else if (refundAmount > 0 && (body.refundMethod === "cash" || !body.refundMethod)) {
+const treasuryCode = resolveTreasuryCode("payment", "cash");
+const { rows: tr } = await client.query(`SELECT id FROM treasuries WHERE code = $1`, [treasuryCode]);
+if (tr.length) {
+const voucherNumber = await nextDocNumber(client, {
+table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+});
+const { rows: custRows } = await client.query(`SELECT business_name FROM customers WHERE id = $1`, [before.rows[0].customer_id]);
+const { rows: [voucher] } = await client.query(
+`INSERT INTO vouchers
+(voucher_number, voucher_type, party_type, party_id, party_name,
+amount, method, treasury_id, order_id, approval_status, approved_by, approved_at, note, created_by)
+VALUES ($1,'payment','customer',$2,$3,$4,'cash',$5,$6,'approved',$7,now(),$8,$7)
+RETURNING *`,
+[voucherNumber, before.rows[0].customer_id, custRows[0]?.business_name || "", refundAmount,
+tr[0].id, before.rows[0].order_id, `استرجاع نقدي - ${before.rows[0].return_number}`, req.actor.id]
+);
+refundVoucherId = voucher.id;
+}
+}
     }
 
     const { rows } = await client.query(
       `UPDATE returns SET status = $2, refund_method = COALESCE($3, refund_method),
-              refund_amount = $4, approved_by = $5
+              refund_amount = $4, refund_voucher_id = $5, approved_by = $6
        WHERE id = $1 RETURNING *`,
-      [req.params.id, body.status, body.refundMethod ?? null, refundAmount, req.actor.id]
+            [req.params.id, body.status, body.refundMethod ?? null, refundAmount, refundVoucherId, req.actor.id]
     );
 
     await writeAudit(client, {
