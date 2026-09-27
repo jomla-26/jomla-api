@@ -424,7 +424,12 @@ accountsRouter.patch("/:kind/:id/sections", requirePermission("accounts.sections
     const exists = await client.query(`SELECT id FROM ${cfg.table} WHERE id = $1`, [req.params.id]);
     if (!exists.rows.length) throw new ApiError(404, "الحساب غير موجود");
 
-    await client.query(`UPDATE ${cfg.sectionTable} SET enabled = FALSE WHERE ${cfg.idCol} = $1`, [req.params.id]);
+    const scope = await getEmployeeSectionScope(req.actor.id);
+    if (scope === null) {
+      await client.query(`UPDATE ${cfg.sectionTable} SET enabled = FALSE WHERE ${cfg.idCol} = $1`, [req.params.id]);
+    } else {
+      await client.query(`UPDATE ${cfg.sectionTable} SET enabled = FALSE WHERE ${cfg.idCol} = $1 AND section_id = ANY($2::UUID[])`, [req.params.id, [...scope]]);
+    }
 
     for (const sectionId of sectionIds) {
       await client.query(
