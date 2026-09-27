@@ -394,6 +394,7 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
     if (order.status !== "under_review") throw new ApiError(400, "الطلبية ليست قيد المراجعة");
+    if (Number(order.grand_total) < 1000) { throw new ApiError(400, "لا يمكن الموافقة على طلبية أقل من 1000 دينار"); }
 
     if (order.payment_method === "deferred") {
       const cust = await client.query(`SELECT credit_enabled FROM customers WHERE id = $1`, [order.customer_id]);
