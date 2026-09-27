@@ -353,7 +353,7 @@ financeRouter.get("/ledger/customer/:id", asyncRoute(async (req, res) => {
     throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذا الكشف");
   }
   const { rows } = await query(
-    `SELECT * FROM v_customer_ledger WHERE customer_id = $1 ORDER BY entry_date`,
+    `SELECT * FROM ( SELECT o.customer_id, o.created_at AS entry_date, 'فاتورة ' || o.order_number AS label, o.order_number AS reference, NULL::text AS voucher_number, o.grand_total AS debit, 0 AS credit FROM orders o WHERE o.customer_id = $1 AND o.status NOT IN ('draft','under_review','cancelled','postponed') UNION ALL SELECT v.party_id AS customer_id, v.created_at AS entry_date, CASE WHEN v.voucher_type = 'payment' THEN 'إشعار دائن (استرجاع)' ELSE 'إيصال قبض' END AS label, COALESCE(o2.order_number, '') AS reference, v.voucher_number, 0 AS debit, v.amount AS credit FROM vouchers v LEFT JOIN orders o2 ON o2.id = v.order_id WHERE v.party_type = 'customer' AND v.party_id = $1 AND v.approval_status = 'approved' AND v.voucher_type IN ('receipt','payment') UNION ALL SELECT r.customer_id, r.created_at AS entry_date, 'إشعار دائن - إرجاع ' || r.return_number AS label, o3.order_number AS reference, r.return_number AS voucher_number, 0 AS debit, r.refund_amount AS credit FROM returns r JOIN orders o3 ON o3.id = r.order_id WHERE r.customer_id = $1 AND r.status = 'refunded' AND r.refund_method = 'credit_note' AND r.refund_amount > 0 ) x ORDER BY entry_date`,
     [req.params.id]
   );
   let balance = 0;
