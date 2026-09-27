@@ -3,7 +3,7 @@ import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, normalizePhone } from "../lib/helpers.js";
 import { authenticate, requirePermission, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
-import { queueNotification } from "../lib/notify.js";
+import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 
 export const accountsRouter = Router();
 
@@ -60,6 +60,11 @@ accountsRouter.post("/:kind/register", asyncRoute(async (req, res) => {
       actorType: req.params.kind, actorId: row.id, actorName: body.businessName,
       action: `${req.params.kind}.self_registered`, entityType: req.params.kind, entityId: row.id,
       entityLabel: body.businessName, after: row, ip: req.ip,
+    
+    });
+        await notifyStaffWithPermission(client, {
+      permissionCode: "accounts.approve", templateCode: "account.new_registration",
+      vars: { business_name: body.businessName, kind: req.params.kind === "supplier" ? "مورد" : "عميل" },
     });
     return row;
   });
