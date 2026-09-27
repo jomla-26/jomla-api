@@ -828,6 +828,10 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
     if (!rows.length) throw new ApiError(404, "الجزء غير موجود");
     const part = rows[0];
 
+    if (part.status !== "sent") {
+      throw new ApiError(400, "تم تسجيل توفر هذا الجزء من قبل");
+    }
+
     let hasShortage = false;
     let subtotal = 0;
 
@@ -850,6 +854,18 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
         [item.id, it.availability, qty]
       );
       subtotal += item.unit_price * qty;
+
+            if (qty > 0) {
+        await client.query(
+          `UPDATE products SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
+          [item.product_id, qty]
+        );
+        await client.query(
+          `INSERT INTO stock_movements (product_id, change_qty, reason, created_by)
+           VALUES ($1, $2, $3, $4)`,
+          [item.product_id, -qty, `بيع — طلب ${part.order_number}`, req.actor.id]
+        );
+      }
 
       if (it.availability !== "full") {
         hasShortage = true;
