@@ -481,7 +481,6 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
     if (order.status !== "under_review") throw new ApiError(400, "الطلبية ليست قيد المراجعة");
-    if (Number(order.grand_total) < 1000) { throw new ApiError(400, "لا يمكن الموافقة على طلبية أقل من 1000 دينار"); }
 
     if (order.payment_method === "deferred") {
       const cust = await client.query(`SELECT credit_enabled FROM customers WHERE id = $1`, [order.customer_id]);
@@ -668,15 +667,17 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
 
 // تغيير طريقة تسليم الطلبية (استلام شخصي ↔ توصيل) — قبل إسناد مندوب
 // تعديل نسبة العمولة لفاتورة (جزء مورد) واحدة فقط — استثناء معزول، لا يمس نسبة المورد الأساسية
-// ولا أي فاتورة أخرى قديمة أو جديدة. مقصور على المسؤول الرئيسي (finance.commission)
-orderRouter.patch("/order-suppliers/:id/commission-rate", requirePermission("finance.commission"), asyncRoute(async (req, res) => {
+// ولا أي فاتورة أخرى قديمة أو جديدة. متاح حتى بعد التسليم (تسوية لاحقة)، بصلاحية خاصة بيه
+// (orders.commission_override) منفصلة عن صلاحية تعديل نسبة المورد الأساسية، ويتسجل في سجل
+// حالة الطلبية (order_status_history) عشان يبان في الجدول الزمني للطلبية نفسها، مو بس بسجل التدقيق العام
+orderRouter.patch("/order-suppliers/:id/commission-rate", requirePermission("orders.commission_override"), asyncRoute(async (req, res) => {
   const { commissionRate } = z.object({
     commissionRate: z.number().min(0).max(100),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
-      `SELECT os.*, o.order_number FROM order_suppliers os
+      `SELECT os.*, o.order_number, o.status AS order_status FROM order_suppliers os
          JOIN orders o ON o.id = os.order_id
         WHERE os.id = $1 FOR UPDATE`,
       [req.params.id]
@@ -689,6 +690,11 @@ orderRouter.patch("/order-suppliers/:id/commission-rate", requirePermission("fin
       [req.params.id, commissionRate]
     );
 
+    await recordStatus(client, {
+      orderId: before.order_id, orderSupplierId: before.id,
+      from: before.order_status, to: before.order_status, actor: req.actor,
+      note: `تعديل نسبة العمولة يدويًا من ${before.commission_rate}% إلى ${commissionRate}% (فاتورة المورد ${before.order_number})`,
+    });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "order_supplier.commission_rate_overridden", entityType: "order_supplier", entityId: before.id,
@@ -761,8 +767,9 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
 }));
 
 // تعديل يدوي لرسوم التوصيل — حسب الاتفاق مع العميل، بدل الاعتماد حصرًا على حساب
-// المنطقة+نوع السيارة الثابت. متاح لأي طلبية توصيل لسا ما اتسلّمتش أو اتلغتش
-orderRouter.patch("/:id/delivery-fee", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+// المنطقة+نوع السيارة الثابت. متاح حتى بعد التسليم (تسوية لاحقة)، بصلاحية خاصة بيه
+// (orders.delivery_fee_override) منفصلة عن صلاحية مراجعة الطلبيات العامة
+orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_override"), asyncRoute(async (req, res) => {
   const { deliveryFee, note } = z.object({
     deliveryFee: z.number().nonnegative(),
     note: z.string().optional(),
@@ -773,9 +780,6 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.review"), async
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
 
-    if (["delivered", "cancelled", "closed"].includes(order.status)) {
-      throw new ApiError(400, "لا يمكن تعديل رسوم التوصيل لطلبية تم تسليمها أو إلغاؤها");
-    }
     if (order.fulfillment !== "delivery") {
       throw new ApiError(400, "هذي طلبية استلام شخصي، لا رسوم توصيل عليها");
     }
@@ -833,11 +837,6 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
         skipped.push({ orderId, orderNumber: order.order_number, reason: "بالفعل في هذه الحالة" });
         continue;
       }
-      if (order.status === "under_review" && Number(order.grand_total) < 1000) {
-        skipped.push({ orderId, orderNumber: order.order_number, reason: "أقل من 1000 دينار، لا يمكن الموافقة" });
-        continue;
-      }
-
       if (status === "assigned_to_driver") {
         if (order.fulfillment !== "delivery") {
           skipped.push({ orderId, orderNumber: order.order_number, reason: "طلبية استلام شخصي، تم تخطيها" });
