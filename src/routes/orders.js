@@ -1175,6 +1175,16 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       [part.id, paymentReceived]
     );
 
+    if (paymentReceived && part.payment_method === "pay_at_supplier") {
+      await client.query(
+        `UPDATE orders SET
+            paid_amount = paid_amount + $2,
+            payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
+          WHERE id = $1`,
+        [part.order_id, part.subtotal]
+      );
+    }
+
     const { rows: [pending] } = await client.query(
       `SELECT COUNT(*)::INT AS remaining FROM order_suppliers
         WHERE order_id = $1 AND NOT pickup_confirmed`,
