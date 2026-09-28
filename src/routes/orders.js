@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { query, withTransaction, writeAudit } from "../lib/db.js";
+import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
@@ -387,6 +387,50 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
     history: history.rows,
   });
 }));
+
+// "كرر آخر طلبية" — يرجّع أصناف طلبية سابقة بأسعارها وتوفّرها الحاليين (مش
+// المحفوظين وقتها)، عشان العميل يقدر يضيفهم للسلة الجديدة بضغطة وحدة
+orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const { rows: orderRows } = await query(
+    `SELECT customer_id FROM orders WHERE id = $1`, [req.params.id]
+  );
+  if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
+  if (orderRows[0].customer_id !== req.actor.id) {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
+  }
+
+  const { rows: pastItems } = await query(
+    `SELECT product_id, MAX(qty_requested) AS qty
+       FROM order_items WHERE order_id = $1
+      GROUP BY product_id`,
+    [req.params.id]
+  );
+
+  const items = [];
+  const unavailable = [];
+  for (const it of pastItems) {
+    const { rows: p } = await query(
+      `SELECT p.id, p.name, p.unit, p.image_url, p.availability, p.supplier_id,
+              s.business_name AS supplier_name, s.status AS supplier_status
+         FROM products p JOIN suppliers s ON s.id = p.supplier_id
+        WHERE p.id = $1 AND p.is_active`,
+      [it.product_id]
+    );
+    if (!p.length || p[0].supplier_status !== "approved" || p[0].availability === "out") {
+      unavailable.push(p[0]?.name ?? "صنف لم يعد متوفرًا");
+      continue;
+    }
+    const price = await resolvePrice(pool, {
+      productId: p[0].id, customerId: req.actor.id, qty: it.qty,
+    }).catch(() => null);
+    if (price == null) { unavailable.push(p[0].name); continue; }
+    const { supplier_status, ...product } = p[0];
+    items.push({ ...product, price, qty: Number(it.qty) });
+  }
+
+  res.json({ items, unavailable });
+}));
+
 orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const body = z.object({
     depositDueAtDelivery: z.number().nonnegative().optional(),
