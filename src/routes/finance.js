@@ -222,6 +222,13 @@ financeRouter.get("/treasuries", requirePermission("finance.vouchers"), asyncRou
 }));
 
 financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  // declaredAmount = المبلغ اللي عدّته الإدارة فعليًا من يد المندوب. لو ما انبعتش،
+  // نفترض إنه طابق المحسوب (توافق مع أي استدعاء قديم). أي فرق ينحفظ فورًا كراية،
+  // مش يضيع.
+  const body = z.object({
+    declaredAmount: z.number().positive().optional(),
+  }).parse(req.body ?? {});
+
   const result = await withTransaction(async (client) => {
     const { rows: pending } = await client.query(
       `SELECT id, order_number, cod_amount FROM orders
@@ -231,6 +238,8 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
     if (!pending.length) throw new ApiError(400, "لا توجد مبالغ معلّقة لهذا المندوب");
 
     const total = pending.reduce((s, o) => s + Number(o.cod_amount), 0);
+    const declaredAmount = body.declaredAmount ?? total;
+    const discrepancy = Number((declaredAmount - total).toFixed(2));
     const { rows: drv } = await client.query(`SELECT name FROM employees WHERE id = $1`, [req.params.id]);
 
     const vNumber = await nextDocNumber(client, {
@@ -244,14 +253,16 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
           amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by)
        VALUES ($1,'receipt','driver',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6)
        RETURNING *`,
-      [vNumber, req.params.id, drv[0]?.name ?? "مندوب", total, tr[0].id, req.actor.id,
-       `تسليم نقدية من مندوب التوصيل`]
+      [vNumber, req.params.id, drv[0]?.name ?? "مندوب", declaredAmount, tr[0].id, req.actor.id,
+       discrepancy !== 0
+         ? `تسليم نقدية من مندوب التوصيل — فرق ${discrepancy > 0 ? "زيادة" : "نقص"} قدره ${Math.abs(discrepancy).toFixed(2)} د.ل عن المحسوب (${total.toFixed(2)} د.ل)`
+         : `تسليم نقدية من مندوب التوصيل`]
     );
 
     const { rows: [settlement] } = await client.query(
-      `INSERT INTO driver_settlements (driver_id, total_amount, voucher_id, settled_by)
-       VALUES ($1,$2,$3,$4) RETURNING *`,
-      [req.params.id, total, voucher.id, req.actor.id]
+      `INSERT INTO driver_settlements (driver_id, total_amount, declared_amount, discrepancy, voucher_id, settled_by)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.params.id, total, declaredAmount, discrepancy, voucher.id, req.actor.id]
     );
 
     for (const o of pending) {
@@ -272,7 +283,7 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
       entityLabel: drv[0]?.name, after: settlement, ip: req.ip,
     });
 
-    return { settlement, voucher, ordersCount: pending.length, total };
+    return { settlement, voucher, ordersCount: pending.length, total, declaredAmount, discrepancy };
   });
 
   res.json(result);
