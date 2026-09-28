@@ -52,21 +52,24 @@ deliveryRouter.post("/vehicle-types", requirePermission("catalog.manage"), async
   const body = z.object({
     name: z.string().min(2), maxWeightKg: z.number().positive().optional(),
     maxVolumeM3: z.number().positive().optional(), tripCost: z.number().nonnegative(),
+    feePerKm: z.number().nonnegative().optional(),
   }).parse(req.body);
   const { rows } = await query(
-    `INSERT INTO vehicle_types (name, max_weight_kg, max_volume_m3, trip_cost) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [body.name, body.maxWeightKg ?? null, body.maxVolumeM3 ?? null, body.tripCost]
+    `INSERT INTO vehicle_types (name, max_weight_kg, max_volume_m3, trip_cost, fee_per_km)
+     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [body.name, body.maxWeightKg ?? null, body.maxVolumeM3 ?? null, body.tripCost, body.feePerKm ?? 0]
   );
   res.status(201).json(rows[0]);
 }));
 
-// تعديل نوع سيارة موجود (التكلفة، الاسم، الحدود) أو إيقافه/تفعيله
+// تعديل نوع سيارة موجود (التكلفة، سعر الكيلومتر، الاسم، الحدود) أو إيقافه/تفعيله
 deliveryRouter.patch("/vehicle-types/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     name: z.string().min(2).optional(),
     maxWeightKg: z.number().positive().optional(),
     maxVolumeM3: z.number().positive().optional(),
     tripCost: z.number().nonnegative().optional(),
+    feePerKm: z.number().nonnegative().optional(),
     isActive: z.boolean().optional(),
   }).parse(req.body);
 
@@ -76,10 +79,11 @@ deliveryRouter.patch("/vehicle-types/:id", requirePermission("catalog.manage"), 
        max_weight_kg = COALESCE($3, max_weight_kg),
        max_volume_m3 = COALESCE($4, max_volume_m3),
        trip_cost = COALESCE($5, trip_cost),
-       is_active = COALESCE($6, is_active)
+       fee_per_km = COALESCE($6, fee_per_km),
+       is_active = COALESCE($7, is_active)
      WHERE id = $1 RETURNING *`,
     [req.params.id, body.name ?? null, body.maxWeightKg ?? null,
-     body.maxVolumeM3 ?? null, body.tripCost ?? null, body.isActive ?? null]
+     body.maxVolumeM3 ?? null, body.tripCost ?? null, body.feePerKm ?? null, body.isActive ?? null]
   );
   if (!rows.length) throw new ApiError(404, "نوع السيارة غير موجود");
   res.json(rows[0]);
@@ -115,10 +119,17 @@ deliveryRouter.get("/settings", asyncRoute(async (_req, res) => {
 }));
 
 deliveryRouter.patch("/settings", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
-  const { extraPickupPointFee } = z.object({ extraPickupPointFee: z.number().nonnegative() }).parse(req.body);
+  const body = z.object({
+    extraPickupPointFee: z.number().nonnegative().optional(),
+    freeKm: z.number().nonnegative().optional(),
+  }).parse(req.body);
+
   const { rows } = await query(
-    `UPDATE delivery_settings SET extra_pickup_point_fee = $1 WHERE id = 1 RETURNING *`,
-    [extraPickupPointFee]
+    `UPDATE delivery_settings SET
+       extra_pickup_point_fee = COALESCE($1, extra_pickup_point_fee),
+       free_km = COALESCE($2, free_km)
+     WHERE id = 1 RETURNING *`,
+    [body.extraPickupPointFee ?? null, body.freeKm ?? null]
   );
   res.json(rows[0]);
 }));
