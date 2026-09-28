@@ -4,8 +4,9 @@ import crypto from "node:crypto";
 import sharp from "sharp";
 import { createClient } from "@supabase/supabase-js";
 import ws from "ws";
-import { authenticate } from "../middleware/auth.js";
+import { authenticate, requirePermission } from "../middleware/auth.js";
 import { ApiError } from "../lib/helpers.js";
+import { query } from "../lib/db.js";
 
 export const uploadRouter = Router();
 uploadRouter.use(authenticate);
@@ -78,5 +79,82 @@ uploadRouter.post("/image", (req, res, next) => {
       console.error("[UPLOAD]", e);
       next(new ApiError(500, "تعذّر رفع الصورة، يرجى المحاولة لاحقًا"));
     }
+  });
+});
+
+// رفع صور أصناف دفعة وحدة — كل صورة تتطابق مع صنفها عن طريق اسم الملف (بدون
+// الامتداد) اللي لازم يكون نفس "رقم الصنف عند المورد" (supplier_sku) بالضبط
+const bulkUpload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } });
+
+uploadRouter.post("/product-images/bulk", (req, res, next) => {
+  bulkUpload.array("images", 100)(req, res, async (err) => {
+    if (err instanceof multer.MulterError) {
+      const message =
+        err.code === "LIMIT_FILE_SIZE"
+          ? "إحدى الصور كبيرة جدًا — الحد الأقصى 15 ميجابايت للصورة"
+          : "تعذّر رفع الملفات";
+      return next(new ApiError(400, message));
+    }
+    if (err) return next(err);
+    if (!req.files?.length) return next(new ApiError(400, "لم يتم إرفاق أي صور"));
+
+    let supplierId;
+    if (req.actor.type === "supplier") {
+      supplierId = req.actor.id;
+    } else {
+      supplierId = req.body.supplierId;
+      if (!supplierId) return next(new ApiError(400, "يجب تحديد المورد"));
+      try {
+        await new Promise((resolve, reject) => {
+          requirePermission("catalog.manage")(req, res, (e) => (e ? reject(e) : resolve()));
+        });
+      } catch (e) { return next(e); }
+    }
+
+    const matched = [];
+    const unmatched = [];
+
+    for (const file of req.files) {
+      const code = file.originalname.replace(/\.[^.]+$/, "").trim();
+      if (!code) { unmatched.push({ file: file.originalname, reason: "اسم ملف غير صالح" }); continue; }
+
+      const { rows } = await query(
+        `SELECT id, name FROM products WHERE supplier_id = $1 AND supplier_sku = $2`,
+        [supplierId, code]
+      );
+      if (!rows.length) {
+        unmatched.push({ file: file.originalname, reason: "لا يوجد صنف بهذا الكود" });
+        continue;
+      }
+
+      let outputBuffer;
+      try {
+        outputBuffer = await sharp(file.buffer)
+          .rotate()
+          .resize({ width: 1920, height: 1920, fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+      } catch {
+        unmatched.push({ file: file.originalname, reason: "تعذّر التعرّف على نوع الصورة" });
+        continue;
+      }
+
+      try {
+        const filename = `${crypto.randomUUID()}.jpg`;
+        const { error } = await supabase.storage.from(BUCKET).upload(filename, outputBuffer, {
+          contentType: "image/jpeg", upsert: false,
+        });
+        if (error) throw error;
+        const { data } = supabase.storage.from(BUCKET).getPublicUrl(filename);
+
+        await query(`UPDATE products SET image_url = $2 WHERE id = $1`, [rows[0].id, data.publicUrl]);
+        matched.push({ file: file.originalname, productId: rows[0].id, productName: rows[0].name, url: data.publicUrl });
+      } catch (e) {
+        console.error("[BULK_UPLOAD]", e);
+        unmatched.push({ file: file.originalname, reason: "تعذّر رفع الصورة" });
+      }
+    }
+
+    res.json({ matched, unmatched });
   });
 });
