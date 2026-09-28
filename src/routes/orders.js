@@ -114,6 +114,8 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
           vehicleTypeId: body.vehicleTypeId,
           vehiclesCount: body.vehiclesCount,
           supplierCount: supplierIds.length,
+          customerId: req.actor.id,
+          supplierIds,
         })
       : 0;
 
@@ -225,6 +227,8 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
           vehicleTypeId: body.vehicleTypeId,
           vehiclesCount: body.vehiclesCount,
           supplierCount: supplierIds.length,
+          customerId: body.customerId,
+          supplierIds,
         })
       : 0;
 
@@ -429,6 +433,27 @@ orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(a
   }
 
   res.json({ items, unavailable });
+}));
+
+// تقدير تكلفة التوصيل قبل تأكيد الطلبية — نفس حساب السيرفر بالضبط (المسافة من
+// كل مورد بالسلة للزبون)، عشان العميل يشوف رقم قريب من الفاتورة الفعلية قبل
+// ما يأكد، مش يتفاجأ بعدها
+orderRouter.post("/estimate-delivery-fee", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    vehicleTypeId: z.string().uuid().optional(),
+    vehiclesCount: z.number().int().min(1).default(1),
+    supplierIds: z.array(z.string().uuid()).min(1),
+  }).parse(req.body);
+
+  const fee = await calcDeliveryFee(pool, {
+    vehicleTypeId: body.vehicleTypeId,
+    vehiclesCount: body.vehiclesCount,
+    supplierCount: body.supplierIds.length,
+    customerId: req.actor.id,
+    supplierIds: body.supplierIds,
+  });
+
+  res.json({ fee });
 }));
 
 orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(async (req, res) => {
@@ -697,12 +722,14 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
 
     let deliveryFee = 0;
     if (body.fulfillment === "delivery") {
-      const { rows: [{ count }] } = await client.query(
-        `SELECT COUNT(*)::INT AS count FROM order_suppliers WHERE order_id = $1`, [order.id]
+      const { rows: osRows } = await client.query(
+        `SELECT supplier_id FROM order_suppliers WHERE order_id = $1`, [order.id]
       );
+      const supplierIds = osRows.map((r) => r.supplier_id);
       deliveryFee = await calcDeliveryFee(client, {
         zoneId: body.deliveryZoneId, vehicleTypeId: body.vehicleTypeId,
-        vehiclesCount: body.vehiclesCount, supplierCount: count,
+        vehiclesCount: body.vehiclesCount, supplierCount: supplierIds.length,
+        customerId: order.customer_id, supplierIds,
       });
     }
 
