@@ -206,7 +206,7 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
     // بيانات الآجل (السقف والرصيد الحالي) — عشان تطبيق العميل يعرضها قبل ما يكمل
     // الطلب، مش يفاجئه برفض بعد ما يحاول يأكد
     const { rows: custRows } = await query(
-      `SELECT credit_enabled, credit_limit, credit_days FROM customers WHERE id = $1`,
+      `SELECT credit_enabled, credit_limit, credit_days, latitude, longitude FROM customers WHERE id = $1`,
       [req.actor.id]
     );
     const { rows: balRows } = await query(
@@ -222,8 +222,11 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
           balance: Number(balRows[0]?.balance ?? 0),
         }
       : null;
+    const location = custRows.length && custRows[0].latitude != null
+      ? { lat: Number(custRows[0].latitude), lng: Number(custRows[0].longitude) }
+      : null;
 
-    return res.json({ actor: req.actor, sections: rows, credit });
+    return res.json({ actor: req.actor, sections: rows, credit, location });
   }
 
   if (req.actor.type === "employee") {
