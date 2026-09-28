@@ -159,10 +159,80 @@ export async function notifyManager(message) {
   }
 }
 
-// تقرير أرباح مختصر لليوم الحالي — عمولة جملة المحصّلة ناقص المصروفات، يُبعث للمدير
+// أرقام مستلمي التقرير اليومي: المدير (من متغير البيئة) + الشريك (رقمه ثابت بالطلب)،
+// نتفادى التكرار لو صار نفس الرقم في الاثنين
+const DAILY_REPORT_PHONES = [...new Set([
+  process.env.WHATSAPP_MANAGER_PHONE,
+  "0910911991", // شريك الشركة
+].filter(Boolean))];
+
+async function notifyDailyReportRecipients(message) {
+  for (const phone of DAILY_REPORT_PHONES) {
+    try {
+      await sendWhatsapp(phone, message);
+    } catch (err) {
+      console.error("[تقرير يومي]", phone, err.message);
+    }
+  }
+}
+
+// تقرير أرباح شامل لليوم الحالي: المبيعات والفواتير، التحصيل من العملاء، الديون
+// المستحقة على العملاء (تراكمي)، حركة خزينة الحوالات، المصروفات، وصافي الربح.
+// يُبعث للمدير وللشريك سوية.
 export async function sendDailyProfitReport() {
   const { rows } = await query(
     `SELECT
+        COALESCE((
+          SELECT COUNT(*) FROM orders o
+           WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+             AND o.created_at::DATE = CURRENT_DATE
+        ), 0) AS invoices_count,
+        COALESCE((
+          SELECT SUM(o.grand_total) FROM orders o
+           WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+             AND o.created_at::DATE = CURRENT_DATE
+        ), 0) AS sales_total,
+        COALESCE((
+          SELECT SUM(o.cod_amount) FROM orders o
+           WHERE o.cod_collected AND o.delivered_at::DATE = CURRENT_DATE
+        ), 0) AS collected_cod,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v
+           WHERE v.party_type = 'customer' AND v.voucher_type = 'receipt'
+             AND v.approval_status = 'approved' AND v.created_at::DATE = CURRENT_DATE
+        ), 0) AS collected_receipts,
+        COALESCE((
+          SELECT SUM(bal.balance) FROM (
+            SELECT c.id,
+                   COALESCE(SUM(x.debit),0) - COALESCE(SUM(x.credit),0) AS balance
+              FROM customers c
+              LEFT JOIN (
+                SELECT o.customer_id, o.grand_total AS debit, 0 AS credit
+                  FROM orders o
+                 WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+                UNION ALL
+                SELECT v.party_id AS customer_id, 0 AS debit, v.amount AS credit
+                  FROM vouchers v
+                 WHERE v.party_type = 'customer' AND v.approval_status = 'approved'
+                   AND v.voucher_type IN ('receipt','payment')
+                UNION ALL
+                SELECT r.customer_id, 0 AS debit, r.refund_amount AS credit
+                  FROM returns r
+                 WHERE r.status = 'refunded' AND r.refund_method = 'credit_note' AND r.refund_amount > 0
+              ) x ON x.customer_id = c.id
+             GROUP BY c.id
+          ) bal WHERE bal.balance > 0
+        ), 0) AS total_customer_debt,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
+           WHERE t.code = 'hawala' AND v.voucher_type = 'receipt'
+             AND v.approval_status = 'approved' AND v.created_at::DATE = CURRENT_DATE
+        ), 0) AS hawala_in,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
+           WHERE t.code = 'hawala' AND v.voucher_type = 'payment'
+             AND v.approval_status = 'approved' AND v.created_at::DATE = CURRENT_DATE
+        ), 0) AS hawala_out,
         COALESCE((
           SELECT SUM(os.subtotal * os.commission_rate / 100.0)
             FROM order_suppliers os JOIN orders o ON o.id = os.order_id
@@ -170,15 +240,34 @@ export async function sendDailyProfitReport() {
         ), 0) AS commission,
         COALESCE((SELECT SUM(amount) FROM expenses WHERE expense_date = CURRENT_DATE), 0) AS expenses`
   );
-  const commission = Number(rows[0].commission);
-  const expenses = Number(rows[0].expenses);
+
+  const r = rows[0];
+  const invoicesCount = Number(r.invoices_count);
+  const salesTotal = Number(r.sales_total);
+  const collectedToday = Number(r.collected_cod) + Number(r.collected_receipts);
+  const totalDebt = Number(r.total_customer_debt);
+  const hawalaIn = Number(r.hawala_in);
+  const hawalaOut = Number(r.hawala_out);
+  const commission = Number(r.commission);
+  const expenses = Number(r.expenses);
   const dateLabel = new Date().toLocaleDateString("ar-LY", { day: "numeric", month: "long", year: "numeric" });
 
-  await notifyManager(
-    `تقرير أرباح جملة اليومي — ${dateLabel}\n` +
-    `عمولة محصّلة: ${commission.toFixed(2)} د.ل\n` +
-    `مصروفات: ${expenses.toFixed(2)} د.ل\n` +
-    `صافي الربح: ${(commission - expenses).toFixed(2)} د.ل`
+  await notifyDailyReportRecipients(
+    `تقرير جملة الشامل — ${dateLabel}\n\n` +
+    `الفواتير:\n` +
+    `عدد الفواتير اليوم: ${invoicesCount}\n` +
+    `إجمالي المبيعات اليوم: ${salesTotal.toFixed(2)} د.ل\n\n` +
+    `التحصيل:\n` +
+    `تحصيل اليوم من العملاء: ${collectedToday.toFixed(2)} د.ل\n\n` +
+    `الديون:\n` +
+    `إجمالي الديون المستحقة على العملاء: ${totalDebt.toFixed(2)} د.ل\n\n` +
+    `الحوالات اليوم:\n` +
+    `واردة: ${hawalaIn.toFixed(2)} د.ل\n` +
+    `صادرة: ${hawalaOut.toFixed(2)} د.ل\n\n` +
+    `المصروفات اليوم: ${expenses.toFixed(2)} د.ل\n\n` +
+    `الأرباح:\n` +
+    `عمولة محصّلة اليوم: ${commission.toFixed(2)} د.ل\n` +
+    `صافي الربح اليوم: ${(commission - expenses).toFixed(2)} د.ل`
   );
 }
 
