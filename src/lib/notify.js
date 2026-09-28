@@ -166,7 +166,7 @@ const DAILY_REPORT_PHONES = [...new Set([
   "0910911991", // شريك الشركة
 ].filter(Boolean))];
 
-async function notifyDailyReportRecipients(message) {
+async function notifyReportRecipients(message) {
   for (const phone of DAILY_REPORT_PHONES) {
     try {
       await sendWhatsapp(phone, message);
@@ -224,6 +224,13 @@ export async function sendDailyProfitReport() {
           ) bal WHERE bal.balance > 0
         ), 0) AS total_customer_debt,
         COALESCE((
+          SELECT SUM(bal.balance) FROM (
+            SELECT supplier_id, SUM(credit) - SUM(debit) AS balance
+              FROM v_supplier_ledger
+             GROUP BY supplier_id
+          ) bal WHERE bal.balance > 0
+        ), 0) AS total_supplier_debt,
+        COALESCE((
           SELECT SUM(v.amount) FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
            WHERE t.code = 'hawala' AND v.voucher_type = 'receipt'
              AND v.approval_status = 'approved' AND v.created_at::DATE = CURRENT_DATE
@@ -245,14 +252,15 @@ export async function sendDailyProfitReport() {
   const invoicesCount = Number(r.invoices_count);
   const salesTotal = Number(r.sales_total);
   const collectedToday = Number(r.collected_cod) + Number(r.collected_receipts);
-  const totalDebt = Number(r.total_customer_debt);
+  const totalCustomerDebt = Number(r.total_customer_debt);
+  const totalSupplierDebt = Number(r.total_supplier_debt);
   const hawalaIn = Number(r.hawala_in);
   const hawalaOut = Number(r.hawala_out);
   const commission = Number(r.commission);
   const expenses = Number(r.expenses);
   const dateLabel = new Date().toLocaleDateString("ar-LY", { day: "numeric", month: "long", year: "numeric" });
 
-  await notifyDailyReportRecipients(
+  await notifyReportRecipients(
     `تقرير جملة الشامل — ${dateLabel}\n\n` +
     `الفواتير:\n` +
     `عدد الفواتير اليوم: ${invoicesCount}\n` +
@@ -260,7 +268,8 @@ export async function sendDailyProfitReport() {
     `التحصيل:\n` +
     `تحصيل اليوم من العملاء: ${collectedToday.toFixed(2)} د.ل\n\n` +
     `الديون:\n` +
-    `إجمالي الديون المستحقة على العملاء: ${totalDebt.toFixed(2)} د.ل\n\n` +
+    `مستحق لنا على العملاء: ${totalCustomerDebt.toFixed(2)} د.ل\n` +
+    `مستحق علينا للموردين: ${totalSupplierDebt.toFixed(2)} د.ل\n\n` +
     `الحوالات اليوم:\n` +
     `واردة: ${hawalaIn.toFixed(2)} د.ل\n` +
     `صادرة: ${hawalaOut.toFixed(2)} د.ل\n\n` +
@@ -280,6 +289,136 @@ export async function maybeSendDailyProfitReport() {
   if (libyaHour === 23 && now.getUTCMinutes() >= 50 && lastDailyReportSentOn !== todayKey) {
     lastDailyReportSentOn = todayKey;
     await sendDailyProfitReport();
+  }
+}
+
+// تقرير أرباح شامل لكامل الشهر الحالي (من أول يوم فيه لتاريخ اليوم) — نفس بنود
+// التقرير اليومي بالضبط بس مجمّعة على الشهر، يُبعث للمدير وللشريك سوية
+export async function sendMonthlyProfitReport() {
+  const now = new Date();
+  const libyaNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  const year = libyaNow.getUTCFullYear();
+  const month = libyaNow.getUTCMonth(); // 0-indexed
+  const from = `${year}-${String(month + 1).padStart(2, "0")}-01`;
+  const to = new Date(Date.UTC(year, month + 1, 0)).toISOString().slice(0, 10);
+
+  const { rows } = await query(
+    `SELECT
+        COALESCE((
+          SELECT COUNT(*) FROM orders o
+           WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+             AND o.created_at::DATE BETWEEN $1 AND $2
+        ), 0) AS invoices_count,
+        COALESCE((
+          SELECT SUM(o.grand_total) FROM orders o
+           WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+             AND o.created_at::DATE BETWEEN $1 AND $2
+        ), 0) AS sales_total,
+        COALESCE((
+          SELECT SUM(o.cod_amount) FROM orders o
+           WHERE o.cod_collected AND o.delivered_at::DATE BETWEEN $1 AND $2
+        ), 0) AS collected_cod,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v
+           WHERE v.party_type = 'customer' AND v.voucher_type = 'receipt'
+             AND v.approval_status = 'approved' AND v.created_at::DATE BETWEEN $1 AND $2
+        ), 0) AS collected_receipts,
+        COALESCE((
+          SELECT SUM(bal.balance) FROM (
+            SELECT c.id,
+                   COALESCE(SUM(x.debit),0) - COALESCE(SUM(x.credit),0) AS balance
+              FROM customers c
+              LEFT JOIN (
+                SELECT o.customer_id, o.grand_total AS debit, 0 AS credit
+                  FROM orders o
+                 WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+                UNION ALL
+                SELECT v.party_id AS customer_id, 0 AS debit, v.amount AS credit
+                  FROM vouchers v
+                 WHERE v.party_type = 'customer' AND v.approval_status = 'approved'
+                   AND v.voucher_type IN ('receipt','payment')
+                UNION ALL
+                SELECT r.customer_id, 0 AS debit, r.refund_amount AS credit
+                  FROM returns r
+                 WHERE r.status = 'refunded' AND r.refund_method = 'credit_note' AND r.refund_amount > 0
+              ) x ON x.customer_id = c.id
+             GROUP BY c.id
+          ) bal WHERE bal.balance > 0
+        ), 0) AS total_customer_debt,
+        COALESCE((
+          SELECT SUM(bal.balance) FROM (
+            SELECT supplier_id, SUM(credit) - SUM(debit) AS balance
+              FROM v_supplier_ledger
+             GROUP BY supplier_id
+          ) bal WHERE bal.balance > 0
+        ), 0) AS total_supplier_debt,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
+           WHERE t.code = 'hawala' AND v.voucher_type = 'receipt'
+             AND v.approval_status = 'approved' AND v.created_at::DATE BETWEEN $1 AND $2
+        ), 0) AS hawala_in,
+        COALESCE((
+          SELECT SUM(v.amount) FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
+           WHERE t.code = 'hawala' AND v.voucher_type = 'payment'
+             AND v.approval_status = 'approved' AND v.created_at::DATE BETWEEN $1 AND $2
+        ), 0) AS hawala_out,
+        COALESCE((
+          SELECT SUM(os.subtotal * os.commission_rate / 100.0)
+            FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+           WHERE o.status IN ('delivered','closed') AND o.delivered_at::DATE BETWEEN $1 AND $2
+        ), 0) AS commission,
+        COALESCE((
+          SELECT SUM(amount) FROM expenses WHERE expense_date BETWEEN $1 AND $2
+        ), 0) AS expenses`,
+    [from, to]
+  );
+
+  const r = rows[0];
+  const invoicesCount = Number(r.invoices_count);
+  const salesTotal = Number(r.sales_total);
+  const collectedMonth = Number(r.collected_cod) + Number(r.collected_receipts);
+  const totalCustomerDebt = Number(r.total_customer_debt);
+  const totalSupplierDebt = Number(r.total_supplier_debt);
+  const hawalaIn = Number(r.hawala_in);
+  const hawalaOut = Number(r.hawala_out);
+  const commission = Number(r.commission);
+  const expenses = Number(r.expenses);
+  const monthLabel = libyaNow.toLocaleDateString("ar-LY", { month: "long", year: "numeric" });
+
+  await notifyReportRecipients(
+    `تقرير جملة الشهري — ${monthLabel}\n\n` +
+    `الفواتير:\n` +
+    `عدد الفواتير خلال الشهر: ${invoicesCount}\n` +
+    `إجمالي المبيعات خلال الشهر: ${salesTotal.toFixed(2)} د.ل\n\n` +
+    `التحصيل:\n` +
+    `تحصيل الشهر من العملاء: ${collectedMonth.toFixed(2)} د.ل\n\n` +
+    `الديون (لتاريخه):\n` +
+    `مستحق لنا على العملاء: ${totalCustomerDebt.toFixed(2)} د.ل\n` +
+    `مستحق علينا للموردين: ${totalSupplierDebt.toFixed(2)} د.ل\n\n` +
+    `الحوالات خلال الشهر:\n` +
+    `واردة: ${hawalaIn.toFixed(2)} د.ل\n` +
+    `صادرة: ${hawalaOut.toFixed(2)} د.ل\n\n` +
+    `المصروفات خلال الشهر: ${expenses.toFixed(2)} د.ل\n\n` +
+    `الأرباح:\n` +
+    `عمولة محصّلة خلال الشهر: ${commission.toFixed(2)} د.ل\n` +
+    `صافي الربح خلال الشهر: ${(commission - expenses).toFixed(2)} د.ل`
+  );
+}
+
+// يشغّل التقرير الشهري مرة وحدة بس في آخر يوم بالشهر (بتوقيت ليبيا)، شوية بعد
+// وقت التقرير اليومي عشان توصل كرسالتين منفصلتين مرتبتين
+let lastMonthlyReportSentOn = null;
+export async function maybeSendMonthlyProfitReport() {
+  const now = new Date();
+  const libyaHour = (now.getUTCHours() + 2) % 24;
+  const libyaNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  const libyaTomorrow = new Date(libyaNow.getTime() + 24 * 60 * 60 * 1000);
+  const isLastDayOfMonth = libyaTomorrow.getUTCMonth() !== libyaNow.getUTCMonth();
+  const monthKey = `${libyaNow.getUTCFullYear()}-${libyaNow.getUTCMonth()}`;
+
+  if (isLastDayOfMonth && libyaHour === 23 && now.getUTCMinutes() >= 55 && lastMonthlyReportSentOn !== monthKey) {
+    lastMonthlyReportSentOn = monthKey;
+    await sendMonthlyProfitReport();
   }
 }
 
