@@ -206,7 +206,8 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
       WHERE ($1::UUID IS NULL OR p.supplier_id = $1)
         AND ($2::UUID IS NULL OR p.section_id  = $2)
         AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%'
-             OR p.supplier_sku ILIKE '%' || $3 || '%')
+             OR p.supplier_sku ILIKE '%' || $3 || '%'
+             OR s.business_name ILIKE '%' || $3 || '%')
         AND ($4::TEXT IS NULL OR p.approval_status = $4)
       ORDER BY p.name`,
     [ownerFilter, sectionId || null, search || null, approvalStatus || null]
@@ -269,6 +270,8 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
 
 catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
   const body = z.object({
+    name: z.string().min(2).optional(),
+    sectionId: z.string().uuid().optional(),
     basePrice: z.number().positive().optional(),
     purchaseCost: z.number().nonnegative().optional(),
     isActive: z.boolean().optional(),
@@ -284,16 +287,22 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
     if (req.actor.type === "supplier" && before.supplier_id !== req.actor.id) {
       throw new ApiError(403, "لا يمكنك تعديل صنف لا يخصك");
     }
+    // تغيير القسم صلاحية إدارية فقط — المورد يقدر يعدّل صنفه لكن مو يغيّر تصنيفه
+    if (body.sectionId && req.actor.type === "supplier") {
+      throw new ApiError(403, "تغيير قسم الصنف من صلاحية الإدارة فقط");
+    }
 
     const { rows } = await client.query(
       `UPDATE products SET
-         base_price    = COALESCE($2, base_price),
-         purchase_cost = COALESCE($3, purchase_cost),
-         is_active     = COALESCE($4, is_active),
-         supplier_sku  = COALESCE($5, supplier_sku),
-         image_url     = COALESCE($6, image_url)
+         name          = COALESCE($2, name),
+         section_id    = COALESCE($3, section_id),
+         base_price    = COALESCE($4, base_price),
+         purchase_cost = COALESCE($5, purchase_cost),
+         is_active     = COALESCE($6, is_active),
+         supplier_sku  = COALESCE($7, supplier_sku),
+         image_url     = COALESCE($8, image_url)
        WHERE id = $1 RETURNING *`,
-      [req.params.id, body.basePrice ?? null, body.purchaseCost ?? null,
+      [req.params.id, body.name ?? null, body.sectionId ?? null, body.basePrice ?? null, body.purchaseCost ?? null,
        body.isActive ?? null, body.supplierSku ?? null, body.imageUrl ?? null]
     );
 
@@ -314,6 +323,35 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
   });
 
   res.json(updated);
+}));
+
+// حذف صنف نهائيًا — لو له تاريخ طلبات فعلي نوقفه بس (زي الخيارات بالضبط) عشان
+// الفواتير والتقارير القديمة تفضل صحيحة وما تختفيش أرقامها
+catalogRouter.delete("/products/:id", asyncRoute(async (req, res, next) => {
+  const { rows } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
+  if (!rows.length) throw new ApiError(404, "الصنف غير موجود");
+  if (req.actor.type === "supplier") {
+    if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك حذف صنف لا يخصك");
+    return next();
+  }
+  return requirePermission("catalog.manage")(req, res, next);
+}), asyncRoute(async (req, res) => {
+  const used = await query(`SELECT 1 FROM order_items WHERE product_id = $1 LIMIT 1`, [req.params.id]);
+  if (used.rows.length) {
+    await query(`UPDATE products SET is_active = FALSE WHERE id = $1`, [req.params.id]);
+    return res.json({ deactivated: true });
+  }
+  await withTransaction(async (client) => {
+    const before = await client.query(`SELECT * FROM products WHERE id = $1`, [req.params.id]);
+    await client.query(`DELETE FROM product_variants WHERE product_id = $1`, [req.params.id]);
+    await client.query(`DELETE FROM products WHERE id = $1`, [req.params.id]);
+    await writeAudit(client, {
+      actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+      action: "product.deleted", entityType: "product", entityId: req.params.id,
+      entityLabel: before.rows[0]?.name, before: before.rows[0], ip: req.ip,
+    });
+  });
+  res.status(204).send();
 }));
 
 /* --------------------- خيارات الصنف (ألوان/مقاسات/عبوات) ---------------------
