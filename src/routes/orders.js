@@ -1495,3 +1495,26 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
   res.json(result);
 }));
 
+
+// نقطة مؤقتة تُستدعى مرة واحدة: تصحح paid_amount/payment_status للطلبيات
+// السابقة اللي كان دفعها "عند المورد" واستلمها المورد كاش قبل إضافة هذا المنطق
+orderRouter.post("/admin/backfill-pay-at-supplier", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `WITH collected AS (
+         SELECT os.order_id, SUM(os.subtotal) AS amt
+           FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+          WHERE os.payment_received = TRUE AND o.payment_method = 'pay_at_supplier'
+          GROUP BY os.order_id
+       )
+       UPDATE orders o SET
+           paid_amount = c.amt,
+           payment_status = CASE WHEN c.amt >= o.grand_total THEN 'paid' ELSE 'partially_paid' END
+         FROM collected c
+        WHERE o.id = c.order_id AND o.paid_amount IS DISTINCT FROM c.amt
+        RETURNING o.id`
+    );
+    return { updatedCount: rows.length };
+  });
+  res.json(result);
+}));
