@@ -549,13 +549,37 @@ financeRouter.get("/ledger/customer/:id", asyncRoute(async (req, res) => {
 // رصيد كل عميل مجمّعًا من كشف حسابه الكامل (وليس من إجمالي الطلبيات فقط) —
 // يشمل سندات القبض غير المرتبطة بطلبية، فيعكس الرصيد الفعلي: مدين (يدين للشركة)
 // أو دائن (الشركة مدينة له) لو دفع أكثر من المطلوب
+// ملاحظة: كان هذا التقرير يجيب الأرصدة من v_customer_ledger مباشرة، وهي لا
+// تشمل الدفع النقدي عند الاستلام (لا عند المورد ولا مع المندوب) — فكانت تختلف
+// عن كشف حساب العميل التفصيلي (اللي فيه هذي الحركات). توا نفس المصدر بالضبط.
 financeRouter.get("/balances/customers", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
   const { rows } = await query(
     `SELECT c.id, c.business_name AS name, c.phone,
-            COALESCE(SUM(l.debit),0)::numeric  AS total_debit,
-            COALESCE(SUM(l.credit),0)::numeric AS total_credit
+            COALESCE(SUM(x.debit),0)::numeric  AS total_debit,
+            COALESCE(SUM(x.credit),0)::numeric AS total_credit
        FROM customers c
-       LEFT JOIN v_customer_ledger l ON l.customer_id = c.id
+       LEFT JOIN (
+         SELECT o.customer_id, o.grand_total AS debit, 0 AS credit
+           FROM orders o
+          WHERE o.status NOT IN ('draft','under_review','cancelled','postponed')
+         UNION ALL
+         SELECT v.party_id AS customer_id, 0 AS debit, v.amount AS credit
+           FROM vouchers v
+          WHERE v.party_type = 'customer' AND v.approval_status = 'approved'
+            AND v.voucher_type IN ('receipt','payment')
+         UNION ALL
+         SELECT r.customer_id, 0 AS debit, r.refund_amount AS credit
+           FROM returns r
+          WHERE r.status = 'refunded' AND r.refund_method = 'credit_note' AND r.refund_amount > 0
+         UNION ALL
+         SELECT o4.customer_id, 0 AS debit, os.subtotal AS credit
+           FROM order_suppliers os JOIN orders o4 ON o4.id = os.order_id
+          WHERE os.payment_received = TRUE AND o4.payment_method IN ('pay_at_supplier','cash')
+         UNION ALL
+         SELECT o5.customer_id, 0 AS debit, o5.cod_amount AS credit
+           FROM orders o5
+          WHERE o5.cod_collected = TRUE AND o5.fulfillment = 'delivery'
+       ) x ON x.customer_id = c.id
       GROUP BY c.id, c.business_name, c.phone`
   );
   res.json(rows.map((r) => ({
@@ -565,13 +589,20 @@ financeRouter.get("/balances/customers", requirePermission("reports.view"), asyn
 }));
 
 // نفس الفكرة للموردين — بالاتجاه المعاكس (دائن = الشركة مدينة للمورد، الوضع الطبيعي)
+// وتشمل الآن أيضًا نقدًا-عند-الاستلام (زي كشف حساب المورد التفصيلي بالضبط)
 financeRouter.get("/balances/suppliers", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
   const { rows } = await query(
     `SELECT s.id, s.business_name AS name, s.phone,
-            COALESCE(SUM(l.debit),0)::numeric  AS total_debit,
-            COALESCE(SUM(l.credit),0)::numeric AS total_credit
+            COALESCE(SUM(x.debit),0)::numeric  AS total_debit,
+            COALESCE(SUM(x.credit),0)::numeric AS total_credit
        FROM suppliers s
-       LEFT JOIN v_supplier_ledger l ON l.supplier_id = s.id
+       LEFT JOIN (
+         SELECT supplier_id, debit, credit FROM v_supplier_ledger
+         UNION ALL
+         SELECT os.supplier_id, os.subtotal AS debit, 0 AS credit
+           FROM order_suppliers os JOIN orders o ON o.id = os.order_id
+          WHERE os.payment_received = TRUE AND o.payment_method IN ('pay_at_supplier','cash')
+       ) x ON x.supplier_id = s.id
       GROUP BY s.id, s.business_name, s.phone`
   );
   res.json(rows.map((r) => ({
