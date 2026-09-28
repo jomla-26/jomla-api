@@ -171,7 +171,28 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
         ORDER BY s.sort_order`,
       [req.actor.id]
     );
-    return res.json({ actor: req.actor, sections: rows });
+
+    // بيانات الآجل (السقف والرصيد الحالي) — عشان تطبيق العميل يعرضها قبل ما يكمل
+    // الطلب، مش يفاجئه برفض بعد ما يحاول يأكد
+    const { rows: custRows } = await query(
+      `SELECT credit_enabled, credit_limit, credit_days FROM customers WHERE id = $1`,
+      [req.actor.id]
+    );
+    const { rows: balRows } = await query(
+      `SELECT COALESCE(SUM(debit),0)::numeric - COALESCE(SUM(credit),0)::numeric AS balance
+         FROM v_customer_ledger WHERE customer_id = $1`,
+      [req.actor.id]
+    );
+    const credit = custRows.length
+      ? {
+          enabled: custRows[0].credit_enabled,
+          limit: Number(custRows[0].credit_limit ?? 0),
+          days: custRows[0].credit_days,
+          balance: Number(balRows[0]?.balance ?? 0),
+        }
+      : null;
+
+    return res.json({ actor: req.actor, sections: rows, credit });
   }
 
   if (req.actor.type === "employee") {
