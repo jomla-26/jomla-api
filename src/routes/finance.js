@@ -452,8 +452,15 @@ financeRouter.get("/drivers/:id/wallet/transactions", asyncRoute(async (req, res
               v.voucher_number, 0 AS in_amount, v.amount AS out_amount
          FROM vouchers v
         WHERE v.paid_by_driver_id = $1 AND v.approval_status = 'approved'
+          AND v.voucher_type = 'payment'
        UNION ALL
-       SELECT ds.created_at AS entry_date, 'تسليم نقدية للإدارة' AS label,
+       SELECT v.created_at AS entry_date, 'استرجاع عهدة للإدارة' AS label,
+              v.voucher_number, 0 AS in_amount, v.amount AS out_amount
+         FROM vouchers v
+        WHERE v.paid_by_driver_id = $1 AND v.approval_status = 'approved'
+          AND v.voucher_type = 'receipt'
+       UNION ALL
+       SELECT v2.created_at AS entry_date, 'تسليم نقدية للإدارة' AS label,
               v2.voucher_number, 0 AS in_amount, ds.total_amount AS out_amount
          FROM driver_settlements ds JOIN vouchers v2 ON v2.id = ds.voucher_id
         WHERE ds.driver_id = $1
