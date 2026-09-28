@@ -34,7 +34,18 @@ export function normalizePhone(phone) {
   return digits;
 }
 
-export async function resolvePrice(client, { productId, customerId, qty }) {
+export async function resolvePrice(client, { productId, customerId, qty, variantId }) {
+  // خيارات الصنف (ألوان/مقاسات/عبوات) لها سعرها الخاص المستقل تمامًا —
+  // قواعد التسعير (عروض/أسعار عملاء) لسا على مستوى الصنف الأساسي بس، مو على كل خيار لحاله
+  if (variantId) {
+    const { rows } = await client.query(
+      `SELECT price FROM product_variants WHERE id = $1 AND product_id = $2`,
+      [variantId, productId]
+    );
+    if (!rows.length) throw new ApiError(404, "خيار الصنف غير موجود");
+    return rows[0].price;
+  }
+
   const { rows } = await client.query(
     `SELECT price, rule_type
        FROM product_price_rules
