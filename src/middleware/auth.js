@@ -92,10 +92,14 @@ export const requireAnyPermission = (...permissionCodes) => async (req, _res, ne
   }
 };
 
+// لو القسم المطلوب قسم فرعي (له parent_id)، التفعيل يتحقق منه على مستوى القسم الرئيسي
+// (تفعيل القسم الرئيسي للعميل يفعّل كل تصنيفاته الفرعية تلقائيًا)
 export async function assertCustomerSection(customerId, sectionId) {
   const { rows } = await query(
-    `SELECT 1 FROM customer_sections
-      WHERE customer_id = $1 AND section_id = $2 AND enabled`,
+    `SELECT 1
+       FROM sections s
+       JOIN customer_sections cs ON cs.section_id = COALESCE(s.parent_id, s.id)
+      WHERE s.id = $2 AND cs.customer_id = $1 AND cs.enabled`,
     [customerId, sectionId]
   );
   if (!rows.length) throw new ApiError(403, "هذا القسم غير مفعّل لحسابك");
