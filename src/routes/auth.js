@@ -183,7 +183,8 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
 
   if (req.actor.type === "supplier") {
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug, s.image_url
+      `SELECT s.id, s.name, s.slug, s.image_url,
+              EXISTS(SELECT 1 FROM sections c WHERE c.parent_id = s.id AND c.is_active) AS has_subsections
          FROM supplier_sections ss
          JOIN sections s ON s.id = ss.section_id
         WHERE ss.supplier_id = $1 AND ss.enabled AND s.is_active
@@ -195,7 +196,8 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
 
   if (req.actor.type === "customer") {
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug, s.image_url
+      `SELECT s.id, s.name, s.slug, s.image_url,
+              EXISTS(SELECT 1 FROM sections c WHERE c.parent_id = s.id AND c.is_active) AS has_subsections
          FROM customer_sections cs
          JOIN sections s ON s.id = cs.section_id
         WHERE cs.customer_id = $1 AND cs.enabled AND s.is_active
