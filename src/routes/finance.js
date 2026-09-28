@@ -283,6 +283,189 @@ financeRouter.get("/drivers/cash", requirePermission("reports.view"), asyncRoute
   res.json(rows);
 }));
 
+// ====== عهدة/محفظة المندوب ======
+// الإدارة تسلّم المندوب مبلغ نقدي (عهدة) يستخدمه لاحقًا في الدفع للموردين نيابة عن الشركة
+financeRouter.post("/drivers/:id/float", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    amount: z.number().positive(),
+    note: z.string().optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows: drv } = await client.query(
+      `SELECT name FROM employees WHERE id = $1 AND is_active`, [req.params.id]
+    );
+    if (!drv.length) throw new ApiError(404, "المندوب غير موجود");
+
+    const { rows: tr } = await client.query(
+      `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("payment", "cash")]
+    );
+    if (!tr.length) throw new ApiError(400, "الخزينة غير معروفة");
+
+    const vNumber = await nextDocNumber(client, {
+      table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+    });
+
+    const { rows: [voucher] } = await client.query(
+      `INSERT INTO vouchers
+         (voucher_number, voucher_type, party_type, party_id, party_name,
+          amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by)
+       VALUES ($1,'payment','driver',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6)
+       RETURNING *`,
+      [vNumber, req.params.id, drv[0].name, body.amount, tr[0].id,
+       req.actor.id, body.note || `عهدة نقدية للمندوب`]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "driver.float_issued", entityType: "voucher", entityId: voucher.id,
+      entityLabel: voucher.voucher_number, after: voucher, ip: req.ip,
+    });
+
+    return voucher;
+  });
+
+  res.status(201).json(result);
+}));
+
+// رصيد عهدة/محفظة المندوب الحالي: (العهدة اللي سلّمته الإدارة) + (كاش حصّله من العملاء ولسا ما سلّمهش)
+// ناقص (اللي صرفه هو نفسه لموردين من عهدته)
+async function computeDriverWalletBalance(driverId) {
+  const { rows: floatRows } = await query(
+    `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+      WHERE party_type = 'driver' AND party_id = $1 AND voucher_type = 'payment'
+        AND method = 'cash' AND approval_status = 'approved'`,
+    [driverId]
+  );
+  const { rows: codRows } = await query(
+    `SELECT COALESCE(SUM(cod_amount),0) AS total FROM orders
+      WHERE driver_id = $1 AND cod_collected AND NOT cod_settled`,
+    [driverId]
+  );
+  const { rows: paidOutRows } = await query(
+    `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+      WHERE paid_by_driver_id = $1 AND approval_status = 'approved'`,
+    [driverId]
+  );
+  const floatGiven = Number(floatRows[0].total);
+  const codInHand = Number(codRows[0].total);
+  const paidOut = Number(paidOutRows[0].total);
+  return { floatGiven, codInHand, paidOut, balance: floatGiven + codInHand - paidOut };
+}
+
+financeRouter.get("/drivers/:id/wallet", asyncRoute(async (req, res) => {
+  if (req.actor.role === "driver" && req.actor.id !== req.params.id) {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على محفظة مندوب آخر");
+  }
+  const result = await computeDriverWalletBalance(req.params.id);
+  res.json(result);
+}));
+
+// حركات محفظة المندوب بالتفصيل (زي كشف حساب)
+financeRouter.get("/drivers/:id/wallet/transactions", asyncRoute(async (req, res) => {
+  if (req.actor.role === "driver" && req.actor.id !== req.params.id) {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على محفظة مندوب آخر");
+  }
+  const { rows } = await query(
+    `SELECT * FROM (
+       SELECT v.created_at AS entry_date, 'عهدة نقدية مستلمة من الإدارة' AS label,
+              v.voucher_number, v.amount AS in_amount, 0 AS out_amount
+         FROM vouchers v
+        WHERE v.party_type = 'driver' AND v.party_id = $1 AND v.voucher_type = 'payment'
+          AND v.method = 'cash' AND v.approval_status = 'approved'
+       UNION ALL
+       SELECT o.delivered_at AS entry_date, 'تحصيل نقدي عند التسليم - ' || o.order_number AS label,
+              NULL::text AS voucher_number, o.cod_amount AS in_amount, 0 AS out_amount
+         FROM orders o
+        WHERE o.driver_id = $1 AND o.cod_collected = TRUE
+       UNION ALL
+       SELECT v.created_at AS entry_date, 'دفع لمورد: ' || v.party_name AS label,
+              v.voucher_number, 0 AS in_amount, v.amount AS out_amount
+         FROM vouchers v
+        WHERE v.paid_by_driver_id = $1 AND v.approval_status = 'approved'
+       UNION ALL
+       SELECT ds.created_at AS entry_date, 'تسليم نقدية للإدارة' AS label,
+              v2.voucher_number, 0 AS in_amount, ds.total_amount AS out_amount
+         FROM driver_settlements ds JOIN vouchers v2 ON v2.id = ds.voucher_id
+        WHERE ds.driver_id = $1
+     ) x ORDER BY entry_date`,
+    [req.params.id]
+  );
+  let balance = 0;
+  const withBalance = rows.map((r) => {
+    balance += Number(r.in_amount) - Number(r.out_amount);
+    return { ...r, balance };
+  });
+  res.json(withBalance);
+}));
+
+// المندوب يدفع لمورد نقدًا من عهدته الشخصية (يصرف من رصيده هو، مو من خزينة الشركة مباشرة)
+financeRouter.post("/drivers/:id/pay-supplier", requireActorType("employee"), asyncRoute(async (req, res) => {
+  if (req.actor.role !== "driver") throw new ApiError(403, "هذا الإجراء مخصص لمندوبي التوصيل");
+  if (req.actor.id !== req.params.id) throw new ApiError(403, "لا تقدر تصرف من عهدة مندوب ثاني");
+
+  const body = z.object({
+    supplierId: z.string().uuid(),
+    amount: z.number().positive(),
+    note: z.string().optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows: floatRows } = await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+        WHERE party_type = 'driver' AND party_id = $1 AND voucher_type = 'payment'
+          AND method = 'cash' AND approval_status = 'approved'`,
+      [req.actor.id]
+    );
+    const { rows: codRows } = await client.query(
+      `SELECT COALESCE(SUM(cod_amount),0) AS total FROM orders
+        WHERE driver_id = $1 AND cod_collected AND NOT cod_settled`,
+      [req.actor.id]
+    );
+    const { rows: paidOutRows } = await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+        WHERE paid_by_driver_id = $1 AND approval_status = 'approved'`,
+      [req.actor.id]
+    );
+    const balance = Number(floatRows[0].total) + Number(codRows[0].total) - Number(paidOutRows[0].total);
+    if (body.amount > balance) {
+      throw new ApiError(400, `رصيد عهدتك ${balance.toFixed(2)} د.ل، ما يكفيش لدفع ${body.amount.toFixed(2)} د.ل`);
+    }
+
+    const { rows: sup } = await client.query(`SELECT business_name FROM suppliers WHERE id = $1`, [body.supplierId]);
+    if (!sup.length) throw new ApiError(404, "المورد غير موجود");
+
+    const { rows: tr } = await client.query(
+      `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("payment", "cash")]
+    );
+    if (!tr.length) throw new ApiError(400, "الخزينة غير معروفة");
+
+    const vNumber = await nextDocNumber(client, {
+      table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+    });
+
+    const { rows: [voucher] } = await client.query(
+      `INSERT INTO vouchers
+         (voucher_number, voucher_type, party_type, party_id, party_name,
+          amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by, paid_by_driver_id)
+       VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6,$8)
+       RETURNING *`,
+      [vNumber, body.supplierId, sup[0].business_name, body.amount, tr[0].id,
+       req.actor.id, body.note || `دفعها المندوب ${req.actor.name} من عهدته`, req.actor.id]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "driver.paid_supplier_from_wallet", entityType: "voucher", entityId: voucher.id,
+      entityLabel: voucher.voucher_number, after: voucher, ip: req.ip,
+    });
+
+    return voucher;
+  });
+
+  res.status(201).json(result);
+}));
+
 financeRouter.post("/salaries", requirePermission("finance.salaries"), asyncRoute(async (req, res) => {
   const body = z.object({
     employeeId: z.string().uuid(),
