@@ -1534,7 +1534,30 @@ orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review
            AND o.paid_amount < o.grand_total
          RETURNING o.id, o.order_number`
     );
-    return { updatedCount: rows.length, orders: rows.map((r) => r.order_number) };
+
+    // نفس الطلبيات: نصحح جزء المورد (order_suppliers) اللي فاته التحديث لما
+    // الحالة اتغيّرت يدويًا من لوحة الإدارة (تجاوز الزر العادي لتأكيد الاستلام)،
+    // عشان يبان صح في كشف حساب العميل والمورد بعدين
+    const { rows: osRows } = await client.query(
+      `UPDATE order_suppliers os SET
+           payment_received = TRUE,
+           pickup_confirmed = TRUE,
+           status = CASE WHEN os.status NOT IN ('picked_up','closed','cancelled') THEN 'picked_up' ELSE os.status END,
+           confirmed_at = COALESCE(os.confirmed_at, now())
+         FROM orders o
+        WHERE o.id = os.order_id
+          AND o.status = 'delivered'
+          AND o.fulfillment = 'pickup'
+          AND o.payment_method IN ('cash', 'pay_at_supplier')
+          AND os.payment_received = FALSE
+        RETURNING os.id`
+    );
+
+    return {
+      updatedCount: rows.length,
+      orders: rows.map((r) => r.order_number),
+      supplierPartsFixed: osRows.length,
+    };
   });
   res.json(result);
 }));
