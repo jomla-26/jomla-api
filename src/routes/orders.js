@@ -83,12 +83,30 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
     const itemsSubtotal = enriched.reduce((s, i) => s + i.price * i.qty, 0);
 
     const { rows: supplierRates } = await client.query(
-      `SELECT id, commission_rate_percent FROM suppliers WHERE id = ANY($1)`,
+      `SELECT id, business_name, commission_rate_percent FROM suppliers WHERE id = ANY($1)`,
       [supplierIds]
     );
     const rateMap = Object.fromEntries(
       supplierRates.map((s) => [s.id, s.commission_rate_percent ?? 0])
     );
+    const supplierNameMap = Object.fromEntries(
+      supplierRates.map((s) => [s.id, s.business_name])
+    );
+
+    // الحد الأدنى لطلب كل مورد لوحده داخل السلة — الواجهة تمنع العميل يوصل هنا أصلاً
+    // (تعرضله المبلغ الناقص وهو يبني السلة)، وهذا التحقق شبكة أمان احتياطية بس
+    const MIN_SUPPLIER_ORDER = 1000;
+    for (const supplierId of supplierIds) {
+      const supplierSubtotal = enriched
+        .filter((i) => i.supplier_id === supplierId)
+        .reduce((s, i) => s + i.price * i.qty, 0);
+      if (supplierSubtotal < MIN_SUPPLIER_ORDER) {
+        throw new ApiError(
+          400,
+          `الحد الأدنى للطلب من "${supplierNameMap[supplierId] ?? "المورد"}" هو ${MIN_SUPPLIER_ORDER} د.ل — طلبك من هذا المورد حاليًا ${supplierSubtotal.toFixed(2)} د.ل`
+        );
+      }
+    }
 
     const deliveryFee = body.fulfillment === "delivery"
       ? await calcDeliveryFee(client, {
@@ -1210,48 +1228,45 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
         [part.order_id, part.subtotal]
       );
 
-      // سند قبض/دفع حقيقي برقم رسمي — بس لو فيه مبلغ فعلي (السند بمبلغ صفر مرفوض من قاعدة البيانات أصلاً)
-      if (Number(part.subtotal) > 0) {
-        // سند قبض — يظهر في كشف حساب العميل كدفعة موثّقة بدل سطر بلا رقم
-        const { rows: tr } = await client.query(
-          `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("receipt", "cash")]
+      // سند قبض حقيقي برقم رسمي — يظهر في كشف حساب العميل كدفعة موثّقة بدل سطر بلا رقم
+      const { rows: tr } = await client.query(
+        `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("receipt", "cash")]
+      );
+      if (tr.length) {
+        const { rows: custRows } = await client.query(
+          `SELECT business_name FROM customers WHERE id = $1`, [part.customer_id]
         );
-        if (tr.length) {
-          const { rows: custRows } = await client.query(
-            `SELECT business_name FROM customers WHERE id = $1`, [part.customer_id]
-          );
-          const vNumber = await nextDocNumber(client, {
-            table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
-          });
-          await client.query(
-            `INSERT INTO vouchers
-               (voucher_number, voucher_type, party_type, party_id, party_name,
-                amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-                note, created_by)
-             VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
-            [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", part.subtotal,
-             tr[0].id, part.order_id, `دفع نقدًا عند الاستلام — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
-          );
-        }
+        const vNumber = await nextDocNumber(client, {
+          table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+        });
+        await client.query(
+          `INSERT INTO vouchers
+             (voucher_number, voucher_type, party_type, party_id, party_name,
+              amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
+              note, created_by)
+           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+          [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", part.subtotal,
+           tr[0].id, part.order_id, `دفع نقدًا عند الاستلام — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
+        );
+      }
 
-        // سند دفع مقابل — يعكس إن المورد احتفظ بالمبلغ لنفسه (خصمًا مما تدين له به الشركة)
-        const { rows: trPay } = await client.query(
-          `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("payment", "cash")]
+      // سند دفع مقابل — يعكس إن المورد احتفظ بالمبلغ لنفسه (خصمًا مما تدين له به الشركة)
+      const { rows: trPay } = await client.query(
+        `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("payment", "cash")]
+      );
+      if (trPay.length) {
+        const vNumber2 = await nextDocNumber(client, {
+          table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+        });
+        await client.query(
+          `INSERT INTO vouchers
+             (voucher_number, voucher_type, party_type, party_id, party_name,
+              amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
+              note, created_by)
+           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+          [vNumber2, req.actor.id, req.actor.name, part.subtotal, trPay[0].id, part.order_id,
+           `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${part.order_number}`]
         );
-        if (trPay.length) {
-          const vNumber2 = await nextDocNumber(client, {
-            table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
-          });
-          await client.query(
-            `INSERT INTO vouchers
-               (voucher_number, voucher_type, party_type, party_id, party_name,
-                amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-                note, created_by)
-             VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
-            [vNumber2, req.actor.id, req.actor.name, part.subtotal, trPay[0].id, part.order_id,
-             `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${part.order_number}`]
-          );
-        }
       }
     }
 
@@ -1640,7 +1655,6 @@ orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review
          JOIN suppliers s ON s.id = os.supplier_id
          JOIN customers c ON c.id = o.customer_id
         WHERE os.payment_received = TRUE
-          AND os.subtotal > 0
           AND o.payment_method IN ('cash', 'pay_at_supplier')
           AND NOT EXISTS (
             SELECT 1 FROM vouchers v
