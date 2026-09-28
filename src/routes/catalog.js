@@ -154,10 +154,19 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
 
     const { rows } = await query(
       `SELECT p.id, p.name, p.unit, p.image_url, p.base_price, p.stock_qty,
-              p.availability, s.business_name AS supplier_name, p.supplier_id
+              p.availability, s.business_name AS supplier_name, p.supplier_id,
+              COALESCE(pv.variants, '[]'::json) AS variants
          FROM products p
          JOIN suppliers s ON s.id = p.supplier_id
          JOIN sections psec ON psec.id = p.section_id
+         LEFT JOIN LATERAL (
+               SELECT json_agg(json_build_object(
+                        'id', v.id, 'label', v.label, 'price', v.price,
+                        'stockQty', v.stock_qty, 'imageUrl', v.image_url
+                      ) ORDER BY v.sort_order, v.created_at) AS variants
+                 FROM product_variants v
+                WHERE v.product_id = p.id AND v.is_active
+             ) pv ON true
         WHERE p.section_id = $1
           AND p.is_active
           AND p.approval_status = 'approved'
@@ -177,6 +186,8 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
     const priced = await Promise.all(
       rows.map(async (p) => {
         const { base_price, ...rest } = p;
+        // الصنف اللي عنده خيارات: سعره وكميته الفعليين على مستوى كل خيار لحاله، مش الصنف الأساسي
+        if (rest.variants?.length) return { ...rest, price: null };
         const price = await resolvePrice(pool, {
           productId: p.id, customerId: req.actor.id, qty: 1,
         }).catch(() => base_price);
@@ -303,6 +314,135 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
   });
 
   res.json(updated);
+}));
+
+/* --------------------- خيارات الصنف (ألوان/مقاسات/عبوات) ---------------------
+   كل خيار له سعره وكمية مخزونه المستقلين تمامًا عن الصنف الأساسي وعن بقية الخيارات */
+
+catalogRouter.get("/products/:id/variants", asyncRoute(async (req, res) => {
+  const { rows: prod } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
+  if (!prod.length) throw new ApiError(404, "الصنف غير موجود");
+  if (req.actor.type === "supplier" && prod[0].supplier_id !== req.actor.id) {
+    throw new ApiError(403, "لا يمكنك الاطلاع على خيارات صنف لا يخصك");
+  }
+  const { rows } = await query(
+    `SELECT * FROM product_variants WHERE product_id = $1 ORDER BY sort_order, created_at`,
+    [req.params.id]
+  );
+  res.json(rows);
+}));
+
+const variantSchema = z.object({
+  label: z.string().min(1).max(150),
+  price: z.number().positive(),
+  purchaseCost: z.number().nonnegative().optional(),
+  stockQty: z.number().nonnegative().default(0),
+  sku: z.string().trim().max(100).optional(),
+  imageUrl: z.string().url().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+async function assertCanManageProduct(req, res, next) {
+  const { rows } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
+  if (!rows.length) throw new ApiError(404, "الصنف غير موجود");
+  if (req.actor.type === "supplier") {
+    if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك تعديل صنف لا يخصك");
+    return next();
+  }
+  return requirePermission("catalog.manage")(req, res, next);
+}
+
+catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct), asyncRoute(async (req, res) => {
+  const body = variantSchema.parse(req.body);
+
+  const variant = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `INSERT INTO product_variants
+         (product_id, label, price, purchase_cost, stock_qty, sku, image_url, sort_order, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0),$9) RETURNING *`,
+      [req.params.id, body.label, body.price, body.purchaseCost ?? null, body.stockQty,
+       body.sku || null, body.imageUrl || null, body.sortOrder, req.actor.id]
+    );
+    if (body.stockQty > 0) {
+      await client.query(
+        `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
+         VALUES ($1,$2,$3,'رصيد افتتاحي — خيار جديد',$4)`,
+        [req.params.id, rows[0].id, body.stockQty, req.actor.id]
+      );
+    }
+    await writeAudit(client, {
+      actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+      action: "product_variant.created", entityType: "product_variant", entityId: rows[0].id,
+      entityLabel: body.label, after: rows[0], ip: req.ip,
+    });
+    return rows[0];
+  });
+
+  res.status(201).json(variant);
+}));
+
+async function assertCanManageVariant(req, res, next) {
+  const { rows } = await query(
+    `SELECT v.*, p.supplier_id FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.id = $1`,
+    [req.params.id]
+  );
+  if (!rows.length) throw new ApiError(404, "الخيار غير موجود");
+  if (req.actor.type === "supplier") {
+    if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك تعديل خيار لا يخصك");
+    return next();
+  }
+  return requirePermission("catalog.manage")(req, res, next);
+}
+
+catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant), asyncRoute(async (req, res) => {
+  const body = z.object({
+    label: z.string().min(1).max(150).optional(),
+    price: z.number().positive().optional(),
+    purchaseCost: z.number().nonnegative().optional(),
+    stockQty: z.number().nonnegative().optional(),
+    sku: z.string().trim().max(100).optional(),
+    imageUrl: z.string().url().optional(),
+    isActive: z.boolean().optional(),
+  }).parse(req.body);
+
+  const updated = await withTransaction(async (client) => {
+    const before = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!before.rows.length) throw new ApiError(404, "الخيار غير موجود");
+
+    const { rows } = await client.query(
+      `UPDATE product_variants SET
+         label         = COALESCE($2, label),
+         price         = COALESCE($3, price),
+         purchase_cost = COALESCE($4, purchase_cost),
+         stock_qty     = COALESCE($5, stock_qty),
+         sku           = COALESCE($6, sku),
+         image_url     = COALESCE($7, image_url),
+         is_active     = COALESCE($8, is_active)
+       WHERE id = $1 RETURNING *`,
+      [req.params.id, body.label ?? null, body.price ?? null, body.purchaseCost ?? null,
+       body.stockQty ?? null, body.sku ?? null, body.imageUrl ?? null, body.isActive ?? null]
+    );
+
+    await writeAudit(client, {
+      actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+      action: "product_variant.updated", entityType: "product_variant", entityId: req.params.id,
+      entityLabel: rows[0].label, before: before.rows[0], after: rows[0], ip: req.ip,
+    });
+    return rows[0];
+  });
+
+  res.json(updated);
+}));
+
+catalogRouter.delete("/product-variants/:id", asyncRoute(assertCanManageVariant), asyncRoute(async (req, res) => {
+  const used = await query(`SELECT 1 FROM order_items WHERE variant_id = $1 LIMIT 1`, [req.params.id]);
+  if (used.rows.length) {
+    // ما نحذفش خيار له تاريخ طلبات فعلي — نوقّفه بس عشان الفواتير القديمة تفضل صحيحة
+    await query(`UPDATE product_variants SET is_active = FALSE WHERE id = $1`, [req.params.id]);
+    return res.json({ deactivated: true });
+  }
+  await query(`DELETE FROM product_variants WHERE id = $1`, [req.params.id]);
+  res.status(204).send();
 }));
 
 // موافقة الإدارة أو رفضها لصنف مضاف من مورد — قبل هذا القرار الصنف لا يظهر للعميل إطلاقًا
