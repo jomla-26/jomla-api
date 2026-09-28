@@ -290,7 +290,65 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
 }));
 
 financeRouter.get("/drivers/cash", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
-  const { rows } = await query(`SELECT * FROM v_driver_cash ORDER BY cash_in_hand DESC`);
+  // نضيف هنا رصيد العهدة الكامل (float_given + cash_in_hand - paid_out) لكل
+  // مندوب، بنفس آلية computeDriverWalletBalance بالضبط، بس بجولة واحدة لكل
+  // المندوبين مع بعض بدل ما نسأل عن كل مندوب لحاله — عشان لوحة "تحصيلات
+  // المندوبين" تقدر تعرض رصيد العهدة مباشرة من غير ما تفتح محفظة كل مندوب
+  // واحد واحد.
+  const { rows } = await query(
+    `SELECT dc.*,
+            COALESCE(f.total, 0)                                      AS float_given,
+            COALESCE(p.total, 0)                                      AS paid_out,
+            COALESCE(f.total, 0) + dc.cash_in_hand - COALESCE(p.total, 0) AS wallet_balance
+       FROM v_driver_cash dc
+       LEFT JOIN (
+         SELECT party_id, SUM(amount) AS total FROM vouchers
+          WHERE party_type = 'driver' AND voucher_type = 'payment'
+            AND method = 'cash' AND approval_status = 'approved'
+          GROUP BY party_id
+       ) f ON f.party_id = dc.driver_id
+       LEFT JOIN (
+         SELECT paid_by_driver_id, SUM(amount) AS total FROM vouchers
+          WHERE paid_by_driver_id IS NOT NULL AND approval_status = 'approved'
+          GROUP BY paid_by_driver_id
+       ) p ON p.paid_by_driver_id = dc.driver_id
+      ORDER BY wallet_balance DESC`
+  );
+  res.json(rows);
+}));
+
+// رصيد العهدة لكل الموظفين (مش المندوبين بس) — نفس جدول "vouchers" اللي
+// يسجّل العهد يشتغل لأي موظف نشط، مش مربوط بدور "مندوب" تحديدًا في الباك
+// اند (شوف POST /drivers/:id/float — ما فيهوش شرط role === 'driver')، بس
+// v_driver_cash نفسها مبنية على orders.driver_id فقط فما تجيبش موظف عادي
+// ماعندوش طلبيات. هذا المسار يرجّع رصيد العهدة لكل موظف نشط بغض النظر عن دوره،
+// عشان يتعرض جنب كل موظف في صفحة "الموظفون والرواتب".
+financeRouter.get("/employees/wallets", requirePermission("reports.view"), asyncRoute(async (_req, res) => {
+  const { rows } = await query(
+    `SELECT e.id AS employee_id,
+            COALESCE(f.total, 0)                                        AS float_given,
+            COALESCE(c.total, 0)                                        AS cod_in_hand,
+            COALESCE(p.total, 0)                                        AS paid_out,
+            COALESCE(f.total, 0) + COALESCE(c.total, 0) - COALESCE(p.total, 0) AS balance
+       FROM employees e
+       LEFT JOIN (
+         SELECT party_id, SUM(amount) AS total FROM vouchers
+          WHERE party_type = 'driver' AND voucher_type = 'payment'
+            AND method = 'cash' AND approval_status = 'approved'
+          GROUP BY party_id
+       ) f ON f.party_id = e.id
+       LEFT JOIN (
+         SELECT driver_id, SUM(cod_amount) AS total FROM orders
+          WHERE cod_collected AND NOT cod_settled
+          GROUP BY driver_id
+       ) c ON c.driver_id = e.id
+       LEFT JOIN (
+         SELECT paid_by_driver_id, SUM(amount) AS total FROM vouchers
+          WHERE paid_by_driver_id IS NOT NULL AND approval_status = 'approved'
+          GROUP BY paid_by_driver_id
+       ) p ON p.paid_by_driver_id = e.id
+      WHERE e.is_active`
+  );
   res.json(rows);
 }));
 
@@ -468,6 +526,70 @@ financeRouter.post("/drivers/:id/pay-supplier", requireActorType("employee"), as
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "driver.paid_supplier_from_wallet", entityType: "voucher", entityId: voucher.id,
+      entityLabel: voucher.voucher_number, after: voucher, ip: req.ip,
+    });
+
+    return voucher;
+  });
+
+  res.status(201).json(result);
+}));
+
+// استرجاع عهدة — الأدمن يستلم من المندوب جزء أو كل رصيد عهدته نقدًا ويرجّعها
+// لخزينة الشركة. عكس "إعطاء عهدة" بالضبط: نفس رصيد المندوب (floatGiven +
+// codInHand - paidOut) ينخفض هنا عن طريق paid_by_driver_id، بنفس آلية دفع
+// المندوب لمورد من عهدته، بس هنا المستفيد خزينة الشركة مش مورد.
+financeRouter.post("/drivers/:id/return-float", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    amount: z.number().positive(),
+    note: z.string().optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows: drv } = await client.query(
+      `SELECT name FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]
+    );
+    if (!drv.length) throw new ApiError(404, "المندوب غير موجود");
+
+    const { rows: floatRows } = await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+        WHERE party_type = 'driver' AND party_id = $1 AND voucher_type = 'payment'
+          AND method = 'cash' AND approval_status = 'approved'`,
+      [req.params.id]
+    );
+    const { rows: codRows } = await client.query(
+      `SELECT COALESCE(SUM(cod_amount),0) AS total FROM orders
+        WHERE driver_id = $1 AND cod_collected AND NOT cod_settled`,
+      [req.params.id]
+    );
+    const { rows: paidOutRows } = await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM vouchers
+        WHERE paid_by_driver_id = $1 AND approval_status = 'approved'`,
+      [req.params.id]
+    );
+    const balance = Number(floatRows[0].total) + Number(codRows[0].total) - Number(paidOutRows[0].total);
+    if (body.amount > balance) {
+      throw new ApiError(400, `رصيد عهدة ${drv[0].name} ${balance.toFixed(2)} د.ل، ما يكفيش لاسترجاع ${body.amount.toFixed(2)} د.ل`);
+    }
+
+    const vNumber = await nextDocNumber(client, {
+      table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
+    });
+    const { rows: tr } = await client.query(`SELECT id FROM treasuries WHERE code = 'sales'`);
+
+    const { rows: [voucher] } = await client.query(
+      `INSERT INTO vouchers
+         (voucher_number, voucher_type, party_type, party_id, party_name,
+          amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by, paid_by_driver_id)
+       VALUES ($1,'receipt','driver',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6,$8)
+       RETURNING *`,
+      [vNumber, req.params.id, drv[0].name, body.amount, tr[0].id,
+       req.actor.id, body.note || `استرجاع عهدة من المندوب ${drv[0].name}`, req.params.id]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "driver.float_returned", entityType: "voucher", entityId: voucher.id,
       entityLabel: voucher.voucher_number, after: voucher, ip: req.ip,
     });
 
