@@ -13,6 +13,33 @@ const otpLimiter = rateLimit({
   message: { error: "محاولات كثيرة، يرجى المحاولة بعد قليل" },
 });
 
+// حماية إضافية حسب رقم الهاتف نفسه (مو بس الـ IP): الـ limiter أعلاه يحسب حسب
+// عنوان IP، وممكن يتلف (شبكة موبايل مشتركة، أو مهاجم يغيّر IP كل مرة). هذا يمنع
+// إغراق رقم معيّن برسائل متكررة مهما كان مصدر الطلب.
+const OTP_COOLDOWN_SECONDS = 45;
+const OTP_MAX_PER_HOUR = 5;
+
+async function checkOtpPhoneLimit(phone, accountType) {
+  const { rows: lastReq } = await query(
+    `SELECT created_at FROM otp_requests WHERE phone = $1 ORDER BY created_at DESC LIMIT 1`,
+    [phone]
+  );
+  if (lastReq.length) {
+    const secondsSince = (Date.now() - new Date(lastReq[0].created_at).getTime()) / 1000;
+    if (secondsSince < OTP_COOLDOWN_SECONDS) {
+      throw new ApiError(429, `يرجى الانتظار ${Math.ceil(OTP_COOLDOWN_SECONDS - secondsSince)} ثانية قبل إعادة الإرسال`);
+    }
+  }
+  const { rows: hourRows } = await query(
+    `SELECT COUNT(*)::int AS c FROM otp_requests WHERE phone = $1 AND created_at > now() - interval '1 hour'`,
+    [phone]
+  );
+  if (hourRows[0].c >= OTP_MAX_PER_HOUR) {
+    throw new ApiError(429, "تجاوزت عدد محاولات طلب رمز التحقق لهذا الرقم، يرجى المحاولة بعد ساعة");
+  }
+  await query(`INSERT INTO otp_requests (phone, account_type) VALUES ($1,$2)`, [phone, accountType]);
+}
+
 const TABLES = {
   employee: { table: "employees", nameCol: "name",          activeClause: "AND is_active" },
   customer: { table: "customers", nameCol: "business_name", activeClause: "AND status = 'approved'" },
@@ -29,6 +56,10 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
   const cfg = TABLES[accountType];
   const normalized = normalizePhone(phone);
   const statusCol = accountType === "employee" ? "is_active" : "status";
+
+  // سقف حسب الرقم نفسه — قبل أي شي ثاني، عشان يحمي حتى لو المهاجم يجرب أرقام
+  // مو مسجّلة بالنظام
+  await checkOtpPhoneLimit(normalized, accountType);
 
   const { rows } = await query(
     `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status
