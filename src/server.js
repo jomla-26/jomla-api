@@ -20,7 +20,7 @@ import { supportRouter } from "./routes/support.js";
 import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
 import { bannerRouter } from "./routes/banners.js";
-import { dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport } from "./lib/notify.js";
+import { dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
 
@@ -96,11 +96,18 @@ const dailyReportTimer = setInterval(() => {
   maybeSendDailyProfitReport().catch((e) => console.error("[DailyReport]", e.message));
 }, 5 * 60 * 1000);
 
+// نفس الفكرة للتقرير الشهري: يفحص كل 5 دقايق، وما يبعث إلا في آخر يوم بالشهر
+// (~23:55 بتوقيت ليبيا)، مرة واحدة بس
+const monthlyReportTimer = setInterval(() => {
+  maybeSendMonthlyProfitReport().catch((e) => console.error("[MonthlyReport]", e.message));
+}, 5 * 60 * 1000);
+
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
     clearInterval(remindersTimer);
     clearInterval(dailyReportTimer);
+    clearInterval(monthlyReportTimer);
     server.close(() => pool.end().then(() => process.exit(0)));
   });
 }
