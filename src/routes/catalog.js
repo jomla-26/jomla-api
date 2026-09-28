@@ -146,7 +146,7 @@ catalogRouter.patch("/sections/:id", requirePermission("accounts.sections"), asy
 }));
 
 catalogRouter.get("/products", asyncRoute(async (req, res) => {
-  const { sectionId, supplierId, search } = req.query;
+  const { sectionId, supplierId, search, approvalStatus } = req.query;
 
   if (req.actor.type === "customer") {
     if (!sectionId) throw new ApiError(400, "يجب تحديد القسم");
@@ -160,6 +160,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
          JOIN sections psec ON psec.id = p.section_id
         WHERE p.section_id = $1
           AND p.is_active
+          AND p.approval_status = 'approved'
           AND s.status = 'approved'
           AND EXISTS (
                 SELECT 1 FROM supplier_sections ss
@@ -195,8 +196,9 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
         AND ($2::UUID IS NULL OR p.section_id  = $2)
         AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%'
              OR p.supplier_sku ILIKE '%' || $3 || '%')
+        AND ($4::TEXT IS NULL OR p.approval_status = $4)
       ORDER BY p.name`,
-    [ownerFilter, sectionId || null, search || null]
+    [ownerFilter, sectionId || null, search || null, approvalStatus || null]
   );
   res.json(rows);
 }));
@@ -221,15 +223,19 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
     ? req.actor.id
     : z.string().uuid().parse(req.body.supplierId);
 
+  // أصناف الموظف/الإدارة تُعتمد تلقائيًا؛ أصناف المورد الجديدة تُنتظر موافقة الإدارة قبل ما تظهر للعميل
+  const approvalStatus = req.actor.type === "employee" ? "approved" : "pending";
+
   const product = await withTransaction(async (client) => {
     const { rows } = await client.query(
       `INSERT INTO products
-         (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, supplier_sku, added_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+         (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, supplier_sku, added_by, approval_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [body.sectionId, supplierId, body.name, body.unit, body.basePrice,
        body.purchaseCost ?? null, body.stockQty, body.imageUrl ?? null,
        body.supplierSku || null,
-       req.actor.type === "employee" ? req.actor.id : null]
+       req.actor.type === "employee" ? req.actor.id : null,
+       approvalStatus]
     );
     if (body.stockQty > 0) {
       await client.query(
@@ -291,6 +297,36 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
     await writeAudit(client, {
       actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
       action: "product.updated", entityType: "product", entityId: req.params.id,
+      entityLabel: before.name, before, after: rows[0], ip: req.ip,
+    });
+    return rows[0];
+  });
+
+  res.json(updated);
+}));
+
+// موافقة الإدارة أو رفضها لصنف مضاف من مورد — قبل هذا القرار الصنف لا يظهر للعميل إطلاقًا
+catalogRouter.patch("/products/:id/approval", requirePermission("catalog.approve_products"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    status: z.enum(["approved", "rejected"]),
+    note: z.string().trim().max(300).optional(),
+  }).parse(req.body);
+
+  const updated = await withTransaction(async (client) => {
+    const existing = await client.query(`SELECT * FROM products WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!existing.rows.length) throw new ApiError(404, "الصنف غير موجود");
+    const before = existing.rows[0];
+
+    const { rows } = await client.query(
+      `UPDATE products SET approval_status = $2, approval_note = $3, approved_by = $4, approved_at = now()
+       WHERE id = $1 RETURNING *`,
+      [req.params.id, body.status, body.note || null, req.actor.id]
+    );
+
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: body.status === "approved" ? "product.approved" : "product.rejected",
+      entityType: "product", entityId: req.params.id,
       entityLabel: before.name, before, after: rows[0], ip: req.ip,
     });
     return rows[0];
