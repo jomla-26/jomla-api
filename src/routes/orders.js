@@ -1175,7 +1175,7 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       [part.id, paymentReceived]
     );
 
-    if (paymentReceived && part.payment_method === "pay_at_supplier") {
+    if (paymentReceived && ["pay_at_supplier", "cash"].includes(part.payment_method)) {
       await client.query(
         `UPDATE orders SET
             paid_amount = paid_amount + $2,
@@ -1515,6 +1515,26 @@ orderRouter.post("/admin/backfill-pay-at-supplier", requirePermission("orders.re
         RETURNING o.id`
     );
     return { updatedCount: rows.length };
+  });
+  res.json(result);
+}));
+
+// نقطة مؤقتة تُستدعى مرة واحدة: تصحح paid_amount/payment_status للطلبيات اللي
+// اتسلّمت واتقفلت بتحديث حالة يدوي من لوحة الإدارة (قبل إضافة منطق الدفع تلقائيًا)
+// وطريقة دفعها نقدًا عند الاستلام أو عند المورد، بس المبلغ المدفوع فيها فضل صفر
+orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `UPDATE orders o SET
+           paid_amount = o.grand_total,
+           payment_status = 'paid'
+         WHERE o.status = 'delivered'
+           AND o.fulfillment = 'pickup'
+           AND o.payment_method IN ('cash', 'pay_at_supplier')
+           AND o.paid_amount < o.grand_total
+         RETURNING o.id, o.order_number`
+    );
+    return { updatedCount: rows.length, orders: rows.map((r) => r.order_number) };
   });
   res.json(result);
 }));
