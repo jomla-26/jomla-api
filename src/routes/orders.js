@@ -51,6 +51,7 @@ const createSchema = z.object({
   items: z.array(z.object({
     productId: z.string().uuid(),
     qty: z.number().positive(),
+    variantId: z.string().uuid().optional(), // خيار الصنف (لون/مقاس/عبوة) لو الصنف عنده خيارات
   })).min(1),
 });
 
@@ -72,11 +73,27 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
       if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
+      let variantLabel = null;
+      let purchaseCost = p.purchase_cost;
+      if (item.variantId) {
+        const { rows: vRows } = await client.query(
+          `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+          [item.variantId, p.id]
+        );
+        if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        variantLabel = vRows[0].label;
+        purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+      }
+
       await assertCustomerSection(req.actor.id, p.section_id);
       const price = await resolvePrice(client, {
-        productId: p.id, customerId: req.actor.id, qty: item.qty,
+        productId: p.id, customerId: req.actor.id, qty: item.qty, variantId: item.variantId,
       });
-      enriched.push({ ...p, qty: item.qty, price });
+      enriched.push({
+        ...p, qty: item.qty, price, purchase_cost: purchaseCost,
+        variantId: item.variantId || null, variantLabel,
+        name: variantLabel ? `${p.name} — ${variantLabel}` : p.name,
+      });
     }
 
     const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
@@ -149,9 +166,10 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
         await client.query(
           `INSERT INTO order_items
              (order_id, order_supplier_id, product_id, product_name, unit,
-              unit_price, purchase_cost, qty_requested, line_total, supplier_sku)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null]
+              unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null,
+           i.variantId, i.variantLabel]
         );
       }
     }
@@ -203,11 +221,27 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
       if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
+      let variantLabel = null;
+      let purchaseCost = p.purchase_cost;
+      if (item.variantId) {
+        const { rows: vRows } = await client.query(
+          `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+          [item.variantId, p.id]
+        );
+        if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        variantLabel = vRows[0].label;
+        purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+      }
+
       await assertCustomerSection(body.customerId, p.section_id);
       const price = await resolvePrice(client, {
-        productId: p.id, customerId: body.customerId, qty: item.qty,
+        productId: p.id, customerId: body.customerId, qty: item.qty, variantId: item.variantId,
       });
-      enriched.push({ ...p, qty: item.qty, price });
+      enriched.push({
+        ...p, qty: item.qty, price, purchase_cost: purchaseCost,
+        variantId: item.variantId || null, variantLabel,
+        name: variantLabel ? `${p.name} — ${variantLabel}` : p.name,
+      });
     }
 
     const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
@@ -262,9 +296,10 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
         await client.query(
           `INSERT INTO order_items
              (order_id, order_supplier_id, product_id, product_name, unit,
-              unit_price, purchase_cost, qty_requested, line_total, supplier_sku)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null]
+              unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null,
+           i.variantId, i.variantLabel]
         );
       }
     }
@@ -404,9 +439,9 @@ orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(a
   }
 
   const { rows: pastItems } = await query(
-    `SELECT product_id, MAX(qty_requested) AS qty
+    `SELECT product_id, variant_id, MAX(qty_requested) AS qty
        FROM order_items WHERE order_id = $1
-      GROUP BY product_id`,
+      GROUP BY product_id, variant_id`,
     [req.params.id]
   );
 
@@ -424,12 +459,25 @@ orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(a
       unavailable.push(p[0]?.name ?? "صنف لم يعد متوفرًا");
       continue;
     }
+    let variant = null;
+    if (it.variant_id) {
+      const { rows: v } = await query(
+        `SELECT id, label, price FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+        [it.variant_id, it.product_id]
+      );
+      if (!v.length) { unavailable.push(`${p[0].name} (الخيار لم يعد متوفرًا)`); continue; }
+      variant = v[0];
+    }
     const price = await resolvePrice(pool, {
-      productId: p[0].id, customerId: req.actor.id, qty: it.qty,
+      productId: p[0].id, customerId: req.actor.id, qty: it.qty, variantId: it.variant_id,
     }).catch(() => null);
     if (price == null) { unavailable.push(p[0].name); continue; }
     const { supplier_status, ...product } = p[0];
-    items.push({ ...product, price, qty: Number(it.qty) });
+    items.push({
+      ...product, price, qty: Number(it.qty),
+      variantId: it.variant_id, variantLabel: variant?.label ?? null,
+      name: variant ? `${product.name} — ${variant.label}` : product.name,
+    });
   }
 
   res.json({ items, unavailable });
@@ -951,14 +999,21 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
       subtotal += item.unit_price * qty;
 
             if (qty > 0) {
+        if (item.variant_id) {
+          await client.query(
+            `UPDATE product_variants SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
+            [item.variant_id, qty]
+          );
+        } else {
+          await client.query(
+            `UPDATE products SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
+            [item.product_id, qty]
+          );
+        }
         await client.query(
-          `UPDATE products SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
-          [item.product_id, qty]
-        );
-        await client.query(
-          `INSERT INTO stock_movements (product_id, change_qty, reason, created_by)
-           VALUES ($1, $2, $3, $4)`,
-          [item.product_id, -qty, `بيع — طلب ${part.order_number}`, req.actor.id]
+          `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [item.product_id, item.variant_id || null, -qty, `بيع — طلب ${part.order_number}`, req.actor.id]
         );
       }
 
@@ -1478,6 +1533,7 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
   const body = z.object({
     productId: z.string().uuid(),
     qty: z.number().positive(),
+    variantId: z.string().uuid().optional(),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -1500,9 +1556,22 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
     if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
     if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
+    let variantLabel = null;
+    let purchaseCost = p.purchase_cost;
+    if (body.variantId) {
+      const { rows: vRows } = await client.query(
+        `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+        [body.variantId, p.id]
+      );
+      if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+      variantLabel = vRows[0].label;
+      purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+    }
+    const productName = variantLabel ? `${p.name} — ${variantLabel}` : p.name;
+
     await assertCustomerSection(order.customer_id, p.section_id);
     const price = await resolvePrice(client, {
-      productId: p.id, customerId: order.customer_id, qty: body.qty,
+      productId: p.id, customerId: order.customer_id, qty: body.qty, variantId: body.variantId,
     });
 
     const { rows: osRows } = await client.query(
@@ -1529,16 +1598,18 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
     const { rows: [item] } = await client.query(
       `INSERT INTO order_items
          (order_id, order_supplier_id, product_id, product_name, unit,
-          unit_price, purchase_cost, qty_requested, qty_confirmed, availability, line_total, supplier_sku)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'full',$9,$10) RETURNING *`,
-      [order.id, orderSupplierId, p.id, p.name, p.unit, price, p.purchase_cost, body.qty, lineTotal, p.supplier_sku ?? null]
+          unit_price, purchase_cost, qty_requested, qty_confirmed, availability, line_total, supplier_sku,
+          variant_id, variant_label)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'full',$9,$10,$11,$12) RETURNING *`,
+      [order.id, orderSupplierId, p.id, productName, p.unit, price, purchaseCost, body.qty, lineTotal, p.supplier_sku ?? null,
+       body.variantId || null, variantLabel]
     );
 
     await recalcOrderTotals(client, order.id);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
-      note: `تمت إضافة صنف: ${p.name} × ${body.qty} ${p.unit}`,
+      note: `تمت إضافة صنف: ${productName} × ${body.qty} ${p.unit}`,
     });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
