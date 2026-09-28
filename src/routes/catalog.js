@@ -9,30 +9,76 @@ export const catalogRouter = Router();
 catalogRouter.use(authenticate);
 
 catalogRouter.get("/sections", asyncRoute(async (req, res) => {
+  const { parentId } = req.query;
+
   if (req.actor.type === "customer") {
+    if (parentId) {
+      // تصنيفات فرعية تحت قسم رئيسي — تظهر تلقائيًا لو القسم الرئيسي مفعّل للعميل
+      const { rows } = await query(
+        `SELECT s.id, s.name, s.slug, s.image_url
+           FROM sections s
+           JOIN customer_sections cs ON cs.section_id = $2
+          WHERE s.parent_id = $2 AND s.is_active
+            AND cs.customer_id = $1 AND cs.enabled
+          ORDER BY s.sort_order`,
+        [req.actor.id, parentId]
+      );
+      return res.json(rows);
+    }
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug, s.image_url
+      `SELECT s.id, s.name, s.slug, s.image_url,
+              EXISTS(SELECT 1 FROM sections c WHERE c.parent_id = s.id AND c.is_active) AS has_subsections
          FROM customer_sections cs
          JOIN sections s ON s.id = cs.section_id
-        WHERE cs.customer_id = $1 AND cs.enabled AND s.is_active
+        WHERE cs.customer_id = $1 AND cs.enabled AND s.is_active AND s.parent_id IS NULL
         ORDER BY s.sort_order`,
       [req.actor.id]
     );
     return res.json(rows);
   }
   if (req.actor.type === "supplier") {
+    if (parentId) {
+      const { rows } = await query(
+        `SELECT s.id, s.name, s.slug, s.image_url, s.is_active
+           FROM sections s
+           JOIN supplier_sections ss ON ss.section_id = $2
+          WHERE s.parent_id = $2 AND ss.supplier_id = $1 AND ss.enabled
+          ORDER BY s.sort_order`,
+        [req.actor.id, parentId]
+      );
+      return res.json(rows);
+    }
     const { rows } = await query(
-      `SELECT s.id, s.name, s.slug, s.image_url, s.is_active
+      `SELECT s.id, s.name, s.slug, s.image_url, s.is_active,
+              EXISTS(SELECT 1 FROM sections c WHERE c.parent_id = s.id AND c.is_active) AS has_subsections
          FROM supplier_sections ss
          JOIN sections s ON s.id = ss.section_id
-        WHERE ss.supplier_id = $1 AND s.is_active
+        WHERE ss.supplier_id = $1 AND s.is_active AND s.parent_id IS NULL
         ORDER BY s.sort_order`,
       [req.actor.id]
     );
     return res.json(rows);
   }
+
+  // موظف/إدارة: بلا parentId تُرجع الأقسام الرئيسية فقط (بالإضافة لعلامة إذا عندها فروع)،
+  // ومع parentId تُرجع التصنيفات الفرعية لذلك القسم. flat=1 يرجع كل الأقسام (رئيسي+فرعي) للبحث والقوائم المنسدلة.
+  if (req.query.flat) {
+    const { rows } = await query(
+      `SELECT id, name, slug, image_url, is_active, parent_id FROM sections ORDER BY sort_order`
+    );
+    return res.json(rows);
+  }
+  if (parentId) {
+    const { rows } = await query(
+      `SELECT id, name, slug, image_url, is_active, parent_id FROM sections WHERE parent_id = $1 ORDER BY sort_order`,
+      [parentId]
+    );
+    return res.json(rows);
+  }
   const { rows } = await query(
-    `SELECT id, name, slug, image_url, is_active FROM sections ORDER BY sort_order`
+    `SELECT s.id, s.name, s.slug, s.image_url, s.is_active, s.parent_id,
+            EXISTS(SELECT 1 FROM sections c WHERE c.parent_id = s.id) AS has_subsections
+       FROM sections s WHERE s.parent_id IS NULL ORDER BY s.sort_order`
   );
   res.json(rows);
 }));
@@ -43,13 +89,19 @@ catalogRouter.post("/sections", requirePermission("accounts.sections"), asyncRou
     slug: z.string().min(2).regex(/^[a-z0-9-]+$/),
     sortOrder: z.number().int().optional(),
     imageUrl: z.string().url().optional(),
+    parentId: z.string().uuid().optional(),
   }).parse(req.body);
 
   const section = await withTransaction(async (client) => {
+    if (body.parentId) {
+      const parent = await client.query(`SELECT id, parent_id FROM sections WHERE id = $1`, [body.parentId]);
+      if (!parent.rows.length) throw new ApiError(404, "القسم الرئيسي غير موجود");
+      if (parent.rows[0].parent_id) throw new ApiError(400, "لا يمكن إضافة تصنيف فرعي تحت تصنيف فرعي آخر");
+    }
     const { rows } = await client.query(
-      `INSERT INTO sections (name, slug, sort_order, image_url, created_by)
-       VALUES ($1,$2,COALESCE($3, 0),$4,$5) RETURNING *`,
-      [body.name, body.slug, body.sortOrder, body.imageUrl ?? null, req.actor.id]
+      `INSERT INTO sections (name, slug, sort_order, image_url, created_by, parent_id)
+       VALUES ($1,$2,COALESCE($3, 0),$4,$5,$6) RETURNING *`,
+      [body.name, body.slug, body.sortOrder, body.imageUrl ?? null, req.actor.id, body.parentId ?? null]
     );
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -105,12 +157,15 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
               p.availability, s.business_name AS supplier_name, p.supplier_id
          FROM products p
          JOIN suppliers s ON s.id = p.supplier_id
+         JOIN sections psec ON psec.id = p.section_id
         WHERE p.section_id = $1
           AND p.is_active
           AND s.status = 'approved'
           AND EXISTS (
                 SELECT 1 FROM supplier_sections ss
-                 WHERE ss.supplier_id = p.supplier_id AND ss.section_id = p.section_id AND ss.enabled
+                 WHERE ss.supplier_id = p.supplier_id
+                   AND ss.section_id = COALESCE(psec.parent_id, p.section_id)
+                   AND ss.enabled
               )
           AND ($2::UUID IS NULL OR p.supplier_id = $2)
           AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%')
