@@ -240,7 +240,15 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
         WHERE e.id = $1`,
       [req.actor.id]
     );
-    return res.json({ actor: req.actor, permissions: rows.map((r) => r.code) });
+    // الصلاحيات الفردية (منح/سحب) تتفوق على صلاحيات الدور
+    const { rows: ovr } = await query(
+      `SELECT p.code, o.granted FROM employee_permission_overrides o
+         JOIN permissions p ON p.id = o.permission_id WHERE o.employee_id = $1`,
+      [req.actor.id]
+    );
+    const set = new Set(rows.map((r) => r.code));
+    for (const o of ovr) { if (o.granted) set.add(o.code); else set.delete(o.code); }
+    return res.json({ actor: req.actor, permissions: [...set] });
   }
 
   res.json({ actor: req.actor });
