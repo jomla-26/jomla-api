@@ -20,7 +20,7 @@ import { supportRouter } from "./routes/support.js";
 import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
 import { bannerRouter } from "./routes/banners.js";
-import { dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
+import { dispatchManagerVoucherAlerts, dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
 
@@ -93,6 +93,10 @@ const whatsappTimer = setInterval(() => {
   dispatchWhatsappQueue().catch((e) => console.error("[WhatsApp]", e.message));
 }, 30_000);
 
+const voucherAlertTimer = setInterval(() => {
+  dispatchManagerVoucherAlerts().catch((e) => console.error("[VoucherAlerts]", e.message));
+}, 30_000);
+
 const remindersTimer = setInterval(() => {
   runCreditDueReminders().catch((e) => console.error("[Reminders]", e.message));
 }, 6 * 60 * 60 * 1000);
@@ -111,6 +115,7 @@ const monthlyReportTimer = setInterval(() => {
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
+    clearInterval(voucherAlertTimer);
     clearInterval(remindersTimer);
     clearInterval(dailyReportTimer);
     clearInterval(monthlyReportTimer);
