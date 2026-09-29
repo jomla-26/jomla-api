@@ -71,7 +71,8 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
       const p = rows[0];
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+      // الصنف اللي له خيارات: التوفر يُحسب على مخزون الخيار نفسه مش على علامة الصنف
+      if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
       let variantLabel = null;
       let purchaseCost = p.purchase_cost;
@@ -215,7 +216,8 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
       if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
       const p = rows[0];
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+      // الصنف اللي له خيارات: التوفر يُحسب على مخزون الخيار نفسه مش على علامة الصنف
+      if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
       let variantLabel = null;
       let purchaseCost = p.purchase_cost;
@@ -462,7 +464,7 @@ orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(a
         WHERE p.id = $1 AND p.is_active`,
       [it.product_id]
     );
-    if (!p.length || p[0].supplier_status !== "approved" || p[0].availability === "out") {
+    if (!p.length || p[0].supplier_status !== "approved" || (p[0].availability === "out" && !it.variant_id)) {
       unavailable.push(p[0]?.name ?? "صنف لم يعد متوفرًا");
       continue;
     }
@@ -1647,7 +1649,7 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
     if (!prodRows.length) throw new ApiError(404, "الصنف غير موجود");
     const p = prodRows[0];
     if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-    if (p.availability === "out") throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+    if (p.availability === "out" && !body.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
     let variantLabel = null;
     let purchaseCost = p.purchase_cost;
