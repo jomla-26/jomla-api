@@ -63,6 +63,18 @@ catalogRouter.get("/sections", asyncRoute(async (req, res) => {
   // موظف/إدارة: بلا parentId تُرجع الأقسام الرئيسية فقط (بالإضافة لعلامة إذا عندها فروع)،
   // ومع parentId تُرجع التصنيفات الفرعية لذلك القسم. flat=1 يرجع كل الأقسام (رئيسي+فرعي) للبحث والقوائم المنسدلة.
   if (req.query.flat) {
+    if (req.query.supplierId) {
+      // أقسام المورد المخصصة له فقط (والفرعية تحتها)
+      const { rows } = await query(
+        `SELECT id, name, slug, image_url, is_active, parent_id FROM sections
+          WHERE is_active AND (
+            id IN (SELECT section_id FROM supplier_sections WHERE supplier_id = $1 AND enabled)
+            OR parent_id IN (SELECT section_id FROM supplier_sections WHERE supplier_id = $1 AND enabled))
+          ORDER BY sort_order`,
+        [req.query.supplierId]
+      );
+      return res.json(rows);
+    }
     const { rows } = await query(
       `SELECT id, name, slug, image_url, is_active, parent_id FROM sections ORDER BY sort_order`
     );
@@ -86,9 +98,9 @@ catalogRouter.get("/sections", asyncRoute(async (req, res) => {
 catalogRouter.post("/sections", requirePermission("accounts.sections"), asyncRoute(async (req, res) => {
   const body = z.object({
     name: z.string().min(2),
-    slug: z.string().min(2).regex(/^[a-z0-9-]+$/),
+    slug: z.string().optional(),
     sortOrder: z.number().int().optional(),
-    imageUrl: z.string().url().optional(),
+    imageUrl: z.string().url().optional().or(z.literal("").transform(() => undefined)),
     parentId: z.string().uuid().optional(),
   }).parse(req.body);
 
@@ -98,6 +110,13 @@ catalogRouter.post("/sections", requirePermission("accounts.sections"), asyncRou
       if (!parent.rows.length) throw new ApiError(404, "القسم الرئيسي غير موجود");
       if (parent.rows[0].parent_id) throw new ApiError(400, "لا يمكن إضافة تصنيف فرعي تحت تصنيف فرعي آخر");
     }
+    // المعرّف يتولّد تلقائيًا — ما نطلبوش من المستخدم
+    let slug = String(body.slug || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (slug.length < 2) slug = `section-${Math.random().toString(36).slice(2, 8)}`;
+    while ((await client.query(`SELECT 1 FROM sections WHERE slug = $1`, [slug])).rows.length) {
+      slug = `${slug}-${Math.random().toString(36).slice(2, 5)}`;
+    }
+    body.slug = slug;
     const { rows } = await client.query(
       `INSERT INTO sections (name, slug, sort_order, image_url, created_by, parent_id)
        VALUES ($1,$2,COALESCE($3, 0),$4,$5,$6) RETURNING *`,
@@ -339,7 +358,7 @@ catalogRouter.delete("/products/:id", asyncRoute(async (req, res, next) => {
     if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك حذف صنف لا يخصك");
     return next();
   }
-  return requirePermission("catalog.manage")(req, res, next);
+  return requirePermission("catalog.delete")(req, res, next);
 }), asyncRoute(async (req, res) => {
   const used = await query(`SELECT 1 FROM order_items WHERE product_id = $1 LIMIT 1`, [req.params.id]);
   if (used.rows.length) {
@@ -385,6 +404,21 @@ const variantSchema = z.object({
   sortOrder: z.number().int().optional(),
 });
 
+// مخزون الصنف يتقسّم على خياراته: مجموع مخزون الخيارات ما يتعداش مخزون الصنف المتوفر
+async function assertVariantPool(client, productId, excludeVariantId, newQty) {
+  const { rows: [p] } = await client.query(`SELECT stock_qty FROM products WHERE id = $1 FOR UPDATE`, [productId]);
+  const { rows: [o] } = await client.query(
+    `SELECT COALESCE(SUM(stock_qty),0) AS s FROM product_variants
+      WHERE product_id = $1 AND is_active AND ($2::uuid IS NULL OR id <> $2)`,
+    [productId, excludeVariantId]
+  );
+  const total = Number(o.s) + Number(newQty);
+  if (total > Number(p.stock_qty)) {
+    const left = Math.max(0, Number(p.stock_qty) - Number(o.s));
+    throw new ApiError(400, `مجموع كميات الخيارات (${total}) أكبر من مخزون الصنف المتوفر (${p.stock_qty}). المتاح للخيار: ${left}`);
+  }
+}
+
 async function assertCanManageProduct(req, res, next) {
   const { rows } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
   if (!rows.length) throw new ApiError(404, "الصنف غير موجود");
@@ -399,6 +433,7 @@ catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct),
   const body = variantSchema.parse(req.body);
 
   const variant = await withTransaction(async (client) => {
+    await assertVariantPool(client, req.params.id, null, body.stockQty);
     const { rows } = await client.query(
       `INSERT INTO product_variants
          (product_id, label, price, purchase_cost, stock_qty, sku, image_url, sort_order, created_by)
@@ -451,6 +486,10 @@ catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant),
   const updated = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الخيار غير موجود");
+    if (body.stockQty !== undefined || body.isActive === true) {
+      await assertVariantPool(client, before.rows[0].product_id, req.params.id,
+        body.stockQty ?? before.rows[0].stock_qty);
+    }
 
     const { rows } = await client.query(
       `UPDATE product_variants SET
