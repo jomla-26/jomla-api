@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
-import { ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
+import { restoreOrderStock, ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 
@@ -579,6 +579,7 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
     if (order.payment_method !== "transfer") throw new ApiError(400, "الطلبية ليست بطريقة الحوالة المصرفية");
+    if (["cancelled", "closed"].includes(order.status)) throw new ApiError(409, "الطلبية ملغاة أو مغلقة");
 
     const remaining = Number(order.grand_total) - Number(order.paid_amount);
     // الزيادة عن قيمة الفاتورة تُسجَّل بالكامل في الإيصال (تظهر كرصيد للعميل بكشف حسابه)،
@@ -651,6 +652,7 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
           WHERE order_id = $1 AND status NOT IN ('picked_up','closed','cancelled')`,
         [order.id]
       );
+      await restoreOrderStock(client, order.id, req.actor.id);
     }
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -684,6 +686,14 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
 
     // لو الإدارة حطّت حالة الطلبية "تم التسليم"/"مغلقة" يدويًا (بدون المرور بمسار المندوب)،
     // لازم نقفل فواتير الموردين المرتبطة بالطلبية بنفس الوقت، وإلا تفضل ظاهرة "مفتوحة" عند المورد
+    if (status === "cancelled") {
+      await client.query(
+        `UPDATE order_suppliers SET status = 'cancelled'
+          WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
+        [order.id]
+      );
+      await restoreOrderStock(client, order.id, req.actor.id);
+    }
     if (status === "delivered" || status === "closed") {
       await client.query(
         `UPDATE order_suppliers SET status = 'closed'
@@ -868,7 +878,7 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
     const updated = [];
     const skipped = [];
 
-    for (const orderId of orderIds) {
+    for (const orderId of [...new Set(orderIds)].sort()) {
       const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
       if (!rows.length) { skipped.push({ orderId, reason: "غير موجودة" }); continue; }
       const order = rows[0];
@@ -922,6 +932,14 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
           [orderId]
         );
       }
+      if (status === "cancelled") {
+        await client.query(
+          `UPDATE order_suppliers SET status = 'cancelled'
+            WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
+          [orderId]
+        );
+        await restoreOrderStock(client, orderId, req.actor.id);
+      }
       // نفس منطق /:id/status — تسليم/إغلاق جماعي من لوحة الإدارة لازم يقفل فواتير الموردين معاه
       if (status === "delivered" || status === "closed") {
         await client.query(
@@ -966,6 +984,11 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
+    // قفل الطلبية أولًا (ترتيب موحّد للأقفال: الطلبية ثم جزء المورد) لمنع التعارض والـdeadlock
+    await client.query(
+      `SELECT 1 FROM orders WHERE id = (SELECT order_id FROM order_suppliers WHERE id = $1) FOR UPDATE`,
+      [req.params.osId]
+    );
     const { rows } = await client.query(
       `SELECT os.*, o.order_number, o.customer_id
          FROM order_suppliers os JOIN orders o ON o.id = os.order_id
@@ -977,6 +1000,17 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
 
     if (part.status !== "sent") {
       throw new ApiError(400, "تم تسجيل توفر هذا الجزء من قبل");
+    }
+    {
+      const { rows: [ost] } = await client.query(`SELECT status FROM orders WHERE id = $1`, [part.order_id]);
+      if (["cancelled", "closed", "delivered"].includes(ost?.status)) {
+        throw new ApiError(409, "الطلبية ملغاة أو منتهية ولا يمكن تسجيل التوفر عليها");
+      }
+      const seen = new Set();
+      for (const it of body.items) {
+        if (seen.has(it.orderItemId)) throw new ApiError(400, "صنف مكرر في الطلب");
+        seen.add(it.orderItemId);
+      }
     }
 
     let hasShortage = false;
@@ -992,7 +1026,7 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
 
       const qty = it.availability === "full" ? item.qty_requested
                 : it.availability === "out"  ? 0
-                : it.qtyConfirmed;
+                : Math.min(it.qtyConfirmed, item.qty_requested);
 
       await client.query(
         `UPDATE order_items
@@ -1004,15 +1038,17 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
 
             if (qty > 0) {
         if (item.variant_id) {
-          await client.query(
-            `UPDATE product_variants SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
+          const r = await client.query(
+            `UPDATE product_variants SET stock_qty = stock_qty - $2 WHERE id = $1 AND stock_qty >= $2`,
             [item.variant_id, qty]
           );
+          if (!r.rowCount) throw new ApiError(409, "الكمية المؤكدة أكبر من المخزون المسجّل لأحد الأصناف — حدّث المخزون أولًا");
         } else {
-          await client.query(
-            `UPDATE products SET stock_qty = GREATEST(stock_qty - $2, 0) WHERE id = $1`,
+          const r = await client.query(
+            `UPDATE products SET stock_qty = stock_qty - $2 WHERE id = $1 AND stock_qty >= $2`,
             [item.product_id, qty]
           );
+          if (!r.rowCount) throw new ApiError(409, "الكمية المؤكدة أكبر من المخزون المسجّل لأحد الأصناف — حدّث المخزون أولًا");
         }
         await client.query(
           `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
@@ -1161,6 +1197,9 @@ orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver")
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
     if (order.fulfillment !== "delivery") throw new ApiError(400, "الطلبية للاستلام الشخصي");
+    if (["delivered", "cancelled", "closed", "out_for_delivery", "draft", "under_review", "postponed"].includes(order.status)) {
+      throw new ApiError(409, "حالة الطلبية الحالية لا تسمح بإسنادها لمندوب");
+    }
 
     const cod = order.payment_method === "deferred"
       ? Number(order.deposit_due_at_delivery || 0)
@@ -1250,7 +1289,7 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET status = 'delivered', delivered_at = now(),
               cod_collected = $2,
-              paid_amount = paid_amount + CASE WHEN $2 THEN cod_amount ELSE 0 END,
+              paid_amount = paid_amount + CASE WHEN $2 THEN LEAST(cod_amount, GREATEST(grand_total - paid_amount, 0)) ELSE 0 END,
               payment_status = CASE
                 WHEN $2 AND paid_amount + cod_amount >= grand_total THEN 'paid'
                 WHEN $2 THEN 'partially_paid' ELSE payment_status END
@@ -1278,8 +1317,8 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
           `INSERT INTO vouchers
              (voucher_number, voucher_type, party_type, party_id, party_name,
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by)
-           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',$7,now(),$8,$7)`,
+              note, created_by, off_treasury)
+           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',$7,now(),$8,$7,true)`,
           [vNumber, order.customer_id, custRows[0]?.business_name ?? "عميل", order.cod_amount,
            tr[0].id, order.id, req.actor.id,
            `تحصيل نقدي عند التسليم — حصّلها المندوب ${req.actor.name} لطلبية ${order.order_number}`]
@@ -1323,6 +1362,11 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
   const { paymentReceived } = z.object({ paymentReceived: z.boolean() }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
+    // قفل الطلبية أولًا (ترتيب موحّد للأقفال: الطلبية ثم جزء المورد) لمنع التعارض والـdeadlock
+    await client.query(
+      `SELECT 1 FROM orders WHERE id = (SELECT order_id FROM order_suppliers WHERE id = $1) FOR UPDATE`,
+      [req.params.osId]
+    );
     const { rows } = await client.query(
       `SELECT os.*, o.order_number, o.payment_method, o.customer_id
          FROM order_suppliers os JOIN orders o ON o.id = os.order_id
@@ -1372,8 +1416,8 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
           `INSERT INTO vouchers
              (voucher_number, voucher_type, party_type, party_id, party_name,
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by)
-           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+              note, created_by, off_treasury)
+           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
           [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", part.subtotal,
            tr[0].id, part.order_id, `دفع نقدًا عند الاستلام — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
         );
@@ -1391,8 +1435,8 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
           `INSERT INTO vouchers
              (voucher_number, voucher_type, party_type, party_id, party_name,
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by)
-           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+              note, created_by, off_treasury)
+           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
           [vNumber2, req.actor.id, req.actor.name, part.subtotal, trPay[0].id, part.order_id,
            `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${part.order_number}`]
         );
@@ -1441,6 +1485,11 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
 // عشان الأدمن يسند مندوب) أو "جاهزة للاستلام" (لو استلام شخصي، بانتظار حضور العميل)
 orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const result = await withTransaction(async (client) => {
+    // قفل الطلبية أولًا (ترتيب موحّد للأقفال: الطلبية ثم جزء المورد) لمنع التعارض والـdeadlock
+    await client.query(
+      `SELECT 1 FROM orders WHERE id = (SELECT order_id FROM order_suppliers WHERE id = $1) FOR UPDATE`,
+      [req.params.osId]
+    );
     const { rows } = await client.query(
       `SELECT os.*, o.order_number, o.fulfillment, o.status AS order_status
          FROM order_suppliers os JOIN orders o ON o.id = os.order_id
@@ -1817,8 +1866,8 @@ orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review
           `INSERT INTO vouchers
              (voucher_number, voucher_type, party_type, party_id, party_name,
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by)
-           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+              note, created_by, off_treasury)
+           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
           [vNumber, m.customer_id, m.customer_name, m.subtotal, tr[0].id, m.order_id,
            `دفع نقدًا عند الاستلام — استلمها المورد ${m.supplier_name} لطلبية ${m.order_number} (تصحيح رصيد)`]
         );
@@ -1832,8 +1881,8 @@ orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review
           `INSERT INTO vouchers
              (voucher_number, voucher_type, party_type, party_id, party_name,
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by)
-           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+              note, created_by, off_treasury)
+           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
           [vNumber2, m.supplier_id, m.supplier_name, m.subtotal, trPay[0].id, m.order_id,
            `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${m.order_number} (تصحيح رصيد)`]
         );
@@ -1864,8 +1913,8 @@ orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review
         `INSERT INTO vouchers
            (voucher_number, voucher_type, party_type, party_id, party_name,
             amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-            note, created_by)
-         VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL)`,
+            note, created_by, off_treasury)
+         VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
         [vNumber, m.customer_id, m.customer_name, m.cod_amount, tr[0].id, m.order_id,
          `تحصيل نقدي عند التسليم — حصّلها المندوب ${m.driver_name ?? "غير معروف"} لطلبية ${m.order_number} (تصحيح رصيد)`]
       );
