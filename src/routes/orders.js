@@ -63,7 +63,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
     for (const item of body.items) {
       const { rows } = await client.query(
         `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
-                p.availability, s.status AS supplier_status
+                p.availability, p.stock_qty, s.status AS supplier_status
            FROM products p JOIN suppliers s ON s.id = p.supplier_id
           WHERE p.id = $1 AND p.is_active`,
         [item.productId]
@@ -77,15 +77,23 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       let purchaseCost = p.purchase_cost;
       if (item.variantId) {
         const { rows: vRows } = await client.query(
-          `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+          `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
           [item.variantId, p.id]
         );
         if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
+        if (Number(item.qty) > Number(vRows[0].stock_qty)) {
+          throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
+        }
         variantLabel = vRows[0].label;
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
       } else {
         const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
         if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
+        if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+        if (Number(item.qty) > Number(p.stock_qty)) {
+          throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
+        }
       }
 
       await assertCustomerSection(req.actor.id, p.section_id);
@@ -199,7 +207,7 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
     for (const item of body.items) {
       const { rows } = await client.query(
         `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
-                p.availability, s.status AS supplier_status
+                p.availability, p.stock_qty, s.status AS supplier_status
            FROM products p JOIN suppliers s ON s.id = p.supplier_id
           WHERE p.id = $1 AND p.is_active`,
         [item.productId]
@@ -213,15 +221,23 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
       let purchaseCost = p.purchase_cost;
       if (item.variantId) {
         const { rows: vRows } = await client.query(
-          `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+          `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
           [item.variantId, p.id]
         );
         if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
+        if (Number(item.qty) > Number(vRows[0].stock_qty)) {
+          throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
+        }
         variantLabel = vRows[0].label;
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
       } else {
         const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
         if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
+        if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
+        if (Number(item.qty) > Number(p.stock_qty)) {
+          throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
+        }
       }
 
       await assertCustomerSection(body.customerId, p.section_id);
