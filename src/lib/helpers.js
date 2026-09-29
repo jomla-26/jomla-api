@@ -147,3 +147,27 @@ export async function calcDeliveryFee(client, { zoneId, vehicleTypeId, vehiclesC
 
   return Number(fee.toFixed(2));
 }
+
+// إرجاع مخزون طلبية ملغاة: يحسب صافي ما خُصم فعليًا (بيع − إرجاع سابق) لكل صنف ويرجّعه — آمن للتكرار
+export async function restoreOrderStock(client, orderId, actorId) {
+  const { rows: [o] } = await client.query(`SELECT order_number FROM orders WHERE id = $1`, [orderId]);
+  if (!o) return;
+  const sale = `بيع — طلب ${o.order_number}`;
+  const back = `إرجاع — إلغاء طلب ${o.order_number}`;
+  const { rows } = await client.query(
+    `SELECT product_id, variant_id, SUM(change_qty) AS net
+       FROM stock_movements WHERE reason = ANY($1)
+        AND product_id IN (SELECT product_id FROM order_items oi JOIN order_suppliers os ON os.id = oi.order_supplier_id WHERE os.order_id = $2)
+      GROUP BY product_id, variant_id HAVING SUM(change_qty) < 0`,
+    [[sale, back], orderId]
+  );
+  for (const r of rows) {
+    const qty = -Number(r.net);
+    if (r.variant_id) await client.query(`UPDATE product_variants SET stock_qty = stock_qty + $2 WHERE id = $1`, [r.variant_id, qty]);
+    else await client.query(`UPDATE products SET stock_qty = stock_qty + $2 WHERE id = $1`, [r.product_id, qty]);
+    await client.query(
+      `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by) VALUES ($1,$2,$3,$4,$5)`,
+      [r.product_id, r.variant_id || null, qty, back, actorId || null]
+    );
+  }
+}
