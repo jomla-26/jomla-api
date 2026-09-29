@@ -110,21 +110,6 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       supplierRates.map((s) => [s.id, s.business_name])
     );
 
-    // الحد الأدنى لطلب كل مورد لوحده داخل السلة — الواجهة تمنع العميل يوصل هنا أصلاً
-    // (تعرضله المبلغ الناقص وهو يبني السلة)، وهذا التحقق شبكة أمان احتياطية بس
-    const MIN_SUPPLIER_ORDER = 1000;
-    for (const supplierId of supplierIds) {
-      const supplierSubtotal = enriched
-        .filter((i) => i.supplier_id === supplierId)
-        .reduce((s, i) => s + i.price * i.qty, 0);
-      if (supplierSubtotal < MIN_SUPPLIER_ORDER) {
-        throw new ApiError(
-          400,
-          `الحد الأدنى للطلب من "${supplierNameMap[supplierId] ?? "المورد"}" هو ${MIN_SUPPLIER_ORDER} د.ل — طلبك من هذا المورد حاليًا ${supplierSubtotal.toFixed(2)} د.ل`
-        );
-      }
-    }
-
     const deliveryFee = body.fulfillment === "delivery"
       ? await calcDeliveryFee(client, {
           zoneId: body.deliveryZoneId,
