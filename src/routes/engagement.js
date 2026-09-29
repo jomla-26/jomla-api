@@ -349,7 +349,7 @@ const { rows: [voucher] } = await client.query(
 `INSERT INTO vouchers
 (voucher_number, voucher_type, party_type, party_id, party_name,
 amount, method, treasury_id, order_id, approval_status, approved_by, approved_at, note, created_by)
-VALUES ($1,'payment','customer',$2,$3,$4,'cash',$5,$6,'approved',$7,now(),$8,$7)
+VALUES ($1,'payment','customer',$2,$3,$4,'cash',$5,$6,'approved',$8,now(),$7,$8)
 RETURNING *`,
 [voucherNumber, before.rows[0].customer_id, custRows[0]?.business_name || "", refundAmount,
 tr[0].id, before.rows[0].order_id, `استرجاع نقدي - ${before.rows[0].return_number}`, req.actor.id]
