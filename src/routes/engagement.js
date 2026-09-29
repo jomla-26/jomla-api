@@ -267,9 +267,16 @@ engagementRouter.post("/returns", asyncRoute(async (req, res) => {
 
     for (const item of body.items) {
       const oi = await client.query(
-        `SELECT unit_price FROM order_items WHERE id = $1 AND order_id = $2`, [item.orderItemId, body.orderId]
+        `SELECT unit_price, COALESCE(qty_confirmed, qty_requested) AS qty_ok FROM order_items WHERE id = $1 AND order_id = $2`, [item.orderItemId, body.orderId]
       );
       if (!oi.rows.length) throw new ApiError(400, "صنف غير موجود في هذه الطلبية");
+      const prev = await client.query(
+        `SELECT COALESCE(SUM(ri.qty),0) AS q FROM return_items ri JOIN returns r ON r.id = ri.return_id
+          WHERE ri.order_item_id = $1 AND r.status <> 'rejected'`, [item.orderItemId]
+      );
+      if (Number(prev.rows[0].q) + Number(item.qty) > Number(oi.rows[0].qty_ok)) {
+        throw new ApiError(400, "كمية الإرجاع أكبر من الكمية المسلّمة (بعد خصم المرتجعات السابقة)");
+      }
       await client.query(
         `INSERT INTO return_items (return_id, order_item_id, qty, unit_price, line_total)
          VALUES ($1,$2,$3,$4,$5)`,
@@ -313,6 +320,9 @@ engagementRouter.patch("/returns/:id/status", requirePermission("orders.review")
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM returns WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "طلب الإرجاع غير موجود");
+    if (["refunded", "rejected"].includes(before.rows[0].status)) {
+      throw new ApiError(409, "طلب الإرجاع مُغلق ولا يمكن تغيير حالته");
+    }
 
     let refundAmount = before.rows[0].refund_amount;
     let refundVoucherId = before.rows[0].refund_voucher_id;
