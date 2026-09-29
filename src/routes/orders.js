@@ -522,8 +522,22 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
     if (order.status !== "under_review") throw new ApiError(400, "الطلبية ليست قيد المراجعة");
 
     if (order.payment_method === "deferred") {
-      const cust = await client.query(`SELECT credit_enabled FROM customers WHERE id = $1`, [order.customer_id]);
+      // قفل على مستوى العميل: عشان اعتمادين متزامنين ما يتجاوزوا السقف مع بعض
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`credit:${order.customer_id}`]);
+      const cust = await client.query(`SELECT credit_enabled, credit_limit FROM customers WHERE id = $1`, [order.customer_id]);
       if (!cust.rows[0]?.credit_enabled) throw new ApiError(400, "البيع الآجل غير مفعّل لهذا العميل");
+      // سقف الآجل (0 = بدون سقف): الرصيد الحالي + قيمة هذي الطلبية ما يتعداش السقف
+      const limit = Number(cust.rows[0].credit_limit ?? 0);
+      if (limit > 0) {
+        const { rows: [bal] } = await client.query(
+          `SELECT COALESCE(SUM(debit),0)::numeric - COALESCE(SUM(credit),0)::numeric AS balance
+             FROM v_customer_ledger WHERE customer_id = $1`, [order.customer_id]
+        );
+        const after = Number(bal.balance) + Number(order.grand_total);
+        if (after > limit + 0.005) {
+          throw new ApiError(400, `تجاوز سقف الآجل: الرصيد الحالي ${Number(bal.balance).toFixed(2)} + الطلبية ${Number(order.grand_total).toFixed(2)} أكبر من السقف ${limit.toFixed(2)} د.ل`);
+        }
+      }
     }
 
     const { rows: [updated] } = await client.query(
