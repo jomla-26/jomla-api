@@ -150,10 +150,12 @@ export async function dispatchWhatsappQueue() {
 
 // رسالة مباشرة لرقم المدير المسؤول (WHATSAPP_MANAGER_PHONE) — مالهاش علاقة بجدول
 // الإشعارات، تُستخدم لإشعارات الإدارة الداخلية (إيصالات، تقرير يومي)
+// الرقم الافتراضي للمدير المسؤول لو ما اتضبطش WHATSAPP_MANAGER_PHONE في Railway
+const MANAGER_PHONE = process.env.WHATSAPP_MANAGER_PHONE || "0913363363";
+
 export async function notifyManager(message) {
-  if (!process.env.WHATSAPP_MANAGER_PHONE) return;
   try {
-    await sendWhatsapp(process.env.WHATSAPP_MANAGER_PHONE, message);
+    await sendWhatsapp(MANAGER_PHONE, message);
   } catch (err) {
     console.error("[إشعار المدير]", err.message);
   }
@@ -162,7 +164,7 @@ export async function notifyManager(message) {
 // أرقام مستلمي التقرير اليومي: المدير (من متغير البيئة) + الشريك (رقمه ثابت بالطلب)،
 // نتفادى التكرار لو صار نفس الرقم في الاثنين
 const DAILY_REPORT_PHONES = [...new Set([
-  process.env.WHATSAPP_MANAGER_PHONE,
+  MANAGER_PHONE,
   "0910911991", // شريك الشركة
 ].filter(Boolean))];
 
@@ -441,4 +443,43 @@ export async function notifyStaffWithPermission(client, {
       orderId, sectionId, vars,
     });
   }
+}
+
+
+// فاحص مركزي لكل سند جديد معتمد (قبض/دفع) مهما كان مصدره — يدوي من شاشة السندات، أو
+// تلقائي (تحصيل عند التسليم، استلام شخصي، تأكيد حوالة، تسوية مندوب، دفع مورد...) —
+// ويبعث تنبيه واتساب واحد للمدير، ثم يعلّم السند إنه انبعت (manager_notified).
+export async function dispatchManagerVoucherAlerts() {
+  const { rows } = await query(
+    `SELECT v.id, v.voucher_number, v.voucher_type, v.party_type, v.party_name, v.amount, v.method,
+            v.off_treasury, v.note, t.name AS treasury_name, o.order_number
+       FROM vouchers v
+       JOIN treasuries t ON t.id = v.treasury_id
+       LEFT JOIN orders o ON o.id = v.order_id
+      WHERE NOT v.manager_notified AND v.approval_status = 'approved'
+      ORDER BY v.created_at
+      LIMIT 20`
+  );
+  const partyLabel = { customer: "عميل", supplier: "مورد", driver: "مندوب", employee: "موظف", other: "طرف آخر" };
+  const methodLabel = { cash: "نقدًا", transfer: "حوالة", card: "بطاقة" };
+  for (const v of rows) {
+    const isReceipt = v.voucher_type === "receipt";
+    const msg =
+      `${isReceipt ? "📥 إيصال قبض" : "📤 إيصال دفع"} ${v.voucher_number}\n` +
+      `${partyLabel[v.party_type] || ""}: ${v.party_name}\n` +
+      `المبلغ: ${Number(v.amount).toFixed(2)} د.ل (${methodLabel[v.method] || v.method})\n` +
+      (v.order_number ? `الطلبية: ${v.order_number}\n` : "") +
+      (v.off_treasury ? "الحركة: نقدًا خارج الخزينة (مباشرة مع المندوب/المورد)" : `الخزينة: ${v.treasury_name}`) +
+      (v.note ? `\nملاحظة: ${v.note}` : "");
+    // يوصل للمدير وللشريك سوية. لو الواتساب مقطوع (ما وصلش لأي رقم) ما نعلّمش السند كمُرسل،
+    // فيعيد المحاولة في الدورة الجاية بدل ما تضيع الرسالة.
+    let sentTo = 0;
+    for (const phone of DAILY_REPORT_PHONES) {
+      try { await sendWhatsapp(phone, msg); sentTo++; }
+      catch (err) { console.error("[إيصال]", phone, err.message); }
+    }
+    if (sentTo > 0) await query(`UPDATE vouchers SET manager_notified = TRUE WHERE id = $1`, [v.id]);
+    else break;
+  }
+  return rows.length;
 }
