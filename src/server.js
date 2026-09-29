@@ -70,6 +70,12 @@ app.use((err, _req, res, _next) => {
   if (err?.code === "23505") {
     return res.status(409).json({ error: "هذا السجل موجود مسبقًا" });
   }
+  if (["22P02", "22007", "22003", "23514"].includes(err?.code)) {
+    return res.status(400).json({ error: "قيمة غير صالحة في البيانات المرسلة" });
+  }
+  if (["40P01", "40001"].includes(err?.code)) {
+    return res.status(409).json({ error: "العملية تعارضت مع عملية أخرى، أعد المحاولة" });
+  }
   if (err?.code === "23503") {
     return res.status(400).json({ error: "مرجع غير صالح في البيانات المرسلة" });
   }
