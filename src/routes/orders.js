@@ -696,6 +696,17 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET status = $2 WHERE id = $1 RETURNING *`, [order.id, status]
     );
+
+    // لو الإدارة حطّت حالة الطلبية "تم التسليم"/"مغلقة" يدويًا (بدون المرور بمسار المندوب)،
+    // لازم نقفل فواتير الموردين المرتبطة بالطلبية بنفس الوقت، وإلا تفضل ظاهرة "مفتوحة" عند المورد
+    if (status === "delivered" || status === "closed") {
+      await client.query(
+        `UPDATE order_suppliers SET status = 'closed'
+          WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
+        [order.id]
+      );
+    }
+
     await recordStatus(client, { orderId: order.id, from: order.status, to: status, actor: req.actor, note });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -923,6 +934,14 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
       if (!["under_review", "draft"].includes(status)) {
         await client.query(
           `UPDATE order_suppliers SET status = 'sent' WHERE order_id = $1 AND status = 'pending'`,
+          [orderId]
+        );
+      }
+      // نفس منطق /:id/status — تسليم/إغلاق جماعي من لوحة الإدارة لازم يقفل فواتير الموردين معاه
+      if (status === "delivered" || status === "closed") {
+        await client.query(
+          `UPDATE order_suppliers SET status = 'closed'
+            WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
           [orderId]
         );
       }
