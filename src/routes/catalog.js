@@ -1033,7 +1033,7 @@ catalogRouter.get("/stock-movements", requirePermission("reports.view"), asyncRo
 catalogRouter.get("/products/:id/movement", requirePermission("reports.view"), asyncRoute(async (req, res) => {
   const info = await query(
     `SELECT p.id, p.name, p.unit, p.added_at, p.stock_qty, p.supplier_sku, s.business_name AS supplier_name,
-            sec.name AS section_name
+            sec.name AS section_name, p.image_url, p.base_price, p.section_id, p.supplier_id, p.is_active
        FROM products p
        JOIN suppliers s  ON s.id = p.supplier_id
        JOIN sections sec ON sec.id = p.section_id
