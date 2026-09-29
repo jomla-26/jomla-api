@@ -240,7 +240,7 @@ const returnSchema = z.object({
   })).min(1),
 });
 
-engagementRouter.post("/returns", asyncRoute(async (req, res) => {
+engagementRouter.post("/returns", requirePermission("orders.returns"), asyncRoute(async (req, res) => {
   const body = returnSchema.parse(req.body);
   const isCustomer = req.actor.type === "customer";
   const isEmployee = req.actor.type === "employee";
@@ -295,7 +295,7 @@ engagementRouter.post("/returns", asyncRoute(async (req, res) => {
   res.status(201).json(ret);
 }));
 
-engagementRouter.get("/returns", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+engagementRouter.get("/returns", requirePermission("orders.returns"), asyncRoute(async (req, res) => {
   const { status } = req.query;
   const { rows } = await query(
     `SELECT r.*, o.order_number, c.business_name AS customer_name, s.business_name AS supplier_name,
@@ -311,7 +311,7 @@ engagementRouter.get("/returns", requirePermission("orders.review"), asyncRoute(
   res.json(rows);
 }));
 
-engagementRouter.patch("/returns/:id/status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+engagementRouter.patch("/returns/:id/status", requirePermission("orders.returns"), asyncRoute(async (req, res) => {
   const body = z.object({
     status: z.enum(["approved", "rejected", "received", "refunded"]),
     refundMethod: z.enum(["cash", "credit_note", "replacement"]).optional(),
