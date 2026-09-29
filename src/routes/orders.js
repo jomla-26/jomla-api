@@ -857,6 +857,9 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_ov
     if (order.fulfillment !== "delivery") {
       throw new ApiError(400, "هذي طلبية استلام شخصي، لا رسوم توصيل عليها");
     }
+    if (["delivered", "closed", "cancelled"].includes(order.status)) {
+      throw new ApiError(400, "ما تقدرش تعدل رسوم التوصيل بعد تسليم الطلبية أو إلغائها");
+    }
 
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET delivery_fee = $2, grand_total = items_subtotal + $2 WHERE id = $1 RETURNING *`,
@@ -865,7 +868,8 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_ov
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
-      note: note || `تعديل رسوم التوصيل يدويًا إلى ${deliveryFee} د.ل`,
+      note: `تعديل رسوم التوصيل يدويًا من ${Number(order.delivery_fee).toFixed(2)} د.ل إلى ${Number(deliveryFee).toFixed(2)} د.ل` +
+            (note ? ` — ${note}` : ""),
     });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
