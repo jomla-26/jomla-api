@@ -83,6 +83,9 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
         if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
         variantLabel = vRows[0].label;
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+      } else {
+        const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
+        if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
       }
 
       await assertCustomerSection(req.actor.id, p.section_id);
@@ -216,6 +219,9 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
         if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
         variantLabel = vRows[0].label;
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+      } else {
+        const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
+        if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
       }
 
       await assertCustomerSection(body.customerId, p.section_id);
@@ -1619,6 +1625,9 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
       if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
       variantLabel = vRows[0].label;
       purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
+    } else {
+      const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
+      if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
     }
     const productName = variantLabel ? `${p.name} — ${variantLabel}` : p.name;
 
