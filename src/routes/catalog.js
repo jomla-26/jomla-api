@@ -268,7 +268,12 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
   res.status(201).json(product);
 }));
 
-catalogRouter.patch("/products/:id", asyncRoute(async (req, res) => {
+catalogRouter.patch("/products/:id", asyncRoute(async (req, res, next) => {
+  if (req.actor.type !== "supplier") {
+    await new Promise((resolve, reject) => {
+      requirePermission("catalog.manage")(req, res, (e) => (e ? reject(e) : resolve()));
+    });
+  }
   const body = z.object({
     name: z.string().min(2).optional(),
     sectionId: z.string().uuid().optional(),
@@ -863,9 +868,10 @@ catalogRouter.post("/products/import/confirm-new", asyncRoute(async (req, res, n
     for (const row of inputRows) {
       const { rows } = await client.query(
         `INSERT INTO products
-           (section_id, supplier_id, name, unit, base_price, stock_qty, supplier_sku)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [row.sectionId, supplierId, row.name, row.unit, row.basePrice, row.stockQty, row.supplierSku]
+           (section_id, supplier_id, name, unit, base_price, stock_qty, supplier_sku, approval_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [row.sectionId, supplierId, row.name, row.unit, row.basePrice, row.stockQty, row.supplierSku,
+         req.actor.type === "employee" ? "approved" : "pending"]
       );
       const product = rows[0];
       if (row.stockQty > 0) {
@@ -968,6 +974,7 @@ catalogRouter.post("/stock-vouchers", asyncRoute(async (req, res, next) => {
 catalogRouter.get("/stock-vouchers", asyncRoute(async (req, res) => {
   const { voucherType, supplierId } = req.query;
   const ownerFilter = req.actor.type === "supplier" ? req.actor.id : (supplierId || null);
+  if (!["supplier", "employee"].includes(req.actor.type)) throw new ApiError(403, "غير مصرّح");
 
   if (req.actor.type === "employee") {
     await new Promise((resolve, reject) => {
@@ -999,6 +1006,7 @@ catalogRouter.get("/stock-vouchers/:id", asyncRoute(async (req, res) => {
   );
   if (!vRows.length) throw new ApiError(404, "الفاتورة غير موجودة");
   const voucher = vRows[0];
+  if (!["supplier", "employee"].includes(req.actor.type)) throw new ApiError(403, "غير مصرّح");
   if (req.actor.type === "supplier" && voucher.supplier_id !== req.actor.id) {
     throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الفاتورة");
   }
