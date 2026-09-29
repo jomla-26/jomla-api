@@ -112,6 +112,9 @@ const monthlyReportTimer = setInterval(() => {
   maybeSendMonthlyProfitReport().catch((e) => console.error("[MonthlyReport]", e.message));
 }, 5 * 60 * 1000);
 
+// ما نخليش خطأ غير متوقع يوقّع السيرفر كله — نسجّله ونكمل
+process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
+process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
