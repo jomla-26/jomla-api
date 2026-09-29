@@ -188,6 +188,8 @@ financeRouter.post("/transfers", requirePermission("finance.transfers"), asyncRo
     );
     const map = Object.fromEntries(tr.map((t) => [t.code, t.id]));
 
+    // قفل الخزينة المحوَّل منها لمنع سحبين متزامنين يسبّبوا رصيد سالب
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ["treasury:" + body.fromCode]);
     const { rows: bal } = await client.query(
       `SELECT balance FROM v_treasury_balances WHERE code = $1`, [body.fromCode]
     );
@@ -273,8 +275,8 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
     }
     await client.query(
       `UPDATE orders SET cod_settled = TRUE
-        WHERE driver_id = $1 AND cod_collected AND NOT cod_settled`,
-      [req.params.id]
+        WHERE id = ANY($1::uuid[])`,
+      [pending.map((o) => o.id)]
     );
 
     await writeAudit(client, {
@@ -523,8 +525,8 @@ financeRouter.post("/drivers/:id/pay-supplier", requireActorType("employee"), as
     const { rows: [voucher] } = await client.query(
       `INSERT INTO vouchers
          (voucher_number, voucher_type, party_type, party_id, party_name,
-          amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by, paid_by_driver_id)
-       VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6,$8)
+          amount, method, treasury_id, approval_status, approved_by, approved_at, note, created_by, paid_by_driver_id, off_treasury)
+       VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6,$8,true)
        RETURNING *`,
       [vNumber, body.supplierId, sup[0].business_name, body.amount, tr[0].id,
        req.actor.id, body.note || `دفعها المندوب ${req.actor.name} من عهدته`, req.actor.id]
