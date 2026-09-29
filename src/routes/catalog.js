@@ -218,12 +218,24 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
 
   const ownerFilter = req.actor.type === "supplier" ? req.actor.id : supplierId || null;
   const { rows } = await query(
-    `SELECT p.*, s.business_name AS supplier_name, sec.name AS section_name
+    `SELECT p.*, s.business_name AS supplier_name, sec.name AS section_name,
+            COALESCE(pv.variants, '[]'::json) AS variants,
+            COALESCE(pv.total, p.stock_qty) AS stock_qty,
+            p.stock_qty AS unallocated_qty
        FROM products p
        JOIN suppliers s  ON s.id = p.supplier_id
        JOIN sections sec ON sec.id = p.section_id
+       LEFT JOIN LATERAL (
+             SELECT json_agg(json_build_object(
+                      'id', v.id, 'label', v.label, 'price', v.price,
+                      'stockQty', v.stock_qty, 'imageUrl', v.image_url
+                    ) ORDER BY v.sort_order, v.created_at) AS variants,
+                    SUM(v.stock_qty) AS total
+               FROM product_variants v
+              WHERE v.product_id = p.id AND v.is_active
+           ) pv ON true
       WHERE ($1::UUID IS NULL OR p.supplier_id = $1)
-        AND ($2::UUID IS NULL OR p.section_id  = $2)
+        AND ($2::UUID IS NULL OR p.section_id = $2 OR sec.parent_id = $2)
         AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%'
              OR p.supplier_sku ILIKE '%' || $3 || '%'
              OR s.business_name ILIKE '%' || $3 || '%')
@@ -405,18 +417,15 @@ const variantSchema = z.object({
 });
 
 // مخزون الصنف يتقسّم على خياراته: مجموع مخزون الخيارات ما يتعداش مخزون الصنف المتوفر
-async function assertVariantPool(client, productId, excludeVariantId, newQty) {
+async function takeFromPool(client, productId, delta) {
+  // مخزون الصنف يتقسّم على خياراته: كمية الخيار تُخصم من رصيد الصنف غير الموزّع
+  // (delta موجب = يسحب من الرصيد، سالب = يرجّع له)
+  if (!delta) return;
   const { rows: [p] } = await client.query(`SELECT stock_qty FROM products WHERE id = $1 FOR UPDATE`, [productId]);
-  const { rows: [o] } = await client.query(
-    `SELECT COALESCE(SUM(stock_qty),0) AS s FROM product_variants
-      WHERE product_id = $1 AND is_active AND ($2::uuid IS NULL OR id <> $2)`,
-    [productId, excludeVariantId]
-  );
-  const total = Number(o.s) + Number(newQty);
-  if (total > Number(p.stock_qty)) {
-    const left = Math.max(0, Number(p.stock_qty) - Number(o.s));
-    throw new ApiError(400, `مجموع كميات الخيارات (${total}) أكبر من مخزون الصنف المتوفر (${p.stock_qty}). المتاح للخيار: ${left}`);
+  if (delta > 0 && Number(p.stock_qty) < delta) {
+    throw new ApiError(400, `الكمية أكبر من المتوفر غير الموزّع على الخيارات (${p.stock_qty}). المتاح: ${p.stock_qty}`);
   }
+  await client.query(`UPDATE products SET stock_qty = stock_qty - $2 WHERE id = $1`, [productId, delta]);
 }
 
 async function assertCanManageProduct(req, res, next) {
@@ -433,7 +442,7 @@ catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct),
   const body = variantSchema.parse(req.body);
 
   const variant = await withTransaction(async (client) => {
-    await assertVariantPool(client, req.params.id, null, body.stockQty);
+    await takeFromPool(client, req.params.id, body.stockQty);
     const { rows } = await client.query(
       `INSERT INTO product_variants
          (product_id, label, price, purchase_cost, stock_qty, sku, image_url, sort_order, created_by)
@@ -486,9 +495,12 @@ catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant),
   const updated = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الخيار غير موجود");
-    if (body.stockQty !== undefined || body.isActive === true) {
-      await assertVariantPool(client, before.rows[0].product_id, req.params.id,
-        body.stockQty ?? before.rows[0].stock_qty);
+    {
+      const old = before.rows[0];
+      const oldEff = old.is_active ? Number(old.stock_qty) : 0;
+      const newActive = body.isActive ?? old.is_active;
+      const newEff = newActive ? Number(body.stockQty ?? old.stock_qty) : 0;
+      await takeFromPool(client, old.product_id, newEff - oldEff);
     }
 
     const { rows } = await client.query(
@@ -520,10 +532,20 @@ catalogRouter.delete("/product-variants/:id", asyncRoute(assertCanManageVariant)
   const used = await query(`SELECT 1 FROM order_items WHERE variant_id = $1 LIMIT 1`, [req.params.id]);
   if (used.rows.length) {
     // ما نحذفش خيار له تاريخ طلبات فعلي — نوقّفه بس عشان الفواتير القديمة تفضل صحيحة
-    await query(`UPDATE product_variants SET is_active = FALSE WHERE id = $1`, [req.params.id]);
+    await withTransaction(async (client) => {
+      const { rows: [v] } = await client.query(`SELECT product_id, stock_qty, is_active FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
+      if (v?.is_active) await takeFromPool(client, v.product_id, -Number(v.stock_qty));
+      await client.query(`UPDATE product_variants SET is_active = FALSE WHERE id = $1`, [req.params.id]);
+    });
     return res.json({ deactivated: true });
   }
-  await query(`DELETE FROM product_variants WHERE id = $1`, [req.params.id]);
+  await withTransaction(async (client) => {
+    const { rows: [v] } = await client.query(`SELECT product_id, stock_qty, is_active FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (v) {
+      if (v.is_active) await takeFromPool(client, v.product_id, -Number(v.stock_qty));
+      await client.query(`DELETE FROM product_variants WHERE id = $1`, [req.params.id]);
+    }
+  });
   res.status(204).send();
 }));
 
@@ -610,11 +632,11 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
 
   const totals = await query(
     `SELECT COUNT(*)::INT AS products_count,
-            COALESCE(SUM(stock_qty), 0)::INT AS total_units,
-            COALESCE(SUM(stock_qty * base_price), 0) AS stock_value,
-            COUNT(*) FILTER (WHERE stock_qty = 0)::INT AS out_of_stock_count,
-            COUNT(*) FILTER (WHERE stock_qty > 0 AND stock_qty < 10)::INT AS low_stock_count
-       FROM products p
+            COALESCE(SUM(eff), 0)::INT AS total_units,
+            COALESCE(SUM(eff * base_price), 0) AS stock_value,
+            COUNT(*) FILTER (WHERE eff = 0)::INT AS out_of_stock_count,
+            COUNT(*) FILTER (WHERE eff > 0 AND eff < 10)::INT AS low_stock_count
+       FROM (SELECT p.*, COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty) AS eff FROM products p) p
       WHERE p.is_active
         AND ($1::UUID IS NULL OR p.supplier_id = $1)
         AND ($2::UUID IS NULL OR p.section_id  = $2)`,
@@ -624,8 +646,8 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
   const bySupplier = await query(
     `SELECT s.id AS supplier_id, s.business_name AS supplier_name,
             COUNT(p.*)::INT AS products_count,
-            COALESCE(SUM(p.stock_qty), 0)::INT AS total_units,
-            COALESCE(SUM(p.stock_qty * p.base_price), 0) AS stock_value
+            COALESCE(SUM(COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty)), 0)::INT AS total_units,
+            COALESCE(SUM(COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty) * p.base_price), 0) AS stock_value
        FROM products p
        JOIN suppliers s ON s.id = p.supplier_id
       WHERE p.is_active
@@ -637,15 +659,15 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
   );
 
   const lowStockItems = await query(
-    `SELECT p.id, p.name, p.unit, p.stock_qty, p.supplier_sku,
+    `SELECT p.id, p.name, p.unit, COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty) AS stock_qty, p.supplier_sku,
             s.business_name AS supplier_name, sec.name AS section_name
        FROM products p
        JOIN suppliers s  ON s.id  = p.supplier_id
        JOIN sections sec ON sec.id = p.section_id
-      WHERE p.is_active AND p.stock_qty < 10
+      WHERE p.is_active AND COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty) < 10
         AND ($1::UUID IS NULL OR p.supplier_id = $1)
         AND ($2::UUID IS NULL OR p.section_id  = $2)
-      ORDER BY p.stock_qty ASC
+      ORDER BY 4 ASC
       LIMIT 100`,
     [supplierId || null, sectionId || null]
   );
@@ -653,7 +675,7 @@ catalogRouter.get("/inventory-report", requirePermission("reports.view"), asyncR
   // أصناف راكدة: مافيهاش أي حركة مخزون (إضافة/خصم) آخر 30 يوم — تشمل مافيهاش
   // حركة أبدًا منذ إضافتها. تفيد لمعرفة الأصناف اللي ما تتحرّكش عشان مراجعتها
   const staleItems = await query(
-    `SELECT p.id, p.name, p.unit, p.stock_qty, p.supplier_sku,
+    `SELECT p.id, p.name, p.unit, COALESCE((SELECT SUM(v.stock_qty) FROM product_variants v WHERE v.product_id = p.id AND v.is_active), p.stock_qty) AS stock_qty, p.supplier_sku,
             s.business_name AS supplier_name, sec.name AS section_name,
             lm.last_movement_at
        FROM products p
