@@ -104,6 +104,7 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
     } else {
       supplierId = req.body.supplierId;
       if (!supplierId) return next(new ApiError(400, "يجب تحديد المورد"));
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(supplierId)) return next(new ApiError(400, "معرّف المورد غير صالح"));
       try {
         await new Promise((resolve, reject) => {
           requirePermission("catalog.manage")(req, res, (e) => (e ? reject(e) : resolve()));
