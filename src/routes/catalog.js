@@ -796,7 +796,9 @@ catalogRouter.get("/products/:id/stock-movements", asyncRoute(async (req, res, n
   }
 
   const { rows } = await query(
-    `SELECT * FROM stock_movements WHERE product_id = $1 ORDER BY created_at DESC`,
+    `SELECT sm.*, v.label AS variant_label FROM stock_movements sm
+       LEFT JOIN product_variants v ON v.id = sm.variant_id
+      WHERE sm.product_id = $1 ORDER BY sm.created_at DESC`,
     [req.params.id]
   );
   res.json(rows);
