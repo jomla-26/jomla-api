@@ -173,7 +173,12 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
 
     const { rows } = await query(
       `SELECT p.id, p.name, p.unit, p.image_url, p.base_price, p.stock_qty,
-              p.availability, s.business_name AS supplier_name, p.supplier_id,
+              CASE WHEN p.availability = 'suspended' THEN 'suspended'
+                   WHEN pv.total IS NULL THEN p.availability
+                   WHEN pv.total <= 0 THEN 'out'
+                   WHEN pv.total < 10 THEN 'low'
+                   ELSE 'available' END AS availability,
+              s.business_name AS supplier_name, p.supplier_id,
               COALESCE(pv.variants, '[]'::json) AS variants
          FROM products p
          JOIN suppliers s ON s.id = p.supplier_id
@@ -182,7 +187,8 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
                SELECT json_agg(json_build_object(
                         'id', v.id, 'label', v.label, 'price', v.price,
                         'stockQty', v.stock_qty, 'imageUrl', v.image_url
-                      ) ORDER BY v.sort_order, v.created_at) AS variants
+                      ) ORDER BY v.sort_order, v.created_at) AS variants,
+                      SUM(v.stock_qty) AS total
                  FROM product_variants v
                 WHERE v.product_id = p.id AND v.is_active
              ) pv ON true
@@ -219,6 +225,11 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
   const ownerFilter = req.actor.type === "supplier" ? req.actor.id : supplierId || null;
   const { rows } = await query(
     `SELECT p.*, s.business_name AS supplier_name, sec.name AS section_name,
+            CASE WHEN p.availability = 'suspended' THEN 'suspended'
+                 WHEN pv.total IS NULL THEN p.availability
+                 WHEN pv.total <= 0 THEN 'out'
+                 WHEN pv.total < 10 THEN 'low'
+                 ELSE 'available' END AS availability,
             COALESCE(pv.variants, '[]'::json) AS variants,
             COALESCE(pv.total, p.stock_qty) AS stock_qty,
             p.stock_qty AS unallocated_qty
