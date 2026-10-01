@@ -186,7 +186,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
                  FROM product_variants v
                 WHERE v.product_id = p.id AND v.is_active
              ) pv ON true
-        WHERE p.section_id = $1
+        WHERE (p.section_id = $1 OR psec.parent_id = $1)
           AND p.is_active
           AND p.approval_status = 'approved'
           AND s.status = 'approved'
