@@ -250,11 +250,20 @@ const productSchema = z.object({
   sectionId: z.string().uuid(),
   name: z.string().min(2),
   unit: z.string().min(1),
-  basePrice: z.number().positive(),
+  basePrice: z.number().positive().optional(),
   purchaseCost: z.number().nonnegative().optional(),
   stockQty: z.number().nonnegative().default(0),
   imageUrl: z.string().url().optional(),
   supplierSku: z.string().trim().max(100).optional(),
+  // خيارات (ألوان/مقاسات) تُضاف مع الصنف مباشرة في نفس الطلب
+  variants: z.array(z.object({
+    label: z.string().trim().min(1).max(150),
+    price: z.number().positive(),
+    purchaseCost: z.number().nonnegative().optional(),
+    stockQty: z.number().nonnegative().default(0),
+    sku: z.string().trim().max(100).optional(),
+    imageUrl: z.string().url().optional(),
+  })).max(60).optional(),
 });
 
 catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
@@ -262,6 +271,14 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
   return requirePermission("catalog.manage")(req, res, next);
 }), asyncRoute(async (req, res) => {
   const body = productSchema.parse(req.body);
+  const variantsIn = body.variants ?? [];
+  if (!variantsIn.length && !body.basePrice) throw new ApiError(400, "السعر مطلوب");
+  if (new Set(variantsIn.map((v) => v.label)).size !== variantsIn.length) {
+    throw new ApiError(400, "في خيارين بنفس الاسم — غيّر أحدهما");
+  }
+  // صنف بخيارات: سعر الصنف الأساسي = أقل سعر خيار، ومخزونه = مجموع كميات الخيارات (موزّع عليها كاملًا)
+  const basePrice = variantsIn.length ? Math.min(...variantsIn.map((v) => v.price)) : body.basePrice;
+  const stockQty = variantsIn.length ? 0 : body.stockQty;
   const supplierId = req.actor.type === "supplier"
     ? req.actor.id
     : z.string().uuid().parse(req.body.supplierId);
@@ -274,18 +291,33 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
       `INSERT INTO products
          (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, supplier_sku, added_by, approval_status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [body.sectionId, supplierId, body.name, body.unit, body.basePrice,
-       body.purchaseCost ?? null, body.stockQty, body.imageUrl ?? null,
+      [body.sectionId, supplierId, body.name, body.unit, basePrice,
+       body.purchaseCost ?? null, stockQty, body.imageUrl ?? null,
        body.supplierSku || null,
        req.actor.type === "employee" ? req.actor.id : null,
        approvalStatus]
     );
-    if (body.stockQty > 0) {
+    if (stockQty > 0) {
       await client.query(
         `INSERT INTO stock_movements (product_id, change_qty, reason, created_by)
          VALUES ($1,$2,'رصيد افتتاحي — صنف جديد',$3)`,
-        [rows[0].id, body.stockQty, req.actor.id]
+        [rows[0].id, stockQty, req.actor.id]
       );
+    }
+    for (const [i, v] of variantsIn.entries()) {
+      const { rows: vr } = await client.query(
+        `INSERT INTO product_variants
+           (product_id, label, price, purchase_cost, stock_qty, sku, image_url, sort_order, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [rows[0].id, v.label, v.price, v.purchaseCost ?? null, v.stockQty, v.sku || null, v.imageUrl || null, i, req.actor.id]
+      );
+      if (v.stockQty > 0) {
+        await client.query(
+          `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
+           VALUES ($1,$2,$3,'رصيد افتتاحي — خيار جديد',$4)`,
+          [rows[0].id, vr[0].id, v.stockQty, req.actor.id]
+        );
+      }
     }
     await writeAudit(client, {
       actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
