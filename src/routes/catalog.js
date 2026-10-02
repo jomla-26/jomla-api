@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, resolvePrice, nextDocNumber } from "../lib/helpers.js";
-import { authenticate, requirePermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
+import { authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
 import { notifyFavoriteRestock } from "../lib/notify.js";
 
 export const catalogRouter = Router();
@@ -833,6 +833,88 @@ catalogRouter.post("/products/:id/stock-movements", asyncRoute(async (req, res, 
   res.status(201).json(result);
 }));
 
+// سجل الصنف الموحّد للإدارة: حركات المخزون + كل التعديلات (سعر/اسم/كمية/كود/قسم...) بقيمتها قبل وبعد واسم من عدّل
+const HISTORY_FIELDS = {
+  name: "الاسم", base_price: "السعر", price: "السعر", stock_qty: "الكمية", supplier_sku: "كود الصنف",
+  sku: "كود الخيار", label: "اسم الخيار", section_id: "القسم", is_active: "الحالة", image_url: "الصورة",
+  purchase_cost: "سعر التكلفة", unit: "وحدة البيع",
+};
+catalogRouter.get("/products/:id/history", requireAnyPermission("catalog.manage", "reports.view"), asyncRoute(async (req, res) => {
+  const { rows: prod } = await query(`SELECT id, name FROM products WHERE id = $1`, [req.params.id]);
+  if (!prod.length) throw new ApiError(404, "الصنف غير موجود");
+
+  const { rows: moves } = await query(
+    `SELECT sm.id, sm.change_qty, sm.reason, sm.created_at, v.label AS variant_label,
+            COALESCE((SELECT name FROM employees WHERE id = sm.created_by),
+                     (SELECT business_name FROM suppliers WHERE id = sm.created_by), '—') AS actor_name
+       FROM stock_movements sm
+       LEFT JOIN product_variants v ON v.id = sm.variant_id
+      WHERE sm.product_id = $1`,
+    [req.params.id]
+  );
+
+  const { rows: audits } = await query(
+    `SELECT id, action, actor_name, before_data, after_data, entity_label, created_at
+       FROM audit_log
+      WHERE (entity_type = 'product' AND entity_id = $1
+             AND action IN ('product.created','product.updated','product.deleted'))
+         OR (entity_type = 'product_variant'
+             AND (before_data->>'product_id' = $1::text OR after_data->>'product_id' = $1::text))`,
+    [req.params.id]
+  );
+
+  const { rows: secs } = await query(`SELECT id, name FROM sections`);
+  const secName = Object.fromEntries(secs.map((x) => [x.id, x.name]));
+  const show = (field, v) => {
+    if (v === null || v === undefined || v === "") return "—";
+    if (field === "section_id") return secName[v] || v;
+    if (field === "is_active") return v ? "مفعّل" : "موقوف";
+    if (field === "image_url") return "صورة";
+    return String(v);
+  };
+
+  const items = moves.map((m) => ({
+    id: `m-${m.id}`, kind: "stock", at: m.created_at, actor_name: m.actor_name,
+    title: "حركة مخزون", variant_label: m.variant_label, qty_change: Number(m.change_qty), reason: m.reason, changes: [],
+  }));
+
+  for (const a of audits) {
+    const before = a.before_data || {};
+    const after = a.after_data || {};
+    const variantLabel = a.action.startsWith("product_variant") ? (after.label || before.label || a.entity_label) : null;
+    if (a.action === "product.created") {
+      items.push({ id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name, title: "إضافة الصنف", changes: [] });
+      continue;
+    }
+    if (a.action === "product.deleted") {
+      items.push({ id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name, title: "حذف الصنف", changes: [] });
+      continue;
+    }
+    if (a.action === "product_variant.created") {
+      items.push({ id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name, title: "إضافة خيار", variant_label: variantLabel,
+        changes: [{ label: "السعر", from: "—", to: show("price", after.price) }, { label: "الكمية", from: "—", to: show("stock_qty", after.stock_qty) }] });
+      continue;
+    }
+    const changes = [];
+    for (const field of Object.keys(HISTORY_FIELDS)) {
+      if (!(field in before) && !(field in after)) continue;
+      const b = before[field], c = after[field];
+      if (String(b ?? "") === String(c ?? "")) continue;
+      // رقم بنفس القيمة بصيغ مختلفة (600 مقابل 600.00) ما نعتبره تعديل
+      if (b !== null && c !== null && !isNaN(Number(b)) && !isNaN(Number(c)) && Number(b) === Number(c)) continue;
+      changes.push({ label: HISTORY_FIELDS[field], from: show(field, b), to: show(field, c) });
+    }
+    if (!changes.length) continue;
+    items.push({
+      id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name,
+      title: variantLabel ? "تعديل خيار" : "تعديل الصنف", variant_label: variantLabel, changes,
+    });
+  }
+
+  items.sort((x, y) => new Date(y.at) - new Date(x.at));
+  res.json({ product: prod[0], items });
+}));
+
 // سجل حركة المخزون الكامل لصنف واحد
 catalogRouter.get("/products/:id/stock-movements", asyncRoute(async (req, res, next) => {
   if (req.actor.type === "supplier") return next();
@@ -923,6 +1005,13 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
             WHERE id = $1 RETURNING *`,
           [variant.id, row.stockQty, row.basePrice]
         );
+        if (Number(variant.stock_qty) !== Number(savedV.stock_qty) || Number(variant.price) !== Number(savedV.price)) {
+          await writeAudit(client, {
+            actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+            action: "product_variant.updated", entityType: "product_variant", entityId: variant.id,
+            entityLabel: `${variant.product_name} — ${variant.label}`, before: variant, after: savedV, ip: req.ip,
+          });
+        }
         updated.push({ ...savedV, name: `${variant.product_name} — ${variant.label}` });
         continue;
       }
@@ -964,6 +1053,13 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
           `UPDATE products SET stock_qty = $2, base_price = $3 WHERE id = $1 RETURNING *`,
           [product.id, newQty, row.basePrice]
         );
+        if (Number(product.stock_qty) !== Number(saved.stock_qty) || Number(product.base_price) !== Number(saved.base_price)) {
+          await writeAudit(client, {
+            actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+            action: "product.updated", entityType: "product", entityId: product.id,
+            entityLabel: product.name, before: product, after: saved, ip: req.ip,
+          });
+        }
         updated.push(saved);
 
         if (Number(product.stock_qty) === 0 && newQty > 0) {
