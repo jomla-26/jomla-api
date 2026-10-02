@@ -119,10 +119,21 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
       const code = file.originalname.replace(/\.[^.]+$/, "").trim();
       if (!code) { unmatched.push({ file: file.originalname, reason: "اسم ملف غير صالح" }); continue; }
 
-      const { rows } = await query(
+      // الكود قد يكون كود صنف أو كود خيار (لون/مقاس)
+      let { rows } = await query(
         `SELECT id, name FROM products WHERE supplier_id = $1 AND supplier_sku = $2`,
         [supplierId, code]
       );
+      let variantId = null;
+      if (!rows.length) {
+        const { rows: vr } = await query(
+          `SELECT v.id AS variant_id, p.id, p.name || ' - ' || v.label AS name
+             FROM product_variants v JOIN products p ON p.id = v.product_id
+            WHERE p.supplier_id = $1 AND v.sku = $2 LIMIT 1`,
+          [supplierId, code]
+        );
+        if (vr.length) { rows = vr; variantId = vr[0].variant_id; }
+      }
       if (!rows.length) {
         unmatched.push({ file: file.originalname, reason: "لا يوجد صنف بهذا الكود" });
         continue;
@@ -148,7 +159,12 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
         if (error) throw error;
         const { data } = supabase.storage.from(BUCKET).getPublicUrl(filename);
 
-        await query(`UPDATE products SET image_url = $2 WHERE id = $1`, [rows[0].id, data.publicUrl]);
+        if (variantId) {
+          await query(`UPDATE product_variants SET image_url = $2 WHERE id = $1`, [variantId, data.publicUrl]);
+          await query(`UPDATE products SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [rows[0].id, data.publicUrl]);
+        } else {
+          await query(`UPDATE products SET image_url = $2 WHERE id = $1`, [rows[0].id, data.publicUrl]);
+        }
         matched.push({ file: file.originalname, productId: rows[0].id, productName: rows[0].name, url: data.publicUrl });
       } catch (e) {
         console.error("[BULK_UPLOAD]", e);
