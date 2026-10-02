@@ -239,7 +239,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
        LEFT JOIN LATERAL (
              SELECT json_agg(json_build_object(
                       'id', v.id, 'label', v.label, 'price', v.price,
-                      'stockQty', v.stock_qty, 'imageUrl', v.image_url
+                      'stockQty', v.stock_qty, 'imageUrl', v.image_url, 'sku', v.sku
                     ) ORDER BY v.sort_order, v.created_at) AS variants,
                     SUM(v.stock_qty) AS total
                FROM product_variants v
@@ -303,7 +303,7 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
          (section_id, supplier_id, name, unit, base_price, purchase_cost, stock_qty, image_url, supplier_sku, added_by, approval_status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [body.sectionId, supplierId, body.name, body.unit, basePrice,
-       body.purchaseCost ?? null, stockQty, body.imageUrl ?? null,
+       body.purchaseCost ?? null, stockQty, body.imageUrl ?? variantsIn.find((v) => v.imageUrl)?.imageUrl ?? null,
        body.supplierSku || null,
        req.actor.type === "employee" ? req.actor.id : null,
        approvalStatus]
@@ -493,6 +493,9 @@ catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct),
       [req.params.id, body.label, body.price, body.purchaseCost ?? null, body.stockQty,
        body.sku || null, body.imageUrl || null, body.sortOrder, req.actor.id]
     );
+    if (body.imageUrl) {
+      await client.query(`UPDATE products SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [req.params.id, body.imageUrl]);
+    }
     if (body.stockQty > 0) {
       await client.query(
         `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
@@ -559,6 +562,9 @@ catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant),
       [req.params.id, body.label ?? null, body.price ?? null, body.purchaseCost ?? null,
        body.stockQty ?? null, body.sku ?? null, body.imageUrl ?? null, body.isActive ?? null]
     );
+    if (body.imageUrl) {
+      await client.query(`UPDATE products SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [rows[0].product_id, body.imageUrl]);
+    }
 
     await writeAudit(client, {
       actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
@@ -877,6 +883,50 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
         continue;
       }
 
+      // الكود قد يكون كود خيار (لون/مقاس) — نطابقه أولًا مع خيارات أصناف هذا المورد
+      const { rows: vMatch } = await client.query(
+        `SELECT v.*, p.name AS product_name FROM product_variants v
+           JOIN products p ON p.id = v.product_id
+          WHERE p.supplier_id = $1 AND v.sku = $2 AND v.is_active = true LIMIT 1`,
+        [supplierId, row.supplierSku]
+      );
+      if (vMatch.length) {
+        const variant = vMatch[0];
+        // الإكسل يحدّد الكمية والسعر الجديدين (مو يضيف عليهم): الفرق = الكمية الجديدة − الحالية
+        const delta = row.stockQty - Number(variant.stock_qty);
+        if (delta !== 0) {
+          let voucherId = null;
+          if (delta > 0) {
+            if (!voucher) {
+              const number = await nextDocNumber(client, {
+                table: "stock_vouchers", column: "voucher_number", prefix: "ADD", start: 1000,
+              });
+              const { rows: [v] } = await client.query(
+                `INSERT INTO stock_vouchers
+                   (voucher_number, voucher_type, supplier_id, reason, created_by, created_by_type, created_by_name)
+                 VALUES ($1,'addition',$2,'استيراد إكسل',$3,$4,$5) RETURNING *`,
+                [number, supplierId, req.actor.id, req.actor.type, req.actor.name]
+              );
+              voucher = v;
+            }
+            voucherId = voucher.id;
+          }
+          await client.query(
+            `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by, voucher_id)
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [variant.product_id, variant.id, delta,
+             delta > 0 ? "استيراد إكسل — زيادة كمية خيار" : "استيراد إكسل — تخفيض كمية خيار", req.actor.id, voucherId]
+          );
+        }
+        const { rows: [savedV] } = await client.query(
+          `UPDATE product_variants SET stock_qty = $2, price = CASE WHEN $3 > 0 THEN $3 ELSE price END
+            WHERE id = $1 RETURNING *`,
+          [variant.id, row.stockQty, row.basePrice]
+        );
+        updated.push({ ...savedV, name: `${variant.product_name} — ${variant.label}` });
+        continue;
+      }
+
       const { rows: existing } = await client.query(
         `SELECT * FROM products WHERE supplier_id = $1 AND supplier_sku = $2`,
         [supplierId, row.supplierSku]
@@ -884,24 +934,32 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
 
       if (existing.length) {
         const product = existing[0];
-        if (!voucher) {
-          const number = await nextDocNumber(client, {
-            table: "stock_vouchers", column: "voucher_number", prefix: "ADD", start: 1000,
-          });
-          const { rows: [v] } = await client.query(
-            `INSERT INTO stock_vouchers
-               (voucher_number, voucher_type, supplier_id, reason, created_by, created_by_type, created_by_name)
-             VALUES ($1,'addition',$2,'استيراد إكسل',$3,$4,$5) RETURNING *`,
-            [number, supplierId, req.actor.id, req.actor.type, req.actor.name]
+        // الإكسل يحدّد الكمية والسعر الجديدين (مو يضيف عليهم)
+        const delta = row.stockQty - Number(product.stock_qty);
+        const newQty = row.stockQty;
+        if (delta !== 0) {
+          let voucherId = null;
+          if (delta > 0) {
+            if (!voucher) {
+              const number = await nextDocNumber(client, {
+                table: "stock_vouchers", column: "voucher_number", prefix: "ADD", start: 1000,
+              });
+              const { rows: [v] } = await client.query(
+                `INSERT INTO stock_vouchers
+                   (voucher_number, voucher_type, supplier_id, reason, created_by, created_by_type, created_by_name)
+                 VALUES ($1,'addition',$2,'استيراد إكسل',$3,$4,$5) RETURNING *`,
+                [number, supplierId, req.actor.id, req.actor.type, req.actor.name]
+              );
+              voucher = v;
+            }
+            voucherId = voucher.id;
+          }
+          await client.query(
+            `INSERT INTO stock_movements (product_id, change_qty, reason, created_by, voucher_id)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [product.id, delta, delta > 0 ? "استيراد إكسل — زيادة كمية" : "استيراد إكسل — تخفيض كمية", req.actor.id, voucherId]
           );
-          voucher = v;
         }
-        const newQty = Number(product.stock_qty) + row.stockQty;
-        await client.query(
-          `INSERT INTO stock_movements (product_id, change_qty, reason, created_by, voucher_id)
-           VALUES ($1,$2,'استيراد إكسل — تحديث مخزون',$3,$4)`,
-          [product.id, row.stockQty, req.actor.id, voucher.id]
-        );
         const { rows: [saved] } = await client.query(
           `UPDATE products SET stock_qty = $2, base_price = $3 WHERE id = $1 RETURNING *`,
           [product.id, newQty, row.basePrice]
