@@ -16,6 +16,24 @@ async function recordStatus(client, { orderId, orderSupplierId = null, from, to,
     [orderId, orderSupplierId, from, to, actor.id, actor.name, note]
   );
 }
+// نصيب جزء المورد من المبلغ المتبقي على العميل (للاستلام الشخصي).
+// لو الطلبية فيها أكثر من مورد والإدارة ما حددت مورد يستلم المتبقي: المتبقي يتقسم بنسبة قيمة كل جزء لسه ما اتسلمش،
+// وآخر جزء مفتوح ياخذ كل اللي فضل. لو الطلبية خالصة يرجع 0.
+function computePartDue(order, parts, part) {
+  if (!part || part.pickup_confirmed || part.status === "cancelled") return 0;
+  const remaining = Math.max(0, Number(order.grand_total) - Number(order.paid_amount));
+  if (remaining <= 0) return 0;
+  const open = parts.filter((p) => !p.pickup_confirmed && p.status !== "cancelled");
+  const openTotal = open.reduce((sum, p) => sum + Number(p.subtotal || 0), 0);
+  if (open.length <= 1 || openTotal <= 0) return Math.round(remaining * 100) / 100;
+  // لو الإدارة حددت مورد بعينه يستلم المتبقي كامل، هو بس اللي عليه التحصيل والباقي ما عليهم شي
+  const collector = order.remaining_collector_id;
+  if (collector && open.some((p) => p.supplier_id === collector)) {
+    return part.supplier_id === collector ? Math.round(remaining * 100) / 100 : 0;
+  }
+  return Math.round((remaining * Number(part.subtotal || 0) / openTotal) * 100) / 100;
+}
+
 // إعادة حساب إجمالي كل جزء (مورد) وإجمالي الطلبية كاملة بعد أي تعديل على الأصناف
 async function recalcOrderTotals(client, orderId) {
   await client.query(
@@ -429,6 +447,8 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
     suppliers: suppliers.rows
       .map((s) => ({
         ...s,
+        // المتبقي على العميل اللي لازم المورد يستلمه عند التسليم (استلام شخصي) — 0 لو خالصة
+        due_now: order.fulfillment === "pickup" ? computePartDue(order, suppliers.rows, s) : 0,
         items: items.rows.filter((i) => i.order_supplier_id === s.id),
       }))
       .filter((s) => s.items.length > 0),
@@ -644,13 +664,21 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
        req.actor.id, `تأكيد حوالة — طلبية ${order.order_number}`]
     );
 
-    const { rows: [updated] } = await client.query(
+    let { rows: [updated] } = await client.query(
       `UPDATE orders SET
          paid_amount = paid_amount + $2,
          payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
        WHERE id = $1 RETURNING *`,
       [order.id, appliedToOrder]
     );
+    // لو الطلبية عند مندوب قبل ما تتأكد الحوالة، نحدّث "المطلوب تحصيله" عشان يطلع المتبقي بس (أو صفر لو خالصة)
+    if (updated.driver_id && ["assigned_to_driver", "out_for_delivery"].includes(updated.status)) {
+      const { rows: [u2] } = await client.query(
+        `UPDATE orders SET cod_amount = GREATEST(grand_total - paid_amount, 0) WHERE id = $1 RETURNING *`,
+        [order.id]
+      );
+      updated = u2;
+    }
 
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -697,6 +725,44 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
       action: postpone ? "order.postponed" : "order.cancelled",
       entityType: "order", entityId: order.id, entityLabel: order.order_number,
       before: order, after: updated, ip: req.ip,
+    });
+    return updated;
+  });
+
+  res.json(result);
+}));
+
+// الإدارة تحدد أي مورد يستلم المبلغ المتبقي على العميل كامل (طلبية استلام شخصي بالحوالة فيها أكثر من مورد).
+// لو supplierId = null يرجع التقسيم التلقائي بنسبة الفواتير.
+orderRouter.post("/:id/remaining-collector", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const { supplierId } = z.object({ supplierId: z.string().uuid().nullable() }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+    if (order.fulfillment !== "pickup" || order.payment_method !== "transfer") {
+      throw new ApiError(400, "هذا الخيار لطلبيات الاستلام الشخصي بالحوالة فقط");
+    }
+    if (["cancelled", "closed", "delivered"].includes(order.status)) {
+      throw new ApiError(409, "الطلبية ملغاة أو مسلّمة");
+    }
+    if (supplierId) {
+      const { rows: part } = await client.query(
+        `SELECT id FROM order_suppliers
+          WHERE order_id = $1 AND supplier_id = $2 AND NOT pickup_confirmed AND status <> 'cancelled'`,
+        [order.id, supplierId]
+      );
+      if (!part.length) throw new ApiError(400, "هذا المورد ليس له فاتورة مفتوحة في هذه الطلبية");
+    }
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET remaining_collector_id = $2 WHERE id = $1 RETURNING *`,
+      [order.id, supplierId]
+    );
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.remaining_collector_set", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
     });
     return updated;
   });
@@ -1328,6 +1394,20 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
       throw new ApiError(400, "لازم تبدأ التوصيل أولًا قبل تأكيد التسليم");
     }
 
+    // المبلغ المتبقي على العميل وقت التسليم (بعد أي حوالة أكدتها الإدارة). الطلبية الخالصة = 0.
+    // المندوب ما يقدر يسلّم لو باقي مبلغ إلا بعد ما يؤكد إنه استلمه (الآجل له معاملته الخاصة).
+    const dueNow = order.payment_method === "deferred"
+      ? Number(order.cod_amount || 0)
+      : Math.max(0, Number(order.grand_total) - Number(order.paid_amount));
+    if (order.payment_method !== "deferred" && dueNow > 0 && !collected) {
+      throw new ApiError(400, `باقي على الزبون ${dueNow} د.ل — لازم تستلمه وتأكد الاستلام قبل التسليم`);
+    }
+    if (order.payment_method !== "deferred" && Number(order.cod_amount) !== dueNow) {
+      await client.query(`UPDATE orders SET cod_amount = $2 WHERE id = $1`, [order.id, dueNow]);
+      order.cod_amount = dueNow;
+    }
+    const collectedEffective = dueNow > 0 && collected;
+
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET status = 'delivered', delivered_at = now(),
               cod_collected = $2,
@@ -1336,15 +1416,15 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
                 WHEN $2 AND paid_amount + cod_amount >= grand_total THEN 'paid'
                 WHEN $2 THEN 'partially_paid' ELSE payment_status END
        WHERE id = $1 RETURNING *`,
-      [order.id, collected]
+      [order.id, collectedEffective]
     );
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: "delivered", actor: req.actor,
-      note: collected ? `تم تحصيل ${order.cod_amount}` : "تسليم بدون تحصيل",
+      note: collectedEffective ? `تم تحصيل ${order.cod_amount}` : (dueNow > 0 ? "تسليم بدون تحصيل" : "تسليم — الطلبية خالصة"),
     });
 
     // سند قبض حقيقي برقم رسمي باسم المندوب اللي حصّل المبلغ
-    if (collected && Number(order.cod_amount) > 0) {
+    if (collectedEffective && Number(order.cod_amount) > 0) {
       const { rows: tr } = await client.query(
         `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("receipt", "cash")]
       );
@@ -1401,7 +1481,10 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
 }));
 
 orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("supplier"), asyncRoute(async (req, res) => {
-  const { paymentReceived } = z.object({ paymentReceived: z.boolean() }).parse(req.body);
+  const { paymentReceived, amountReceived } = z.object({
+    paymentReceived: z.boolean(),
+    amountReceived: z.number().min(0).optional(),
+  }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
     // قفل الطلبية أولًا (ترتيب موحّد للأقفال: الطلبية ثم جزء المورد) لمنع التعارض والـdeadlock
@@ -1422,7 +1505,32 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       throw new ApiError(400, "لازم تعلّم الفاتورة كجاهزة أولًا قبل تأكيد حضور العميل");
     }
 
-    if (!paymentReceived && part.payment_method !== "deferred") {
+    // الحوالة: المدفوع فعليًا هو اللي أكدته الإدارة. لو باقي مبلغ على العميل، المورد لازم يستلمه نقدًا
+    // ويأكد استلامه قبل التسليم. لو الطلبية خالصة، يسلّم بدون أي تحصيل.
+    let transferDue = 0;
+    if (part.payment_method === "transfer") {
+      const { rows: [ord] } = await client.query(
+        `SELECT grand_total, paid_amount, remaining_collector_id FROM orders WHERE id = $1`, [part.order_id]
+      );
+      const { rows: allParts } = await client.query(
+        `SELECT id, supplier_id, subtotal, pickup_confirmed, status FROM order_suppliers WHERE order_id = $1`, [part.order_id]
+      );
+      if (Number(ord.paid_amount) <= 0) {
+        throw new ApiError(409, "الحوالة لم تُؤكَّد من الإدارة بعد — انتظر تأكيد الإدارة قبل تسليم الطلبية");
+      }
+      transferDue = computePartDue(ord, allParts, part);
+      if (transferDue > 0) {
+        if (!paymentReceived) {
+          throw new ApiError(400, `باقي على الزبون ${transferDue} د.ل — لازم تستلمه وتأكد الاستلام قبل التسليم`);
+        }
+        if (amountReceived === undefined || Math.abs(amountReceived - transferDue) > 0.01) {
+          throw new ApiError(400, `المبلغ المتبقي المطلوب استلامه من الزبون هو ${transferDue} د.ل`);
+        }
+      }
+    }
+
+    if (!paymentReceived && part.payment_method !== "deferred"
+        && !(part.payment_method === "transfer" && transferDue === 0)) {
       throw new ApiError(400, "يلزم تأكيد استلام قيمة الفاتورة أو اعتماد الحوالة");
     }
 
@@ -1434,13 +1542,18 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       [part.id, paymentReceived]
     );
 
-    if (paymentReceived && ["pay_at_supplier", "cash"].includes(part.payment_method)) {
+    // المبلغ اللي استلمه المورد نقدًا من العميل: كامل قيمة فاتورته (دفع عند المورد/نقد)، أو المتبقي بعد الحوالة
+    const cashAmount = ["pay_at_supplier", "cash"].includes(part.payment_method)
+      ? Number(part.subtotal)
+      : transferDue;
+    const cashNote = part.payment_method === "transfer" ? " (المتبقي بعد الحوالة)" : "";
+    if (paymentReceived && cashAmount > 0) {
       await client.query(
         `UPDATE orders SET
             paid_amount = paid_amount + $2,
             payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
           WHERE id = $1`,
-        [part.order_id, part.subtotal]
+        [part.order_id, cashAmount]
       );
 
       // سند قبض حقيقي برقم رسمي — يظهر في كشف حساب العميل كدفعة موثّقة بدل سطر بلا رقم
@@ -1460,8 +1573,8 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
               note, created_by, off_treasury)
            VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", part.subtotal,
-           tr[0].id, part.order_id, `دفع نقدًا عند الاستلام — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
+          [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", cashAmount,
+           tr[0].id, part.order_id, `دفع نقدًا عند الاستلام${cashNote} — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
         );
       }
 
@@ -1479,8 +1592,8 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
               note, created_by, off_treasury)
            VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber2, req.actor.id, req.actor.name, part.subtotal, trPay[0].id, part.order_id,
-           `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${part.order_number}`]
+          [vNumber2, req.actor.id, req.actor.name, cashAmount, trPay[0].id, part.order_id,
+           `استلمها المورد مباشرة من العميل عند الاستلام${cashNote} — طلبية ${part.order_number}`]
         );
       }
     }
