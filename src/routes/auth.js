@@ -68,7 +68,7 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
   );
 
   if (!rows.length) {
-    return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
+    throw new ApiError(404, "هذا الرقم غير مسجل");
   }
 
   const user = rows[0];
@@ -85,7 +85,7 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
     : user.account_status === "approved";
 
   if (!isApproved) {
-    return res.json({ sent: true, message: "إذا كان الرقم مسجلًا فستصلك رسالة تحقق" });
+    throw new ApiError(403, "حسابك لم يُعتمد بعد — بانتظار موافقة الإدارة");
   }
 
   const otp = generateOtp();
