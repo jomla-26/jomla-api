@@ -69,7 +69,7 @@ const createSchema = z.object({
   items: z.array(z.object({
     productId: z.string().uuid(),
     qty: z.number().positive(),
-    variantId: z.string().uuid().optional(), // خيار الصنف (لون/مقاس/عبوة) لو الصنف عنده خيارات
+    variantId: z.string().uuid().optional(), // نوع الصنف (لون/مقاس/عبوة) لو الصنف عنده أنواع
   })).min(1),
 });
 
@@ -89,7 +89,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
       if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
       const p = rows[0];
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      // الصنف اللي له خيارات: التوفر يُحسب على مخزون الخيار نفسه مش على علامة الصنف
+      // الصنف اللي له أنواع: التوفر يُحسب على مخزون النوع نفسه مش على علامة الصنف
       if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
       let variantLabel = null;
@@ -99,7 +99,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
           `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
           [item.variantId, p.id]
         );
-        if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
         if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
         if (Number(item.qty) > Number(vRows[0].stock_qty)) {
           throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
@@ -108,7 +108,7 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
       } else {
         const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-        if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
+        if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
         if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
         if (Number(item.qty) > Number(p.stock_qty)) {
           throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
@@ -234,7 +234,7 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
       if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
       const p = rows[0];
       if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      // الصنف اللي له خيارات: التوفر يُحسب على مخزون الخيار نفسه مش على علامة الصنف
+      // الصنف اللي له أنواع: التوفر يُحسب على مخزون النوع نفسه مش على علامة الصنف
       if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
 
       let variantLabel = null;
@@ -244,7 +244,7 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
           `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
           [item.variantId, p.id]
         );
-        if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+        if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
         if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
         if (Number(item.qty) > Number(vRows[0].stock_qty)) {
           throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
@@ -253,7 +253,7 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
         purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
       } else {
         const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-        if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
+        if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
         if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
         if (Number(item.qty) > Number(p.stock_qty)) {
           throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
@@ -494,7 +494,7 @@ orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(a
         `SELECT id, label, price FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
         [it.variant_id, it.product_id]
       );
-      if (!v.length) { unavailable.push(`${p[0].name} (الخيار لم يعد متوفرًا)`); continue; }
+      if (!v.length) { unavailable.push(`${p[0].name} (النوع لم يعد متوفرًا)`); continue; }
       variant = v[0];
     }
     const price = await resolvePrice(pool, {
@@ -1771,12 +1771,12 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
         `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
         [body.variantId, p.id]
       );
-      if (!vRows.length) throw new ApiError(404, `خيار الصنف غير متاح: ${p.name}`);
+      if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
       variantLabel = vRows[0].label;
       purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
     } else {
       const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-      if (hv.length) throw new ApiError(400, `لازم تختار خيار (لون/مقاس/عبوة) للصنف: ${p.name}`);
+      if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
     }
     const productName = variantLabel ? `${p.name} — ${variantLabel}` : p.name;
 
