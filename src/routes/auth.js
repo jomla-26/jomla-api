@@ -67,6 +67,18 @@ async function checkOtpPhoneLimit(phone, accountType) {
   await query(`INSERT INTO otp_requests (phone, account_type) VALUES ($1,$2)`, [phone, accountType]);
 }
 
+
+// ── وضع تجربة مؤقت (معطّل افتراضيًا) ────────────────────────────────────────
+// لو المالك أضاف المتغيرين TEST_OTP_PHONES (أرقام مفصولة بفواصل) و TEST_OTP_CODE (4 أرقام) في Railway،
+// فهذي الأرقام بالذات يكون رمزها هو الكود الثابت ولا يُرسل لها واتساب. أي رقم ثاني يمشي عادي.
+// لإغلاق الباب: امسح المتغيرين من Railway. بدونهما هذا الكود لا يفعل شي.
+function testOtpFor(normalizedPhone) {
+  const code = (process.env.TEST_OTP_CODE || "").trim();
+  if (!/^\d{4}$/.test(code)) return null;
+  const list = (process.env.TEST_OTP_PHONES || "").split(",").map((x) => x.trim()).filter(Boolean).map(normalizePhone);
+  return list.includes(normalizedPhone) ? code : null;
+}
+
 const TABLES = {
   employee: { table: "employees", nameCol: "name",          activeClause: "AND is_active" },
   customer: { table: "customers", nameCol: "business_name", activeClause: "AND status = 'approved'" },
@@ -86,7 +98,7 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
 
   // سقف حسب الرقم نفسه — قبل أي شي ثاني، عشان يحمي حتى لو المهاجم يجرب أرقام
   // مو مسجّلة بالنظام
-  await checkOtpPhoneLimit(normalized, accountType);
+  if (!testOtpFor(normalized)) await checkOtpPhoneLimit(normalized, accountType); // أرقام التجربة معفاة من سقف الطلب (متغيرات مؤقتة)
 
   const { rows } = await query(
     `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status
@@ -116,7 +128,8 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     throw new ApiError(403, "حسابك لم يُعتمد بعد — بانتظار موافقة الإدارة");
   }
 
-  const otp = generateOtp();
+  const fixedTestOtp = testOtpFor(normalized);
+  const otp = fixedTestOtp ?? generateOtp();
   const hash = await hashOtp(otp);
   // رمز جديد = عدّاد محاولات جديد
   await query(
@@ -126,11 +139,13 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     [hash, user.id]
   );
 
-  if (process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
+  if (!fixedTestOtp && process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
 
   // إرسال الرمز عبر واتساب (سيرفس Baileys المستقل) — لا نوقف الطلب لو فشل الإرسال،
   // فقط نسجّل الخطأ، عشان مشكلة مؤقتة بواتساب ما توقفش تسجيل الدخول بالكامل
-  if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
+  if (fixedTestOtp) {
+    console.log(`[AUTH] رقم تجربة (${normalized}): كود ثابت، بدون إرسال واتساب`);
+  } else if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
     fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-secret-key": process.env.WHATSAPP_SECRET_KEY },
