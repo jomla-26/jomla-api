@@ -211,7 +211,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
     const priced = await Promise.all(
       rows.map(async (p) => {
         const { base_price, ...rest } = p;
-        // الصنف اللي عنده خيارات: سعره وكميته الفعليين على مستوى كل خيار لحاله، مش الصنف الأساسي
+        // الصنف اللي عنده أنواع: سعره وكميته الفعليين على مستوى كل نوع لحاله، مش الصنف الأساسي
         if (rest.variants?.length) return { ...rest, price: null };
         const price = await resolvePrice(pool, {
           productId: p.id, customerId: req.actor.id, qty: 1,
@@ -266,7 +266,7 @@ const productSchema = z.object({
   stockQty: z.number().nonnegative().default(0),
   imageUrl: z.string().url().optional(),
   supplierSku: z.string().trim().max(100).optional(),
-  // خيارات (ألوان/مقاسات) تُضاف مع الصنف مباشرة في نفس الطلب
+  // أنواع (ألوان/مقاسات) تُضاف مع الصنف مباشرة في نفس الطلب
   variants: z.array(z.object({
     label: z.string().trim().min(1).max(150),
     price: z.number().positive(),
@@ -284,10 +284,12 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
   const body = productSchema.parse(req.body);
   const variantsIn = body.variants ?? [];
   if (!variantsIn.length && !body.basePrice) throw new ApiError(400, "السعر مطلوب");
+  if (!variantsIn.length && !String(body.supplierSku || "").trim()) throw new ApiError(400, "رقم الصنف عند المورد إجباري");
+  if (variantsIn.some((v) => !String(v.sku || "").trim())) throw new ApiError(400, "كود النوع إجباري لكل نوع");
   if (new Set(variantsIn.map((v) => v.label)).size !== variantsIn.length) {
-    throw new ApiError(400, "في خيارين بنفس الاسم — غيّر أحدهما");
+    throw new ApiError(400, "في نوعين بنفس الاسم — غيّر أحدهما");
   }
-  // صنف بخيارات: سعر الصنف الأساسي = أقل سعر خيار، ومخزونه = مجموع كميات الخيارات (موزّع عليها كاملًا)
+  // صنف بأنواع: سعر الصنف الأساسي = أقل سعر نوع، ومخزونه = مجموع كميات الأنواع (موزّع عليها كاملًا)
   const basePrice = variantsIn.length ? Math.min(...variantsIn.map((v) => v.price)) : body.basePrice;
   const stockQty = variantsIn.length ? 0 : body.stockQty;
   const supplierId = req.actor.type === "supplier"
@@ -325,7 +327,7 @@ catalogRouter.post("/products", asyncRoute(async (req, res, next) => {
       if (v.stockQty > 0) {
         await client.query(
           `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
-           VALUES ($1,$2,$3,'رصيد افتتاحي — خيار جديد',$4)`,
+           VALUES ($1,$2,$3,'رصيد افتتاحي — نوع جديد',$4)`,
           [rows[0].id, vr[0].id, v.stockQty, req.actor.id]
         );
       }
@@ -404,7 +406,7 @@ catalogRouter.patch("/products/:id", asyncRoute(async (req, res, next) => {
   res.json(updated);
 }));
 
-// حذف صنف نهائيًا — لو له تاريخ طلبات فعلي نوقفه بس (زي الخيارات بالضبط) عشان
+// حذف صنف نهائيًا — لو له تاريخ طلبات فعلي نوقفه بس (زي الأنواع بالضبط) عشان
 // الفواتير والتقارير القديمة تفضل صحيحة وما تختفيش أرقامها
 catalogRouter.delete("/products/:id", asyncRoute(async (req, res, next) => {
   const { rows } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
@@ -433,14 +435,14 @@ catalogRouter.delete("/products/:id", asyncRoute(async (req, res, next) => {
   res.status(204).send();
 }));
 
-/* --------------------- خيارات الصنف (ألوان/مقاسات/عبوات) ---------------------
-   كل خيار له سعره وكمية مخزونه المستقلين تمامًا عن الصنف الأساسي وعن بقية الخيارات */
+/* --------------------- أنواع الصنف (ألوان/مقاسات/عبوات) ---------------------
+   كل نوع له سعره وكمية مخزونه المستقلين تمامًا عن الصنف الأساسي وعن بقية الأنواع */
 
 catalogRouter.get("/products/:id/variants", asyncRoute(async (req, res) => {
   const { rows: prod } = await query(`SELECT supplier_id FROM products WHERE id = $1`, [req.params.id]);
   if (!prod.length) throw new ApiError(404, "الصنف غير موجود");
   if (req.actor.type === "supplier" && prod[0].supplier_id !== req.actor.id) {
-    throw new ApiError(403, "لا يمكنك الاطلاع على خيارات صنف لا يخصك");
+    throw new ApiError(403, "لا يمكنك الاطلاع على أنواع صنف لا يخصك");
   }
   const { rows } = await query(
     `SELECT * FROM product_variants WHERE product_id = $1 ORDER BY sort_order, created_at`,
@@ -459,14 +461,14 @@ const variantSchema = z.object({
   sortOrder: z.number().int().optional(),
 });
 
-// مخزون الصنف يتقسّم على خياراته: مجموع مخزون الخيارات ما يتعداش مخزون الصنف المتوفر
+// مخزون الصنف يتقسّم على أنواعه: مجموع مخزون الأنواع ما يتعداش مخزون الصنف المتوفر
 async function takeFromPool(client, productId, delta) {
-  // مخزون الصنف يتقسّم على خياراته: كمية الخيار تُخصم من رصيد الصنف غير الموزّع
+  // مخزون الصنف يتقسّم على أنواعه: كمية النوع تُخصم من رصيد الصنف غير الموزّع
   // (delta موجب = يسحب من الرصيد، سالب = يرجّع له)
   if (!delta) return;
   const { rows: [p] } = await client.query(`SELECT stock_qty FROM products WHERE id = $1 FOR UPDATE`, [productId]);
   if (delta > 0 && Number(p.stock_qty) < delta) {
-    throw new ApiError(400, `الكمية أكبر من المتوفر غير الموزّع على الخيارات (${p.stock_qty}). المتاح: ${p.stock_qty}`);
+    throw new ApiError(400, `الكمية أكبر من المتوفر غير الموزّع على الأنواع (${p.stock_qty}). المتاح: ${p.stock_qty}`);
   }
   await client.query(`UPDATE products SET stock_qty = stock_qty - $2 WHERE id = $1`, [productId, delta]);
 }
@@ -483,6 +485,7 @@ async function assertCanManageProduct(req, res, next) {
 
 catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct), asyncRoute(async (req, res) => {
   const body = variantSchema.parse(req.body);
+  if (!String(body.sku || "").trim()) throw new ApiError(400, "كود النوع إجباري");
 
   const variant = await withTransaction(async (client) => {
     await takeFromPool(client, req.params.id, body.stockQty);
@@ -499,7 +502,7 @@ catalogRouter.post("/products/:id/variants", asyncRoute(assertCanManageProduct),
     if (body.stockQty > 0) {
       await client.query(
         `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
-         VALUES ($1,$2,$3,'رصيد افتتاحي — خيار جديد',$4)`,
+         VALUES ($1,$2,$3,'رصيد افتتاحي — نوع جديد',$4)`,
         [req.params.id, rows[0].id, body.stockQty, req.actor.id]
       );
     }
@@ -519,9 +522,9 @@ async function assertCanManageVariant(req, res, next) {
     `SELECT v.*, p.supplier_id FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.id = $1`,
     [req.params.id]
   );
-  if (!rows.length) throw new ApiError(404, "الخيار غير موجود");
+  if (!rows.length) throw new ApiError(404, "النوع غير موجود");
   if (req.actor.type === "supplier") {
-    if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك تعديل خيار لا يخصك");
+    if (rows[0].supplier_id !== req.actor.id) throw new ApiError(403, "لا يمكنك تعديل نوع لا يخصك");
     return next();
   }
   return requirePermission("catalog.manage")(req, res, next);
@@ -540,7 +543,7 @@ catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant),
 
   const updated = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
-    if (!before.rows.length) throw new ApiError(404, "الخيار غير موجود");
+    if (!before.rows.length) throw new ApiError(404, "النوع غير موجود");
     {
       const old = before.rows[0];
       const oldEff = old.is_active ? Number(old.stock_qty) : 0;
@@ -577,10 +580,46 @@ catalogRouter.patch("/product-variants/:id", asyncRoute(assertCanManageVariant),
   res.json(updated);
 }));
 
+// تعديل كمية نوع بحركة مسجّلة (زيادة أو خصم + السبب) — الكمية ما تتغيّر مباشرة، عشان يبقى السجل واضح: كم كان، كم صار، ومن عدّل
+catalogRouter.post("/product-variants/:id/adjust-stock", asyncRoute(assertCanManageVariant), asyncRoute(async (req, res) => {
+  const body = z.object({
+    changeQty: z.number().refine((n) => n !== 0, "الكمية لا يمكن أن تكون صفرًا"),
+    reason: z.string().trim().min(2),
+  }).parse(req.body);
+
+  const updated = await withTransaction(async (client) => {
+    const { rows: before } = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!before.length) throw new ApiError(404, "النوع غير موجود");
+    const old = before[0];
+    const newQty = Number(old.stock_qty) + body.changeQty;
+    if (newQty < 0) throw new ApiError(400, "الكمية الناتجة أقل من صفر — تحقق من القيمة المدخلة");
+
+    await client.query(
+      `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [old.product_id, old.id, body.changeQty, body.reason, req.actor.id]
+    );
+    const { rows } = await client.query(
+      `UPDATE product_variants SET stock_qty = $2 WHERE id = $1 RETURNING *`, [old.id, newQty]
+    );
+    await writeAudit(client, {
+      actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name,
+      action: "product_variant.updated", entityType: "product_variant", entityId: old.id,
+      entityLabel: old.label, before: old, after: rows[0], ip: req.ip,
+    });
+    if (Number(old.stock_qty) === 0 && newQty > 0) {
+      const { rows: [p] } = await client.query(`SELECT name FROM products WHERE id = $1`, [old.product_id]);
+      await notifyFavoriteRestock(client, { productId: old.product_id, productName: p?.name || old.label });
+    }
+    return rows[0];
+  });
+  res.json(updated);
+}));
+
 catalogRouter.delete("/product-variants/:id", asyncRoute(assertCanManageVariant), asyncRoute(async (req, res) => {
   const used = await query(`SELECT 1 FROM order_items WHERE variant_id = $1 LIMIT 1`, [req.params.id]);
   if (used.rows.length) {
-    // ما نحذفش خيار له تاريخ طلبات فعلي — نوقّفه بس عشان الفواتير القديمة تفضل صحيحة
+    // ما نحذفش نوع له تاريخ طلبات فعلي — نوقّفه بس عشان الفواتير القديمة تفضل صحيحة
     await withTransaction(async (client) => {
       const { rows: [v] } = await client.query(`SELECT product_id, stock_qty, is_active FROM product_variants WHERE id = $1 FOR UPDATE`, [req.params.id]);
       if (v?.is_active) await takeFromPool(client, v.product_id, -Number(v.stock_qty));
@@ -836,7 +875,7 @@ catalogRouter.post("/products/:id/stock-movements", asyncRoute(async (req, res, 
 // سجل الصنف الموحّد للإدارة: حركات المخزون + كل التعديلات (سعر/اسم/كمية/كود/قسم...) بقيمتها قبل وبعد واسم من عدّل
 const HISTORY_FIELDS = {
   name: "الاسم", base_price: "السعر", price: "السعر", stock_qty: "الكمية", supplier_sku: "كود الصنف",
-  sku: "كود الخيار", label: "اسم الخيار", section_id: "القسم", is_active: "الحالة", image_url: "الصورة",
+  sku: "كود النوع", label: "اسم النوع", section_id: "القسم", is_active: "الحالة", image_url: "الصورة",
   purchase_cost: "سعر التكلفة", unit: "وحدة البيع",
 };
 catalogRouter.get("/products/:id/history", requireAnyPermission("catalog.manage", "reports.view"), asyncRoute(async (req, res) => {
@@ -891,7 +930,7 @@ catalogRouter.get("/products/:id/history", requireAnyPermission("catalog.manage"
       continue;
     }
     if (a.action === "product_variant.created") {
-      items.push({ id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name, title: "إضافة خيار", variant_label: variantLabel,
+      items.push({ id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name, title: "إضافة نوع", variant_label: variantLabel,
         changes: [{ label: "السعر", from: "—", to: show("price", after.price) }, { label: "الكمية", from: "—", to: show("stock_qty", after.stock_qty) }] });
       continue;
     }
@@ -907,7 +946,7 @@ catalogRouter.get("/products/:id/history", requireAnyPermission("catalog.manage"
     if (!changes.length) continue;
     items.push({
       id: `a-${a.id}`, kind: "edit", at: a.created_at, actor_name: a.actor_name,
-      title: variantLabel ? "تعديل خيار" : "تعديل الصنف", variant_label: variantLabel, changes,
+      title: variantLabel ? "تعديل نوع" : "تعديل الصنف", variant_label: variantLabel, changes,
     });
   }
 
@@ -965,7 +1004,7 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
         continue;
       }
 
-      // الكود قد يكون كود خيار (لون/مقاس) — نطابقه أولًا مع خيارات أصناف هذا المورد
+      // الكود قد يكون كود نوع (لون/مقاس) — نطابقه أولًا مع أنواع أصناف هذا المورد
       const { rows: vMatch } = await client.query(
         `SELECT v.*, p.name AS product_name FROM product_variants v
            JOIN products p ON p.id = v.product_id
@@ -997,7 +1036,7 @@ catalogRouter.post("/products/import", asyncRoute(async (req, res, next) => {
             `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by, voucher_id)
              VALUES ($1,$2,$3,$4,$5,$6)`,
             [variant.product_id, variant.id, delta,
-             delta > 0 ? "استيراد إكسل — زيادة كمية خيار" : "استيراد إكسل — تخفيض كمية خيار", req.actor.id, voucherId]
+             delta > 0 ? "استيراد إكسل — زيادة كمية نوع" : "استيراد إكسل — تخفيض كمية نوع", req.actor.id, voucherId]
           );
         }
         const { rows: [savedV] } = await client.query(
