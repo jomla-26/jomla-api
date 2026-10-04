@@ -119,7 +119,7 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
       const code = file.originalname.replace(/\.[^.]+$/, "").trim();
       if (!code) { unmatched.push({ file: file.originalname, reason: "اسم ملف غير صالح" }); continue; }
 
-      // الكود قد يكون كود صنف أو كود خيار (لون/مقاس)
+      // الكود قد يكون كود صنف أو كود نوع (لون/مقاس)
       let { rows } = await query(
         `SELECT id, name FROM products WHERE supplier_id = $1 AND supplier_sku = $2`,
         [supplierId, code]
