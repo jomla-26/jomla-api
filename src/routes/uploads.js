@@ -4,9 +4,9 @@ import crypto from "node:crypto";
 import sharp from "sharp";
 import { createClient } from "@supabase/supabase-js";
 import ws from "ws";
-import { authenticate, requirePermission } from "../middleware/auth.js";
+import { authenticate, requirePermission, requireAnyPermission } from "../middleware/auth.js";
 import { ApiError } from "../lib/helpers.js";
-import { query } from "../lib/db.js";
+import { query, withTransaction, writeAudit, resubmitForApproval } from "../lib/db.js";
 
 export const uploadRouter = Router();
 uploadRouter.use(authenticate);
@@ -37,7 +37,20 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 },
 });
 
-uploadRouter.post("/image", (req, res, next) => {
+// الرفع للموردين وموظفي الإدارة (بصلاحية كتالوج/أقسام/أصول/حسابات) فقط — العملاء والمناديب ما يرفعون ملفات
+function runMiddleware(mw, req, res) {
+  return new Promise((resolve, reject) => mw(req, res, (e) => (e ? reject(e) : resolve())));
+}
+async function assertCanUploadImages(req, res) {
+  if (req.actor.type === "supplier") return;
+  if (req.actor.type !== "employee") throw new ApiError(403, "رفع الصور غير متاح لهذا الحساب");
+  await runMiddleware(
+    requireAnyPermission("catalog.manage", "accounts.sections", "accounts.approve", "assets.manage"), req, res
+  );
+}
+
+uploadRouter.post("/image", async (req, res, next) => {
+  try { await assertCanUploadImages(req, res); } catch (e) { return next(e); }
   upload.single("image")(req, res, async (err) => {
     if (err instanceof multer.MulterError) {
       const message =
@@ -84,20 +97,32 @@ uploadRouter.post("/image", (req, res, next) => {
 
 // رفع صور أصناف دفعة وحدة — كل صورة تتطابق مع صنفها عن طريق اسم الملف (بدون
 // الامتداد) اللي لازم يكون نفس "رقم الصنف عند المورد" (supplier_sku) بالضبط
-const bulkUpload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } });
+// الحد: 20 ملفًا في الطلب الواحد × 10 ميجا للملف (الذاكرة تُحجز لكل الملفات معًا، فالحد يحمي السيرفر)
+const BULK_MAX_FILES = 20;
+const bulkUpload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024, files: BULK_MAX_FILES } });
 
-uploadRouter.post("/product-images/bulk", (req, res, next) => {
-  bulkUpload.array("images", 100)(req, res, async (err) => {
+uploadRouter.post("/product-images/bulk", async (req, res, next) => {
+  // التحقق من هوية/صلاحية الرافع قبل استقبال أي ملف
+  if (req.actor.type !== "supplier") {
+    try {
+      if (req.actor.type !== "employee") throw new ApiError(403, "رفع الصور غير متاح لهذا الحساب");
+      await runMiddleware(requirePermission("catalog.manage"), req, res);
+    } catch (e) { return next(e); }
+  }
+  bulkUpload.array("images", BULK_MAX_FILES)(req, res, async (err) => {
     if (err instanceof multer.MulterError) {
       const message =
         err.code === "LIMIT_FILE_SIZE"
-          ? "إحدى الصور كبيرة جدًا — الحد الأقصى 15 ميجابايت للصورة"
-          : "تعذّر رفع الملفات";
+          ? "إحدى الصور كبيرة جدًا — الحد الأقصى 10 ميجابايت للصورة"
+          : ["LIMIT_FILE_COUNT", "LIMIT_UNEXPECTED_FILE"].includes(err.code)
+            ? `الحد الأقصى ${BULK_MAX_FILES} صورة في المرة الواحدة — ارفعها على دفعات`
+            : "تعذّر رفع الملفات";
       return next(new ApiError(400, message));
     }
     if (err) return next(err);
     if (!req.files?.length) return next(new ApiError(400, "لم يتم إرفاق أي صور"));
 
+    try {
     let supplierId;
     if (req.actor.type === "supplier") {
       supplierId = req.actor.id;
@@ -105,11 +130,6 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
       supplierId = req.body.supplierId;
       if (!supplierId) return next(new ApiError(400, "يجب تحديد المورد"));
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(supplierId)) return next(new ApiError(400, "معرّف المورد غير صالح"));
-      try {
-        await new Promise((resolve, reject) => {
-          requirePermission("catalog.manage")(req, res, (e) => (e ? reject(e) : resolve()));
-        });
-      } catch (e) { return next(e); }
     }
 
     const matched = [];
@@ -121,7 +141,9 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
 
       // الكود قد يكون كود صنف أو كود نوع (لون/مقاس)
       let { rows } = await query(
-        `SELECT id, name FROM products WHERE supplier_id = $1 AND supplier_sku = $2`,
+        `SELECT id, name FROM products
+          WHERE supplier_id = $1 AND lower(supplier_sku) = lower($2)
+          ORDER BY added_at, id LIMIT 1`,
         [supplierId, code]
       );
       let variantId = null;
@@ -129,7 +151,8 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
         const { rows: vr } = await query(
           `SELECT v.id AS variant_id, p.id, p.name || ' - ' || v.label AS name
              FROM product_variants v JOIN products p ON p.id = v.product_id
-            WHERE p.supplier_id = $1 AND v.sku = $2 LIMIT 1`,
+            WHERE p.supplier_id = $1 AND lower(v.sku) = lower($2)
+            ORDER BY v.created_at, v.id LIMIT 1`,
           [supplierId, code]
         );
         if (vr.length) { rows = vr; variantId = vr[0].variant_id; }
@@ -159,12 +182,40 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
         if (error) throw error;
         const { data } = supabase.storage.from(BUCKET).getPublicUrl(filename);
 
-        if (variantId) {
-          await query(`UPDATE product_variants SET image_url = $2 WHERE id = $1`, [variantId, data.publicUrl]);
-          await query(`UPDATE products SET image_url = $2 WHERE id = $1 AND image_url IS NULL`, [rows[0].id, data.publicUrl]);
-        } else {
-          await query(`UPDATE products SET image_url = $2 WHERE id = $1`, [rows[0].id, data.publicUrl]);
-        }
+        // كل تغيير صورة داخل معاملة واحدة مع صف تدقيق (الصورة قبل ← بعد + من رفعها)،
+        // وصورة جديدة من المورد على صنف معتمد/مرفوض = تعديل يراه العميل → يرجع للمراجعة (نفس قاعدة تعديل الصنف)
+        await withTransaction(async (client) => {
+          const actorInfo = { actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name, ip: req.ip };
+          const { rows: [pBefore] } = await client.query(`SELECT * FROM products WHERE id = $1 FOR UPDATE`, [rows[0].id]);
+          if (variantId) {
+            const { rows: [vBefore] } = await client.query(`SELECT * FROM product_variants WHERE id = $1 FOR UPDATE`, [variantId]);
+            const { rows: [vAfter] } = await client.query(
+              `UPDATE product_variants SET image_url = $2 WHERE id = $1 RETURNING *`, [variantId, data.publicUrl]);
+            await writeAudit(client, {
+              ...actorInfo, action: "product_variant.updated", entityType: "product_variant", entityId: variantId,
+              entityLabel: rows[0].name, before: vBefore, after: vAfter,
+            });
+            if (!pBefore.image_url) {
+              const { rows: [pAfter] } = await client.query(`UPDATE products SET image_url = $2 WHERE id = $1 RETURNING *`, [pBefore.id, data.publicUrl]);
+              await writeAudit(client, {
+                ...actorInfo, action: "product.updated", entityType: "product", entityId: pBefore.id,
+                entityLabel: pBefore.name, before: pBefore, after: pAfter,
+              });
+            }
+          } else {
+            const { rows: [pAfter] } = await client.query(`UPDATE products SET image_url = $2 WHERE id = $1 RETURNING *`, [pBefore.id, data.publicUrl]);
+            await writeAudit(client, {
+              ...actorInfo, action: "product.updated", entityType: "product", entityId: pBefore.id,
+              entityLabel: pBefore.name, before: pBefore, after: pAfter,
+            });
+          }
+          if (req.actor.type === "supplier") {
+            await resubmitForApproval(client, pBefore.id, {
+              actor: req.actor, ip: req.ip,
+              reason: variantId ? `رفع صور جماعي — تغيير صورة النوع (${rows[0].name})` : "رفع صور جماعي — تغيير صورة الصنف",
+            });
+          }
+        });
         matched.push({ file: file.originalname, productId: rows[0].id, productName: rows[0].name, url: data.publicUrl });
       } catch (e) {
         console.error("[BULK_UPLOAD]", e);
@@ -173,5 +224,8 @@ uploadRouter.post("/product-images/bulk", (req, res, next) => {
     }
 
     res.json({ matched, unmatched });
+    } catch (e) {
+      next(e);
+    }
   });
 });

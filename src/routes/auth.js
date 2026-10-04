@@ -1,21 +1,48 @@
+import crypto from "node:crypto";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
-import { query, withTransaction, writeAudit } from "../lib/db.js";
-import { ApiError, asyncRoute, generateOtp, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
+import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
+import { ApiError, asyncRoute, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
 import { signToken, authenticate } from "../middleware/auth.js";
 
 export const authRouter = Router();
 
-const otpLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
+// رمز من 4 خانات (التطبيقات تتحقق من الطول 4 وترسل تلقائيًا عند اكتماله) — مولَّد بمصدر عشوائي آمن
+const generateOtp = () => String(crypto.randomInt(0, 10000)).padStart(4, "0");
+
+const OTP_MAX_ATTEMPTS = 5; // بعدها يُحرق الرمز ويلزم طلب رمز جديد
+
+// الـ limiters مفصولة (طلب الرمز ≠ التحقق منه) والمفتاح = IP + رقم الهاتف، عشان شبكة موبايل
+// مشتركة ما تقفل كل المستخدمين. وفوقها سقف أوسع حسب IP وحده ضد من يجرب أرقام كثيرة.
+const phoneIpKey = (req) => `${req.ip}|${normalizePhone(req.body?.phone) || "-"}`;
+const ipKey = (req) => String(req.ip);
+const makeLimiter = (windowMs, max, keyGenerator) => rateLimit({
+  windowMs, max, keyGenerator,
+  standardHeaders: true, legacyHeaders: false,
   message: { error: "محاولات كثيرة، يرجى المحاولة بعد قليل" },
 });
+const otpRequestLimiters = [
+  makeLimiter(15 * 60 * 1000, 5, phoneIpKey),
+  makeLimiter(15 * 60 * 1000, 40, ipKey),
+];
+const otpVerifyLimiters = [
+  makeLimiter(15 * 60 * 1000, 10, phoneIpKey),
+  makeLimiter(15 * 60 * 1000, 100, ipKey),
+];
 
-// حماية إضافية حسب رقم الهاتف نفسه (مو بس الـ IP): الـ limiter أعلاه يحسب حسب
-// عنوان IP، وممكن يتلف (شبكة موبايل مشتركة، أو مهاجم يغيّر IP كل مرة). هذا يمنع
-// إغراق رقم معيّن برسائل متكررة مهما كان مصدر الطلب.
+// تسجيل مختصر لفشل الدخول بسجل التدقيق — ما يوقف الطلب لو فشل التسجيل نفسه
+async function auditAuthFailure(action, accountType, user, req) {
+  try {
+    await writeAudit(pool, {
+      actorType: accountType, actorId: user.id, actorName: user.name,
+      action, entityType: accountType, entityId: user.id, entityLabel: user.name, ip: req.ip,
+    });
+  } catch (e) { console.error("[auth audit]", e.message); }
+}
+
+// حماية إضافية حسب رقم الهاتف نفسه (مو بس الـ IP): تمنع إغراق رقم معيّن برسائل
+// متكررة مهما كان مصدر الطلب.
 const OTP_COOLDOWN_SECONDS = 45;
 const OTP_MAX_PER_HOUR = 5;
 
@@ -48,10 +75,10 @@ const TABLES = {
 
 const requestSchema = z.object({
   accountType: z.enum(["employee", "customer", "supplier"]),
-  phone: z.string().min(9),
+  phone: z.string().min(9).max(20),
 });
 
-authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
+authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, res) => {
   const { accountType, phone } = requestSchema.parse(req.body);
   const cfg = TABLES[accountType];
   const normalized = normalizePhone(phone);
@@ -67,6 +94,7 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
     [normalized]
   );
 
+  // قرار المالك: رسالة "هذا الرقم غير مسجل" تبقى كما هي
   if (!rows.length) {
     throw new ApiError(404, "هذا الرقم غير مسجل");
   }
@@ -90,9 +118,10 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
 
   const otp = generateOtp();
   const hash = await hashOtp(otp);
+  // رمز جديد = عدّاد محاولات جديد
   await query(
     `UPDATE ${cfg.table}
-        SET otp_hash = $1, otp_expires_at = now() + interval '5 minutes'
+        SET otp_hash = $1, otp_expires_at = now() + interval '5 minutes', otp_attempts = 0
       WHERE id = $2`,
     [hash, user.id]
   );
@@ -122,34 +151,80 @@ authRouter.post("/otp/request", otpLimiter, asyncRoute(async (req, res) => {
 
 const verifySchema = requestSchema.extend({ otp: z.string().length(4) });
 
-authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
+authRouter.post("/otp/verify", ...otpVerifyLimiters, asyncRoute(async (req, res) => {
   const { accountType, phone, otp } = verifySchema.parse(req.body);
   const cfg = TABLES[accountType];
   const normalized = normalizePhone(phone);
   const statusCol = accountType === "employee" ? "is_active" : "status";
 
   const { rows } = await query(
-    `SELECT id, ${cfg.nameCol} AS name, otp_hash, otp_expires_at, ${statusCol} AS account_status
+    `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status
        FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
     [normalized]
   );
 
   const user = rows[0];
+  const INVALID = "الرمز غير صالح أو منتهي الصلاحية";
+  if (!user) throw new ApiError(401, INVALID);
 
-  const isBlocked = user && (accountType === "employee"
+  const isBlocked = accountType === "employee"
     ? user.account_status === false
-    : user.account_status === "suspended");
-
+    : user.account_status === "suspended";
   if (isBlocked) {
     throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
   }
-
-  if (!user?.otp_hash || new Date(user.otp_expires_at) < new Date()) {
-    throw new ApiError(401, "الرمز غير صالح أو منتهي الصلاحية");
+  const isApproved = accountType === "employee"
+    ? user.account_status === true
+    : user.account_status === "approved";
+  if (!isApproved) {
+    throw new ApiError(403, "حسابك لم يُعتمد بعد — بانتظار موافقة الإدارة");
   }
-  if (!(await verifyOtp(otp, user.otp_hash))) {
+
+  // نستهلك محاولة بشكل ذرّي (UPDATE واحد) قبل المقارنة، فالتخمين المتوازي ما يتجاوزش السقف
+  const { rows: att } = await query(
+    `UPDATE ${cfg.table}
+        SET otp_attempts = otp_attempts + 1
+      WHERE id = $1 AND otp_hash IS NOT NULL AND otp_expires_at > now() AND otp_attempts < $2
+      RETURNING otp_hash, otp_attempts`,
+    [user.id, OTP_MAX_ATTEMPTS]
+  );
+  if (!att.length) {
+    // إما لا يوجد رمز، أو منتهي، أو استُنفدت المحاولات — احرق أي رمز متبقي
+    await query(
+      `UPDATE ${cfg.table} SET otp_hash = NULL WHERE id = $1 AND otp_hash IS NOT NULL AND otp_attempts >= $2`,
+      [user.id, OTP_MAX_ATTEMPTS]
+    );
+    throw new ApiError(401, INVALID);
+  }
+
+  if (!(await verifyOtp(otp, att[0].otp_hash))) {
+    const used = att[0].otp_attempts;
+    if (used >= OTP_MAX_ATTEMPTS) {
+      await query(`UPDATE ${cfg.table} SET otp_hash = NULL, otp_expires_at = NULL WHERE id = $1`, [user.id]);
+      await auditAuthFailure("auth.otp_locked", accountType, user, req);
+      throw new ApiError(401, "تجاوزت عدد المحاولات المسموحة، يرجى طلب رمز جديد");
+    }
+    await auditAuthFailure("auth.otp_failed", accountType, user, req);
     throw new ApiError(401, "الرمز غير صحيح");
   }
+
+  const consumed = await withTransaction(async (client) => {
+    // نحرق الرمز فقط لو لسا هو نفسه (يمنع استعمال نفس الرمز مرتين بالتوازي)
+    const upd = await client.query(
+      `UPDATE ${cfg.table} SET otp_hash = NULL, otp_expires_at = NULL, otp_attempts = 0
+       ${accountType === "employee" ? ", last_login_at = now()" : ""}
+        WHERE id = $1 AND otp_hash = $2`,
+      [user.id, att[0].otp_hash]
+    );
+    if (!upd.rowCount) return false;
+    await writeAudit(client, {
+      actorType: accountType, actorId: user.id, actorName: user.name,
+      action: "auth.login", entityType: accountType, entityId: user.id,
+      entityLabel: user.name, ip: req.ip,
+    });
+    return true;
+  });
+  if (!consumed) throw new ApiError(401, INVALID);
 
   let role = null;
   if (accountType === "employee") {
@@ -159,20 +234,6 @@ authRouter.post("/otp/verify", otpLimiter, asyncRoute(async (req, res) => {
     );
     role = r.rows[0]?.code || null;
   }
-
-  await withTransaction(async (client) => {
-    await client.query(
-      `UPDATE ${cfg.table} SET otp_hash = NULL, otp_expires_at = NULL
-       ${accountType === "employee" ? ", last_login_at = now()" : ""}
-        WHERE id = $1`,
-      [user.id]
-    );
-    await writeAudit(client, {
-      actorType: accountType, actorId: user.id, actorName: user.name,
-      action: "auth.login", entityType: accountType, entityId: user.id,
-      entityLabel: user.name, ip: req.ip,
-    });
-  });
 
   const token = signToken({ sub: user.id, type: accountType, name: user.name, role });
   res.json({ token, actor: { id: user.id, type: accountType, name: user.name, role } });

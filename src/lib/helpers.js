@@ -1,4 +1,5 @@
 import bcrypt from "bcrypt";
+import crypto from "node:crypto";
 
 export class ApiError extends Error {
   constructor(status, message, code = null) {
@@ -21,8 +22,24 @@ export async function nextDocNumber(client, { table, column, prefix, start = 100
   return `${prefix}-${Number(rows[0].last) + 1}`;
 }
 
+// رمز تحقق من 4 خانات — مولّد عشوائي آمن (crypto) بدل Math.random
 export function generateOtp() {
-  return String(Math.floor(1000 + Math.random() * 9000));
+  return String(crypto.randomInt(0, 10000)).padStart(4, "0");
+}
+
+// تقريب المبالغ المالية لخانتين عشريتين — دالة واحدة تُستخدم في كل مكان
+// (سعر السطر، مجموع الجزء، إجمالي الطلبية) عشان المجاميع تتطابق دائمًا
+export function round2(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+// تقريب الكميات لثلاث خانات (نفس دقة أعمدة الكمية في قاعدة البيانات)
+export function round3(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round((n + Number.EPSILON) * 1000) / 1000;
 }
 
 export const hashOtp = (otp) => bcrypt.hash(otp, 10);
@@ -85,21 +102,26 @@ export function haversineKm(lat1, lng1, lat2, lng2) {
 }
 
 export async function calcDeliveryFee(client, { zoneId, vehicleTypeId, vehiclesCount, supplierCount, customerId, supplierIds }) {
-  let fee = 0;
+  // null = لسا ما لقينا سعر. الصفر سعر شرعي (توصيل مجاني لمنطقة معيّنة) ولا يجوز التعامل معه كأنه "ما فيش سعر"
+  let fee = null;
 
   if (zoneId && vehicleTypeId) {
     const { rows } = await client.query(
       `SELECT fee FROM delivery_rates WHERE zone_id = $1 AND vehicle_type_id = $2`,
       [zoneId, vehicleTypeId]
     );
-    if (rows.length) fee = rows[0].fee;
+    if (rows.length && rows[0].fee != null) fee = Number(rows[0].fee);
   }
-  if (!fee && zoneId) {
+  if (fee === null && zoneId) {
     const { rows } = await client.query(`SELECT base_fee FROM delivery_zones WHERE id = $1`, [zoneId]);
-    if (rows.length) fee = rows[0].base_fee;
+    if (rows.length && rows[0].base_fee != null) fee = Number(rows[0].base_fee);
   }
-
-  if (!fee && vehicleTypeId) { const { rows: vt } = await client.query(`SELECT trip_cost FROM vehicle_types WHERE id = $1`, [vehicleTypeId]); if (vt.length) fee = Number(vt[0].trip_cost) || 0; } fee *= Math.max(1, vehiclesCount || 1);
+  if (fee === null && vehicleTypeId) {
+    const { rows: vt } = await client.query(`SELECT trip_cost FROM vehicle_types WHERE id = $1`, [vehicleTypeId]);
+    if (vt.length && vt[0].trip_cost != null) fee = Number(vt[0].trip_cost) || 0;
+  }
+  if (fee === null) fee = 0;
+  fee *= Math.max(1, vehiclesCount || 1);
 
   // رسم إضافي حسب المسافة الفعلية: مافيش مخزن للشركة — المندوب ياخذ البضاعة من
   // المورد (أو عدة موردين) ويوصّلها للزبون مباشرة. فنحسب مسافة كل مورد في
@@ -141,33 +163,58 @@ export async function calcDeliveryFee(client, { zoneId, vehicleTypeId, vehiclesC
 
   if (supplierCount > 1) {
     const { rows } = await client.query(`SELECT extra_pickup_point_fee FROM delivery_settings WHERE id = 1`);
-    const extra = rows.length ? rows[0].extra_pickup_point_fee : 0;
+    const extra = rows.length ? Number(rows[0].extra_pickup_point_fee || 0) : 0;
     fee += extra * (supplierCount - 1);
   }
 
-  return Number(fee.toFixed(2));
+  return round2(fee);
 }
 
-// إرجاع مخزون طلبية ملغاة: يحسب صافي ما خُصم فعليًا (بيع − إرجاع سابق) لكل صنف ويرجّعه — آمن للتكرار
+// أسباب حركات المخزون المرتبطة بطلبية — نص ثابت يُبنى من رقم الطلبية، ويُستعمل للبيع والإرجاع معًا
+export const stockReasons = (orderNumber) => ({
+  sale: `بيع — طلب ${orderNumber}`,
+  cancelBack: `إرجاع — إلغاء طلب ${orderNumber}`,
+  editBack: `إرجاع — تعديل طلب ${orderNumber}`,
+});
+
+// تعديل مخزون صنف (أو نوع) داخل معاملة قائمة + تسجيل حركة المخزون.
+// delta سالب = خصم (يرفض لو المخزون ما يكفي)، موجب = إضافة.
+export async function adjustStock(client, { productId, variantId = null, delta, reason, actorId = null }) {
+  const d = round3(delta);
+  if (!d) return;
+  if (d < 0) {
+    const r = variantId
+      ? await client.query(`UPDATE product_variants SET stock_qty = stock_qty + $2 WHERE id = $1 AND stock_qty + $2 >= 0`, [variantId, d])
+      : await client.query(`UPDATE products SET stock_qty = stock_qty + $2 WHERE id = $1 AND stock_qty + $2 >= 0`, [productId, d]);
+    if (!r.rowCount) throw new ApiError(409, "الكمية المؤكدة أكبر من المخزون المسجّل لأحد الأصناف — حدّث المخزون أولًا");
+  } else if (variantId) {
+    await client.query(`UPDATE product_variants SET stock_qty = stock_qty + $2 WHERE id = $1`, [variantId, d]);
+  } else {
+    await client.query(`UPDATE products SET stock_qty = stock_qty + $2 WHERE id = $1`, [productId, d]);
+  }
+  await client.query(
+    `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by) VALUES ($1,$2,$3,$4,$5)`,
+    [productId, variantId || null, d, reason, actorId || null]
+  );
+}
+
+// إرجاع مخزون طلبية ملغاة: يعتمد على سجل حركات المخزون الفعلي للطلبية نفسها
+// (مجموع كل الخصومات − كل الإرجاعات السابقة لكل صنف/نوع) وليس على الأصناف الباقية في الطلبية،
+// فيشمل الأصناف اللي انحذفت أو اتعدّلت بعد التأكيد — وآمن للتكرار (المرة الثانية صافيها صفر)
 export async function restoreOrderStock(client, orderId, actorId) {
   const { rows: [o] } = await client.query(`SELECT order_number FROM orders WHERE id = $1`, [orderId]);
   if (!o) return;
-  const sale = `بيع — طلب ${o.order_number}`;
-  const back = `إرجاع — إلغاء طلب ${o.order_number}`;
+  const r = stockReasons(o.order_number);
   const { rows } = await client.query(
     `SELECT product_id, variant_id, SUM(change_qty) AS net
        FROM stock_movements WHERE reason = ANY($1)
-        AND product_id IN (SELECT product_id FROM order_items oi JOIN order_suppliers os ON os.id = oi.order_supplier_id WHERE os.order_id = $2)
       GROUP BY product_id, variant_id HAVING SUM(change_qty) < 0`,
-    [[sale, back], orderId]
+    [[r.sale, r.cancelBack, r.editBack]]
   );
-  for (const r of rows) {
-    const qty = -Number(r.net);
-    if (r.variant_id) await client.query(`UPDATE product_variants SET stock_qty = stock_qty + $2 WHERE id = $1`, [r.variant_id, qty]);
-    else await client.query(`UPDATE products SET stock_qty = stock_qty + $2 WHERE id = $1`, [r.product_id, qty]);
-    await client.query(
-      `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by) VALUES ($1,$2,$3,$4,$5)`,
-      [r.product_id, r.variant_id || null, qty, back, actorId || null]
-    );
+  for (const row of rows) {
+    await adjustStock(client, {
+      productId: row.product_id, variantId: row.variant_id,
+      delta: -Number(row.net), reason: r.cancelBack, actorId,
+    });
   }
 }

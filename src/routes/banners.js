@@ -27,14 +27,19 @@ bannerRouter.get("/admin", requirePermission("catalog.manage"), asyncRoute(async
   res.json(rows);
 }));
 
+// روابط http/https فقط (z.string().url() لوحده يقبل javascript: و data: وغيرها)
+const httpUrl = z.string().max(2000).url().refine((u) => {
+  try { return ["http:", "https:"].includes(new URL(u).protocol); } catch { return false; }
+}, "الرابط لازم يبدأ بـ http:// أو https://");
+
 const bannerSchema = z.object({
-  imageUrl: z.string().url(),
-  title: z.string().optional(),
-  subtitle: z.string().optional(),
-  linkUrl: z.string().url().optional(),
+  imageUrl: httpUrl,
+  title: z.string().max(200).optional(),
+  subtitle: z.string().max(500).optional(),
+  linkUrl: httpUrl.optional(),
   sortOrder: z.number().int().default(0),
-  startsAt: z.string().optional(),
-  endsAt: z.string().optional(),
+  startsAt: z.string().max(40).optional(),
+  endsAt: z.string().max(40).optional(),
 });
 
 bannerRouter.post("/", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {

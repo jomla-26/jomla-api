@@ -1,12 +1,21 @@
 import { Router } from "express";
 import { z } from "zod";
-import { query, withTransaction, writeAudit } from "../lib/db.js";
+import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute } from "../lib/helpers.js";
 import { authenticate, requirePermission } from "../middleware/auth.js";
 
 export const assetsRouter = Router();
 assetsRouter.use(authenticate);
 assetsRouter.use(requirePermission("assets.manage"));
+
+async function audit(req, action, entityType, entityId, label, after) {
+  try {
+    await writeAudit(pool, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action, entityType, entityId: entityId ?? null, entityLabel: label ?? null, after, ip: req.ip,
+    });
+  } catch (e) { console.error("[audit]", e.message); }
+}
 
 assetsRouter.get("/", asyncRoute(async (req, res) => {
   const { type } = req.query;
@@ -22,9 +31,9 @@ assetsRouter.get("/", asyncRoute(async (req, res) => {
 
 assetsRouter.post("/", asyncRoute(async (req, res) => {
   const body = z.object({
-    name: z.string().min(2),
+    name: z.string().trim().min(2).max(120),
     assetType: z.enum(["generator", "vehicle", "equipment"]),
-    plateNumber: z.string().optional(),
+    plateNumber: z.string().max(30).optional(),
     vehicleTypeId: z.string().uuid().optional(),
   }).parse(req.body);
 
@@ -32,12 +41,13 @@ assetsRouter.post("/", asyncRoute(async (req, res) => {
     `INSERT INTO assets (name, asset_type, plate_number, vehicle_type_id) VALUES ($1,$2,$3,$4) RETURNING *`,
     [body.name, body.assetType, body.plateNumber ?? null, body.vehicleTypeId ?? null]
   );
+  await audit(req, "asset.created", "asset", rows[0].id, body.name, rows[0]);
   res.status(201).json(rows[0]);
 }));
 
 assetsRouter.post("/:id/runs", asyncRoute(async (req, res) => {
   const body = z.object({
-    startedAt: z.string(), endedAt: z.string().optional(), purpose: z.string().optional(),
+    startedAt: z.string(), endedAt: z.string().optional(), purpose: z.string().max(500).optional(),
     fuelLiters: z.number().nonnegative().optional(), fuelCost: z.number().nonnegative().optional(),
   }).parse(req.body);
 
@@ -51,6 +61,7 @@ assetsRouter.post("/:id/runs", asyncRoute(async (req, res) => {
     [req.params.id, body.startedAt, body.endedAt ?? null, runHours, body.purpose ?? null,
      body.fuelLiters ?? null, body.fuelCost ?? null, req.actor.id]
   );
+  await audit(req, "asset.run_recorded", "asset", req.params.id, null, rows[0]);
   res.status(201).json(rows[0]);
 }));
 
@@ -87,6 +98,7 @@ assetsRouter.post("/:id/trips", asyncRoute(async (req, res) => {
     return rows[0];
   });
 
+  await audit(req, "asset.trip_recorded", "asset", req.params.id, null, trip);
   res.status(201).json(trip);
 }));
 
@@ -100,7 +112,7 @@ assetsRouter.get("/:id/trips", asyncRoute(async (req, res) => {
 assetsRouter.post("/:id/maintenance", asyncRoute(async (req, res) => {
   const body = z.object({
     maintenanceType: z.enum(["routine", "repair", "breakdown"]),
-    description: z.string().optional(),
+    description: z.string().max(1000).optional(),
     cost: z.number().nonnegative().default(0),
     downtimeHours: z.number().nonnegative().optional(),
     startedAt: z.string(), endedAt: z.string().optional(),
@@ -113,6 +125,7 @@ assetsRouter.post("/:id/maintenance", asyncRoute(async (req, res) => {
     [req.params.id, body.maintenanceType, body.description ?? null, body.cost,
      body.downtimeHours ?? null, body.startedAt, body.endedAt ?? null, req.actor.id]
   );
+  await audit(req, "asset.maintenance_recorded", "asset", req.params.id, null, rows[0]);
   res.status(201).json(rows[0]);
 }));
 

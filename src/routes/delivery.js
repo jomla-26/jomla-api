@@ -1,11 +1,21 @@
 import { Router } from "express";
 import { z } from "zod";
-import { query, withTransaction, writeAudit } from "../lib/db.js";
+import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute } from "../lib/helpers.js";
 import { authenticate, requirePermission } from "../middleware/auth.js";
 
 export const deliveryRouter = Router();
 deliveryRouter.use(authenticate);
+
+// تسجيل مختصر لتعديلات إعدادات التوصيل بسجل التدقيق (لا يعطّل العملية لو فشل التسجيل)
+async function audit(req, action, entityType, entityId, label, after) {
+  try {
+    await writeAudit(pool, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action, entityType, entityId: entityId ?? null, entityLabel: label ?? null, after, ip: req.ip,
+    });
+  } catch (e) { console.error("[audit]", e.message); }
+}
 
 deliveryRouter.get("/zones", asyncRoute(async (_req, res) => {
   const { rows } = await query(`SELECT * FROM delivery_zones ORDER BY name`);
@@ -13,7 +23,7 @@ deliveryRouter.get("/zones", asyncRoute(async (_req, res) => {
 }));
 
 deliveryRouter.post("/zones", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
-  const body = z.object({ name: z.string().min(2), baseFee: z.number().nonnegative() }).parse(req.body);
+  const body = z.object({ name: z.string().trim().min(2).max(120), baseFee: z.number().nonnegative().max(1_000_000) }).parse(req.body);
   const zone = await withTransaction(async (client) => {
     const { rows } = await client.query(
       `INSERT INTO delivery_zones (name, base_fee) VALUES ($1,$2) RETURNING *`, [body.name, body.baseFee]
@@ -31,7 +41,7 @@ await writeAudit(client, {
 
 deliveryRouter.patch("/zones/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
-    name: z.string().min(2).optional(), baseFee: z.number().nonnegative().optional(), isActive: z.boolean().optional(),
+    name: z.string().trim().min(2).max(120).optional(), baseFee: z.number().nonnegative().max(1_000_000).optional(), isActive: z.boolean().optional(),
   }).parse(req.body);
   const { rows } = await query(
     `UPDATE delivery_zones SET
@@ -40,6 +50,7 @@ deliveryRouter.patch("/zones/:id", requirePermission("catalog.manage"), asyncRou
     [req.params.id, body.name ?? null, body.baseFee ?? null, body.isActive ?? null]
   );
   if (!rows.length) throw new ApiError(404, "المنطقة غير موجودة");
+  await audit(req, "delivery_zone.updated", "delivery_zone", rows[0].id, rows[0].name, rows[0]);
   res.json(rows[0]);
 }));
 
@@ -50,7 +61,7 @@ deliveryRouter.get("/vehicle-types", asyncRoute(async (_req, res) => {
 
 deliveryRouter.post("/vehicle-types", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
-    name: z.string().min(2), maxWeightKg: z.number().positive().optional(),
+    name: z.string().trim().min(2).max(120), maxWeightKg: z.number().positive().optional(),
     maxVolumeM3: z.number().positive().optional(), tripCost: z.number().nonnegative(),
     feePerKm: z.number().nonnegative().optional(),
   }).parse(req.body);
@@ -59,13 +70,14 @@ deliveryRouter.post("/vehicle-types", requirePermission("catalog.manage"), async
      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [body.name, body.maxWeightKg ?? null, body.maxVolumeM3 ?? null, body.tripCost, body.feePerKm ?? 0]
   );
+  await audit(req, "vehicle_type.created", "vehicle_type", rows[0].id, rows[0].name, rows[0]);
   res.status(201).json(rows[0]);
 }));
 
 // تعديل نوع سيارة موجود (التكلفة، سعر الكيلومتر، الاسم، الحدود) أو إيقافه/تفعيله
 deliveryRouter.patch("/vehicle-types/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
-    name: z.string().min(2).optional(),
+    name: z.string().trim().min(2).max(120).optional(),
     maxWeightKg: z.number().positive().optional(),
     maxVolumeM3: z.number().positive().optional(),
     tripCost: z.number().nonnegative().optional(),
@@ -86,6 +98,7 @@ deliveryRouter.patch("/vehicle-types/:id", requirePermission("catalog.manage"), 
      body.maxVolumeM3 ?? null, body.tripCost ?? null, body.feePerKm ?? null, body.isActive ?? null]
   );
   if (!rows.length) throw new ApiError(404, "نوع السيارة غير موجود");
+  await audit(req, "vehicle_type.updated", "vehicle_type", rows[0].id, rows[0].name, rows[0]);
   res.json(rows[0]);
 }));
 
@@ -110,6 +123,7 @@ deliveryRouter.post("/rates", requirePermission("catalog.manage"), asyncRoute(as
      RETURNING *`,
     [body.zoneId, body.vehicleTypeId, body.fee]
   );
+  await audit(req, "delivery_rate.upserted", "delivery_rate", rows[0].id, null, rows[0]);
   res.status(201).json(rows[0]);
 }));
 
@@ -131,5 +145,6 @@ deliveryRouter.patch("/settings", requirePermission("catalog.manage"), asyncRout
      WHERE id = 1 RETURNING *`,
     [body.extraPickupPointFee ?? null, body.freeKm ?? null]
   );
+  await audit(req, "delivery_settings.updated", "delivery_settings", null, "إعدادات التوصيل", rows[0]);
   res.json(rows[0]);
 }));

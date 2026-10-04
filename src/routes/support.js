@@ -14,6 +14,30 @@ supportRouter.use(authenticate);
 
 const SUPPORT_TYPES = ["customer", "supplier", "driver"];
 
+// صندوق الدعم للإدارة: موظفو الشركة فقط، والمندوب (دوره driver) ما يقرأ محادثات غيره
+const requireStaff = [
+  requireActorType("employee"),
+  (req, _res, next) => (req.actor.role === "driver"
+    ? next(new ApiError(403, "لا تملك صلاحية الوصول لصندوق الدعم الفني"))
+    : next()),
+];
+
+function pageParams(req, defLimit = 200, maxLimit = 500) {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || defLimit, 1), maxLimit);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  return { limit, offset };
+}
+
+// آخر N رسالة (بترتيب زمني تصاعدي) — الترقيم يبدأ من الأحدث
+const MESSAGES_SQL = `
+  SELECT * FROM (
+    SELECT id, sender_role, body, created_at
+      FROM support_messages
+     WHERE actor_type = $1 AND actor_id = $2
+     ORDER BY created_at DESC
+     LIMIT $3 OFFSET $4
+  ) m ORDER BY created_at ASC`;
+
 // نوع محادثة الدعم الخاصة بالمستخدم الحالي، أو null لو حسابه غير مؤهل
 function resolveOwnActorType(actor) {
   if (actor.type === "customer" || actor.type === "supplier") return actor.type;
@@ -30,7 +54,11 @@ async function lookupActor(actorType, actorId) {
     const { rows } = await query(`SELECT business_name AS name, phone FROM suppliers WHERE id = $1`, [actorId]);
     return rows[0] || null;
   }
-  const { rows } = await query(`SELECT name, phone FROM employees WHERE id = $1`, [actorId]);
+  // محادثات "driver" خاصة بالموظفين ذوي دور المندوب فقط
+  const { rows } = await query(
+    `SELECT e.name, e.phone FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1 AND r.code = 'driver'`,
+    [actorId]
+  );
   return rows[0] || null;
 }
 
@@ -44,13 +72,8 @@ supportRouter.get("/mine", requireActorType("customer", "supplier", "employee"),
   const actorType = resolveOwnActorType(req.actor);
   if (!actorType) throw new ApiError(403, "هذا الحساب لا يملك محادثة دعم فني");
 
-  const { rows } = await query(
-    `SELECT id, sender_role, body, created_at
-       FROM support_messages
-      WHERE actor_type = $1 AND actor_id = $2
-      ORDER BY created_at ASC`,
-    [actorType, req.actor.id]
-  );
+  const pg = pageParams(req);
+  const { rows } = await query(MESSAGES_SQL, [actorType, req.actor.id, pg.limit, pg.offset]);
 
   await query(
     `UPDATE support_messages SET read_by_actor = TRUE
@@ -82,8 +105,9 @@ supportRouter.post("/mine", requireActorType("customer", "supplier", "employee")
 =================================================================== */
 
 // قائمة المحادثات لنوع معيّن (customer / supplier / driver)، مرتّبة بآخر رسالة
-supportRouter.get("/threads", requireActorType("employee"), asyncRoute(async (req, res) => {
+supportRouter.get("/threads", ...requireStaff, asyncRoute(async (req, res) => {
   const type = String(req.query.type || "");
+  const pg = pageParams(req);
   if (!SUPPORT_TYPES.includes(type)) throw new ApiError(400, "نوع محادثة غير صالح");
 
   const joinSql =
@@ -101,15 +125,16 @@ supportRouter.get("/threads", requireActorType("employee"), asyncRoute(async (re
        ${joinSql}
       WHERE s.actor_type = $1
       GROUP BY s.actor_id, ${nameCol}, a.phone
-      ORDER BY last_at DESC`,
-    [type]
+      ORDER BY last_at DESC
+      LIMIT $2 OFFSET $3`,
+    [type, pg.limit, pg.offset]
   );
 
   res.json(rows);
 }));
 
 // عدد الرسائل غير المقروءة لكل نوع — لعرض شارات صغيرة في لوحة الإدارة
-supportRouter.get("/unread-counts", requireActorType("employee"), asyncRoute(async (_req, res) => {
+supportRouter.get("/unread-counts", ...requireStaff, asyncRoute(async (_req, res) => {
   const { rows } = await query(
     `SELECT actor_type, COUNT(*) AS unread
        FROM support_messages
@@ -122,20 +147,15 @@ supportRouter.get("/unread-counts", requireActorType("employee"), asyncRoute(asy
 }));
 
 // محادثة كاملة مع حساب بعينه
-supportRouter.get("/threads/:actorType/:actorId", requireActorType("employee"), asyncRoute(async (req, res) => {
+supportRouter.get("/threads/:actorType/:actorId", ...requireStaff, asyncRoute(async (req, res) => {
   const { actorType, actorId } = req.params;
   if (!SUPPORT_TYPES.includes(actorType)) throw new ApiError(400, "نوع محادثة غير صالح");
 
   const actorInfo = await lookupActor(actorType, actorId);
   if (!actorInfo) throw new ApiError(404, "الحساب غير موجود");
 
-  const { rows } = await query(
-    `SELECT id, sender_role, body, created_at
-       FROM support_messages
-      WHERE actor_type = $1 AND actor_id = $2
-      ORDER BY created_at ASC`,
-    [actorType, actorId]
-  );
+  const pg = pageParams(req);
+  const { rows } = await query(MESSAGES_SQL, [actorType, actorId, pg.limit, pg.offset]);
 
   await query(
     `UPDATE support_messages SET read_by_admin = TRUE
@@ -147,7 +167,7 @@ supportRouter.get("/threads/:actorType/:actorId", requireActorType("employee"), 
 }));
 
 // رد الإدارة على حساب بعينه
-supportRouter.post("/threads/:actorType/:actorId", requireActorType("employee"), asyncRoute(async (req, res) => {
+supportRouter.post("/threads/:actorType/:actorId", ...requireStaff, asyncRoute(async (req, res) => {
   const { actorType, actorId } = req.params;
   if (!SUPPORT_TYPES.includes(actorType)) throw new ApiError(400, "نوع محادثة غير صالح");
 

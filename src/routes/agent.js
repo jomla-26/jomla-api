@@ -9,6 +9,7 @@
  *  - الأدوات تشتغل دايمًا على حساب المرسل نفسه (الموديل ما يمرر معرّف حساب أبدًا).
  *  - رقم غير مسجل يجيه رد ثابت بدون أي استدعاء للذكاء الاصطناعي.
  */
+import crypto from "node:crypto";
 import { Router } from "express";
 import { query } from "../lib/db.js";
 import { asyncRoute, normalizePhone, resolvePrice } from "../lib/helpers.js";
@@ -43,13 +44,31 @@ const HITS = new Map();    // phone -> [timestamps]
 const HISTORY_TTL_MS = 30 * 60 * 1000;
 const MAX_TURNS = 12;
 const MAX_PER_HOUR = Number(process.env.AGENT_MAX_PER_HOUR) || 40;
+const MAX_PER_DAY = Number(process.env.AGENT_MAX_PER_DAY) || 150; // سقف يومي لكل رقم (يحمي تكلفة Claude)
 
+// يحتفظ بآخر 24 ساعة من الطلبات لكل رقم؛ نفس المصفوفة تخدم سقف الساعة وسقف اليوم
 function rateLimited(phone) {
   const now = Date.now();
-  const arr = (HITS.get(phone) || []).filter((t) => now - t < 3600_000);
-  arr.push(now);
+  const arr = (HITS.get(phone) || []).filter((t) => now - t < 24 * 3600_000);
+  const lastHour = arr.filter((t) => now - t < 3600_000).length;
+  const blocked = lastHour >= MAX_PER_HOUR || arr.length >= MAX_PER_DAY;
+  if (!blocked) arr.push(now); // الرسائل المرفوضة ما تكبّر العدّاد
   HITS.set(phone, arr);
-  return arr.length > MAX_PER_HOUR;
+  if (HITS.size > 5000) {
+    for (const [k, v] of HITS) if (!v.some((t) => now - t < 24 * 3600_000)) HITS.delete(k);
+  }
+  return blocked;
+}
+
+// اسم الحساب يدخل تعليمات النظام: ننظّفه (بدون أسطر جديدة/رموز تحكم/اقتباسات) ونقصّره
+const safeName = (n) => String(n ?? "").replace(/[\u0000-\u001f\u007f"\\`<>{}\[\]]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+
+// مقارنة المفتاح بزمن ثابت
+function secretOk(provided) {
+  const expected = process.env.WHATSAPP_SECRET_KEY;
+  if (!expected || typeof provided !== "string") return false;
+  const h = (v) => crypto.createHash("sha256").update(v).digest();
+  return crypto.timingSafeEqual(h(provided), h(expected));
 }
 function getHistory(phone) {
   const h = HISTORY.get(phone);
@@ -202,9 +221,10 @@ async function runTool(actor, name, input, rawText) {
   const limitOf = (v, d, max) => Math.min(Math.max(parseInt(v, 10) || d, 1), max);
 
   if (name === "contact_staff") {
+    const kind = ["return", "complaint", "reorder", "other"].includes(input.kind) ? input.kind : "other";
     await notifyManager(
-      `📩 طلب من ${actor.role === "customer" ? "العميل" : "المورد"} ${actor.name} (${actor.phone})\n` +
-      `النوع: ${input.kind}\n${String(input.summary || "").slice(0, 500)}\n\nنص رسالته: ${String(rawText).slice(0, 300)}`
+      `📩 طلب من ${actor.role === "customer" ? "العميل" : "المورد"} ${safeName(actor.name)} (${actor.phone})\n` +
+      `النوع: ${kind}\n${String(input.summary || "").slice(0, 400)}\n\nنص رسالته: ${String(rawText).slice(0, 300)}`
     );
     return { sent: true };
   }
@@ -392,10 +412,10 @@ function systemPrompt(actor) {
 - كلام خارج شغل المنصة: اعتذر بلطف وارجع للموضوع.
 - المبالغ بالدينار الليبي (د.ل). التواريخ بصيغة سنة-شهر-يوم.`;
   if (actor.role === "customer") {
-    return `${base}\nالمتحدث معك عميل اسمه "${actor.name}". طرق الدفع: عند التوصيل (نقدًا عند الاستلام أو حوالة)، وعند الاستلام الشخصي (الدفع عند المورد أو حوالة)، والآجل لمن فُعّل له. الإرجاع يتم عن طريق الإدارة فقط.`;
+    return `${base}\nالمتحدث معك عميل اسمه "${safeName(actor.name)}". طرق الدفع: عند التوصيل (نقدًا عند الاستلام أو حوالة)، وعند الاستلام الشخصي (الدفع عند المورد أو حوالة)، والآجل لمن فُعّل له. الإرجاع يتم عن طريق الإدارة فقط.`;
   }
   if (actor.role === "supplier") {
-    return `${base}\nالمتحدث معك مورد اسمه "${actor.name}". تأكيد التوفر وتحديث الكميات وتعديل الأسعار من التطبيق حاليًا، مش من هنا.`;
+    return `${base}\nالمتحدث معك مورد اسمه "${safeName(actor.name)}". تأكيد التوفر وتحديث الكميات وتعديل الأسعار من التطبيق حاليًا، مش من هنا.`;
   }
   return `${base}\nالمتحدث معك مدير المنصة. أعطه الأرقام مباشرة وبإيجاز. هذه المرحلة قراءة فقط: لو طلب اعتماد أو تغيير قل له يعملها من لوحة الإدارة.`;
 }
@@ -458,7 +478,7 @@ async function logMessage(actor, phone, textIn, textOut) {
 
 /* --------------------------------- النقطة --------------------------------- */
 agentRouter.post("/whatsapp", asyncRoute(async (req, res) => {
-  if (!process.env.WHATSAPP_SECRET_KEY || req.headers["x-secret-key"] !== process.env.WHATSAPP_SECRET_KEY) {
+  if (!secretOk(req.headers["x-secret-key"])) {
     return res.status(401).json({ error: "مفتاح غير صحيح" });
   }
   if (!process.env.ANTHROPIC_API_KEY) {

@@ -27,8 +27,24 @@ const app = express();
 
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(",") ?? true, credentials: true }));
-app.use(express.json({ limit: "2mb" }));
+// CORS: قائمة بيضاء فقط. لو ALLOWED_ORIGINS مضبوط (مفصولة بفواصل) نستعمله، وإلا نستعمل
+// تطبيقات الإنتاج الأربعة + عناوين التطوير المحلي. الطلبات بدون Origin (سيرفس واتساب، curl) ما تتأثر.
+const DEFAULT_ORIGINS = [
+  "https://jomla-customer-beta.vercel.app",
+  "https://jomla-supplier.vercel.app",
+  "https://jomla-admin-omega.vercel.app",
+  "https://jomla-driver.vercel.app",
+  "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176",
+  "http://localhost:4173", "http://localhost:3000",
+  "http://127.0.0.1:5173", "http://127.0.0.1:3000",
+];
+const envOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = new Set(envOrigins.length ? envOrigins : DEFAULT_ORIGINS);
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.has(origin)),
+  credentials: true,
+}));
+app.use(express.json({ limit: "2mb" }) /* الاستيراد الجماعي للأصناف يحتاج هذا الحجم */);
 app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.path}`); next(); });
 app.use(rateLimit({ windowMs: 60_000, max: 300 }));
 app.use("/uploads", express.static(process.env.UPLOAD_DIR || "uploads"));

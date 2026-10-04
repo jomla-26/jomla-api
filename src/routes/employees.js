@@ -1,11 +1,67 @@
 import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
-import { ApiError, asyncRoute } from "../lib/helpers.js";
-import { authenticate, requirePermission, requireAnyPermission } from "../middleware/auth.js";
+import { ApiError, asyncRoute, normalizePhone } from "../lib/helpers.js";
+import {
+  authenticate, requirePermission, requireAnyPermission,
+  getEffectivePermissionCodes, getEmployeeSectionScope,
+  stripSecrets, invalidateAuthCache,
+} from "../middleware/auth.js";
 
 export const employeeRouter = Router();
 employeeRouter.use(authenticate);
+
+const GM_ROLE = "general_manager";
+
+function pageParams(req, defLimit = 200, maxLimit = 1000) {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || defLimit, 1), maxLimit);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  return { limit, offset };
+}
+
+// الهاتف يُخزَّن بنفس صيغة تسجيل الدخول (normalizePhone) عشان الدخول بالـ OTP يلقاه دايمًا
+function cleanPhone(raw) {
+  const phone = normalizePhone(raw);
+  if (phone.length < 9 || phone.length > 15) throw new ApiError(400, "رقم الهاتف غير صالح");
+  return phone;
+}
+
+/* ---------------------------- حماية رفع الصلاحيات ---------------------------- */
+
+// الموظف ما يقدرش يدير موظف صلاحياته الفعلية أعلى من صلاحياته هو (يمنع تعديل/تعطيل/نقل رقم المدير العام)
+async function assertCanManageTarget(callerPerms, targetId) {
+  const target = await getEffectivePermissionCodes(targetId);
+  for (const code of target) {
+    if (!callerPerms.has(code)) {
+      throw new ApiError(403, "لا تملك صلاحية التعديل على موظف صلاحياته أعلى من صلاحياتك");
+    }
+  }
+}
+
+// ما يقدرش يمنح وظيفة فيها صلاحيات هو نفسه ما يملكها
+async function assertCanGrantRole(callerPerms, roleId) {
+  const { rows } = await query(
+    `SELECT p.code FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = $1`,
+    [roleId]
+  );
+  for (const r of rows) {
+    if (!callerPerms.has(r.code)) {
+      throw new ApiError(403, "لا يمكنك منح وظيفة تتضمن صلاحيات لا تملكها أنت");
+    }
+  }
+}
+
+// آخر مدير عام نشط ما يتعطّل ولا يتغيّر دوره. نقفل صفوف المديرين النشطين لمنع تعطيل اثنين بالتوازي.
+async function assertNotLastGeneralManager(client, targetId) {
+  const { rows } = await client.query(
+    `SELECT e.id FROM employees e JOIN roles r ON r.id = e.role_id
+      WHERE r.code = $1 AND e.is_active ORDER BY e.id FOR UPDATE OF e`,
+    [GM_ROLE]
+  );
+  if (rows.some((r) => r.id === targetId) && rows.length <= 1) {
+    throw new ApiError(409, "لا يمكن تعطيل أو تغيير آخر مدير عام نشط في المنظومة");
+  }
+}
 
 employeeRouter.get("/roles", asyncRoute(async (_req, res) => {
   const { rows } = await query(`SELECT code, name FROM roles ORDER BY name`);
@@ -17,35 +73,44 @@ employeeRouter.get("/", requireAnyPermission("employees.manage", "finance.salari
   const activeFilter = status === "inactive" ? "NOT e.is_active"
     : status === "all" ? "TRUE"
     : "e.is_active";
+  const pg = pageParams(req);
 
   const { rows } = await query(
     `SELECT e.id, e.name, e.phone, e.monthly_salary, e.started_on, e.last_login_at, e.is_active,
             r.code AS role_code, r.name AS role_name
        FROM employees e JOIN roles r ON r.id = e.role_id
       WHERE ${activeFilter}
-      ORDER BY e.name`
+      ORDER BY e.name
+      LIMIT $1 OFFSET $2`,
+    [pg.limit, pg.offset]
   );
   res.json(rows);
 }));
 
 const createSchema = z.object({
-  name: z.string().min(2),
-  phone: z.string().min(9),
-  roleCode: z.string(),
-  monthlySalary: z.number().nonnegative(),
+  name: z.string().trim().min(2).max(120),
+  phone: z.string().min(9).max(20),
+  roleCode: z.string().max(60),
+  monthlySalary: z.number().nonnegative().max(10_000_000),
 });
 
 employeeRouter.post("/", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = createSchema.parse(req.body);
+  const phone = cleanPhone(body.phone);
+  const callerPerms = await getEffectivePermissionCodes(req.actor.id);
 
   const employee = await withTransaction(async (client) => {
     const role = await client.query(`SELECT id, name FROM roles WHERE code = $1`, [body.roleCode]);
     if (!role.rows.length) throw new ApiError(400, "الوظيفة غير معروفة");
+    await assertCanGrantRole(callerPerms, role.rows[0].id);
+
+    const dup = await client.query(`SELECT id FROM employees WHERE phone = $1`, [phone]);
+    if (dup.rows.length) throw new ApiError(409, "رقم الهاتف مسجّل مسبقًا لموظف آخر");
 
     const { rows } = await client.query(
       `INSERT INTO employees (name, phone, role_id, monthly_salary)
        VALUES ($1,$2,$3,$4) RETURNING id, name, phone, monthly_salary, started_on`,
-      [body.name, body.phone, role.rows[0].id, body.monthlySalary]
+      [body.name, phone, role.rows[0].id, body.monthlySalary]
     );
     const created = { ...rows[0], role_code: body.roleCode, role_name: role.rows[0].name };
 
@@ -62,29 +127,51 @@ employeeRouter.post("/", requirePermission("employees.manage"), asyncRoute(async
 
 employeeRouter.patch("/:id", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
-    name: z.string().min(2).optional(),
-    phone: z.string().min(9).optional(),
-    roleCode: z.string().optional(),
-    monthlySalary: z.number().nonnegative().optional(),
+    name: z.string().trim().min(2).max(120).optional(),
+    phone: z.string().min(9).max(20).optional(),
+    roleCode: z.string().max(60).optional(),
+    monthlySalary: z.number().nonnegative().max(10_000_000).optional(),
     isActive: z.boolean().optional(),
   }).parse(req.body);
 
   if (Object.keys(body).length === 0) {
     throw new ApiError(400, "لا توجد بيانات للتعديل");
   }
+  const phone = body.phone !== undefined ? cleanPhone(body.phone) : null;
+  const isSelf = req.params.id === req.actor.id;
+  const callerPerms = await getEffectivePermissionCodes(req.actor.id);
+  if (!isSelf) await assertCanManageTarget(callerPerms, req.params.id);
 
   const updated = await withTransaction(async (client) => {
     const before = await client.query(
-      `SELECT e.*, r.code AS role_code FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1 FOR UPDATE`,
+      `SELECT e.*, r.code AS role_code FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1 FOR UPDATE OF e`,
       [req.params.id]
     );
     if (!before.rows.length) throw new ApiError(404, "الموظف غير موجود");
+    const prev = before.rows[0];
 
-    let roleId = before.rows[0].role_id;
-    if (body.roleCode) {
+    let roleId = prev.role_id;
+    const roleChanging = body.roleCode !== undefined && body.roleCode !== prev.role_code;
+    if (roleChanging) {
+      if (isSelf) throw new ApiError(403, "لا يمكنك تغيير وظيفتك بنفسك");
       const role = await client.query(`SELECT id FROM roles WHERE code = $1`, [body.roleCode]);
       if (!role.rows.length) throw new ApiError(400, "الوظيفة غير معروفة");
+      await assertCanGrantRole(callerPerms, role.rows[0].id);
       roleId = role.rows[0].id;
+    }
+    if (isSelf && body.isActive === false) throw new ApiError(403, "لا يمكنك تعطيل حسابك بنفسك");
+    if (isSelf && body.monthlySalary !== undefined && Number(body.monthlySalary) !== Number(prev.monthly_salary)) {
+      throw new ApiError(403, "لا يمكنك تعديل راتبك بنفسك");
+    }
+
+    if ((body.isActive === false && prev.is_active) || (roleChanging && prev.role_code === GM_ROLE)) {
+      await assertNotLastGeneralManager(client, req.params.id);
+    }
+
+    const phoneChanged = phone !== null && phone !== prev.phone;
+    if (phoneChanged) {
+      const dup = await client.query(`SELECT id FROM employees WHERE phone = $1 AND id != $2`, [phone, req.params.id]);
+      if (dup.rows.length) throw new ApiError(409, "رقم الهاتف مسجّل مسبقًا لموظف آخر");
     }
 
     const { rows } = await client.query(
@@ -93,29 +180,38 @@ employeeRouter.patch("/:id", requirePermission("employees.manage"), asyncRoute(a
          phone          = COALESCE($3, phone),
          role_id        = $4,
          monthly_salary = COALESCE($5, monthly_salary),
-         is_active      = COALESCE($6, is_active)
+         is_active      = COALESCE($6, is_active),
+         otp_hash       = CASE WHEN $7::BOOLEAN THEN NULL ELSE otp_hash END,
+         otp_expires_at = CASE WHEN $7::BOOLEAN THEN NULL ELSE otp_expires_at END,
+         otp_attempts   = CASE WHEN $7::BOOLEAN THEN 0 ELSE otp_attempts END
        WHERE id = $1
        RETURNING id, name, phone, monthly_salary, is_active, started_on, role_id`,
-      [req.params.id, body.name ?? null, body.phone ?? null, roleId,
-       body.monthlySalary ?? null, body.isActive ?? null]
+      [req.params.id, body.name ?? null, phone, roleId,
+       body.monthlySalary ?? null, body.isActive ?? null, phoneChanged]
     );
 
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "employee.updated", entityType: "employee", entityId: req.params.id,
-      entityLabel: rows[0].name, before: before.rows[0], after: rows[0], ip: req.ip,
+      entityLabel: rows[0].name, before: stripSecrets(prev), after: rows[0], ip: req.ip,
     });
     return rows[0];
   });
 
+  invalidateAuthCache("employee", req.params.id);
   res.json(updated);
 }));
 
 // "حذف" الموظف = تعطيله، عشان جداول attendance وemployee_reviews مربوطة بـ employee_id
 employeeRouter.delete("/:id", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  if (req.params.id === req.actor.id) throw new ApiError(403, "لا يمكنك تعطيل حسابك بنفسك");
+  const callerPerms = await getEffectivePermissionCodes(req.actor.id);
+  await assertCanManageTarget(callerPerms, req.params.id);
+
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "الموظف غير موجود");
+    if (before.rows[0].is_active) await assertNotLastGeneralManager(client, req.params.id);
 
     const { rows } = await client.query(
       `UPDATE employees SET is_active = FALSE WHERE id = $1 RETURNING id, name, is_active`,
@@ -125,11 +221,12 @@ employeeRouter.delete("/:id", requirePermission("employees.manage"), asyncRoute(
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "employee.deactivated", entityType: "employee", entityId: req.params.id,
-      entityLabel: before.rows[0].name, before: before.rows[0], after: rows[0], ip: req.ip,
+      entityLabel: before.rows[0].name, before: stripSecrets(before.rows[0]), after: rows[0], ip: req.ip,
     });
     return rows[0];
   });
 
+  invalidateAuthCache("employee", req.params.id);
   res.json(result);
 }));
 
@@ -183,6 +280,23 @@ employeeRouter.patch("/:id/permissions", requirePermission("employees.manage"), 
     })),
   }).parse(req.body);
 
+  // الموظف ما يعدّل صلاحياته الفردية بنفسه، ولا يمنح صلاحية لا يملكها
+  if (req.params.id === req.actor.id) throw new ApiError(403, "لا يمكنك تعديل صلاحياتك بنفسك");
+  const callerPerms = await getEffectivePermissionCodes(req.actor.id);
+  await assertCanManageTarget(callerPerms, req.params.id);
+  const targetRoleCodes = new Set((await query(
+    `SELECT p.code FROM employees e
+       JOIN role_permissions rp ON rp.role_id = e.role_id
+       JOIN permissions p ON p.id = rp.permission_id
+      WHERE e.id = $1`, [req.params.id])).rows.map((r) => r.code));
+  for (const o of body.overrides) {
+    // منح صراحةً، أو إلغاء استثناء سحب كان يمنع صلاحية الدور = منح فعلي
+    const effectivelyGrants = o.granted === true || (o.granted === null && targetRoleCodes.has(o.permissionCode));
+    if (effectivelyGrants && !callerPerms.has(o.permissionCode)) {
+      throw new ApiError(403, "لا يمكنك منح صلاحية لا تملكها أنت");
+    }
+  }
+
   const result = await withTransaction(async (client) => {
     const emp = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!emp.rows.length) throw new ApiError(404, "الموظف غير موجود");
@@ -222,6 +336,7 @@ employeeRouter.patch("/:id/permissions", requirePermission("employees.manage"), 
     return Object.fromEntries(overrides.rows.map((o) => [o.code, o.granted]));
   });
 
+  invalidateAuthCache("employee", req.params.id);
   res.json({ overrides: result });
 }));
 
@@ -243,7 +358,16 @@ employeeRouter.get("/:id/section-scope", requirePermission("employees.manage"), 
 
 // تحديث نطاق الأقسام: sectionIds فاضية = إلغاء التقييد بالكامل (يرجع موظف عادي غير مقيّد)
 employeeRouter.patch("/:id/section-scope", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
-  const { sectionIds } = z.object({ sectionIds: z.array(z.string().uuid()) }).parse(req.body);
+  const { sectionIds } = z.object({ sectionIds: z.array(z.string().uuid()).max(500) }).parse(req.body);
+
+  // ما يعدّل نطاقه بنفسه، وموظف مقيّد ما يقدر يوسّع/يلغي التقييد ولا يمنح أقسامًا خارج نطاقه
+  if (req.params.id === req.actor.id) throw new ApiError(403, "لا يمكنك تعديل نطاق أقسامك بنفسك");
+  const callerPerms = await getEffectivePermissionCodes(req.actor.id);
+  await assertCanManageTarget(callerPerms, req.params.id);
+  const callerScope = await getEmployeeSectionScope(req.actor.id);
+  if (callerScope !== null && (!sectionIds.length || !sectionIds.every((id) => callerScope.has(id)))) {
+    throw new ApiError(403, "لا تملك صلاحية على أحد الأقسام المطلوبة");
+  }
 
   const result = await withTransaction(async (client) => {
     const emp = await client.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [req.params.id]);
@@ -303,13 +427,15 @@ employeeRouter.post("/:id/attendance", requirePermission("employees.manage"), as
 
 employeeRouter.get("/:id/attendance", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
   const { from, to } = req.query;
+  const pg = pageParams(req, 400);
   const { rows } = await query(
     `SELECT * FROM attendance
       WHERE employee_id = $1
         AND ($2::DATE IS NULL OR work_date >= $2)
         AND ($3::DATE IS NULL OR work_date <= $3)
-      ORDER BY work_date DESC`,
-    [req.params.id, from || null, to || null]
+      ORDER BY work_date DESC
+      LIMIT $4 OFFSET $5`,
+    [req.params.id, from || null, to || null, pg.limit, pg.offset]
   );
   res.json(rows);
 }));
@@ -339,8 +465,10 @@ employeeRouter.post("/:id/reviews", requirePermission("employees.manage"), async
 }));
 
 employeeRouter.get("/:id/reviews", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
+  const pg = pageParams(req);
   const { rows } = await query(
-    `SELECT * FROM employee_reviews WHERE employee_id = $1 ORDER BY period_end DESC`, [req.params.id]
+    `SELECT * FROM employee_reviews WHERE employee_id = $1 ORDER BY period_end DESC LIMIT $2 OFFSET $3`,
+    [req.params.id, pg.limit, pg.offset]
   );
   res.json(rows);
 }));

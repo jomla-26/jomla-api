@@ -2,27 +2,19 @@ import { Router } from "express";
 import { z } from "zod";
 import { query, pool, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolveTreasuryCode } from "../lib/helpers.js";
-import { authenticate, requirePermission } from "../middleware/auth.js";
-import { queueNotification } from "../lib/notify.js";
+import { authenticate, requirePermission, requireAnyPermission } from "../middleware/auth.js";
+import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 
 export const engagementRouter = Router();
 engagementRouter.use(authenticate);
 
-async function assertThreadAccess(actor, orderId, threadType, orderSupplierId) {
-  if (actor.type === "employee") return;
-  if (actor.type === "customer" && threadType === "customer_support") {
-    const { rows } = await query(`SELECT 1 FROM orders WHERE id = $1 AND customer_id = $2`, [orderId, actor.id]);
-    if (!rows.length) throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
-    return;
-  }
-  if (actor.type === "supplier" && threadType === "supplier_admin") {
-    const { rows } = await query(
-      `SELECT 1 FROM order_suppliers WHERE id = $1 AND supplier_id = $2`, [orderSupplierId, actor.id]
+// صلاحية الموظف على محادثات الطلبيات: أي صلاحية "طلبيات" (مراجعة/إلغاء/مرتجعات/إسناد مندوب)
+function assertEmployeeOrdersAccess(req) {
+  return new Promise((resolve, reject) => {
+    requireAnyPermission("orders.review", "orders.cancel", "orders.returns", "orders.assign_driver")(
+      req, null, (err) => (err ? reject(err) : resolve())
     );
-    if (!rows.length) throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
-    return;
-  }
-  throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
+  });
 }
 
 // المحادثة إما مع العميل (customer_support) أو مع مورد معيّن (supplier_admin).
@@ -34,10 +26,46 @@ function resolveThreadType(actor, orderSupplierId) {
   return "customer_support";
 }
 
+// يتحقق من أن الطرف مشارك فعلًا في هذه المحادثة، ويعيد orderSupplierId النهائي (للمورد يُستنتج من الطلبية لو ما أُرسل).
+// - العميل: صاحب الطلبية فقط، وفي محادثة الدعم فقط
+// - المورد: لازم له جزء (order_suppliers) في هذه الطلبية، وفي محادثته هو فقط
+// - الموظف: بصلاحية طلبيات؛ وأي orderSupplierId لازم يتبع نفس الطلبية
+// - المندوب وأي نوع آخر: ممنوع (الكود الحالي ما يقصد فتح المحادثة للمناديب)
+async function assertThreadAccess(req, orderId, threadType, orderSupplierId) {
+  const actor = req.actor;
+  const { rows: ord } = await query(`SELECT id, customer_id, order_number FROM orders WHERE id = $1`, [orderId]);
+  if (!ord.length) throw new ApiError(404, "الطلبية غير موجودة");
+  const deny = () => new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
+
+  if (actor.type === "employee") {
+    await assertEmployeeOrdersAccess(req);
+    if (threadType === "supplier_admin") {
+      const { rows } = await query(`SELECT 1 FROM order_suppliers WHERE id = $1 AND order_id = $2`, [orderSupplierId, orderId]);
+      if (!rows.length) throw new ApiError(400, "فاتورة المورد لا تتبع هذه الطلبية");
+    }
+    return { orderSupplierId: threadType === "supplier_admin" ? orderSupplierId : null, order: ord[0] };
+  }
+
+  if (actor.type === "customer") {
+    if (threadType !== "customer_support" || ord[0].customer_id !== actor.id) throw deny();
+    return { orderSupplierId: null, order: ord[0] };
+  }
+
+  if (actor.type === "supplier") {
+    const { rows } = await query(
+      `SELECT id FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2`, [orderId, actor.id]
+    );
+    if (!rows.length) throw deny();
+    if (orderSupplierId && orderSupplierId !== rows[0].id) throw deny();
+    return { orderSupplierId: rows[0].id, order: ord[0] };
+  }
+
+  throw deny(); // مندوب أو غيره
+}
+
 engagementRouter.get("/orders/:orderId/messages", asyncRoute(async (req, res) => {
-  const orderSupplierId = req.query.orderSupplierId || null;
-  const threadType = resolveThreadType(req.actor, orderSupplierId);
-  await assertThreadAccess(req.actor, req.params.orderId, threadType, orderSupplierId);
+  const threadType = resolveThreadType(req.actor, req.query.orderSupplierId || null);
+  const { orderSupplierId } = await assertThreadAccess(req, req.params.orderId, threadType, req.query.orderSupplierId || null);
 
   const { rows } = await query(
     `SELECT * FROM order_messages
@@ -50,47 +78,53 @@ engagementRouter.get("/orders/:orderId/messages", asyncRoute(async (req, res) =>
 }));
 
 const messageSchema = z.object({
-  body: z.string().min(1),
+  body: z.string().trim().min(1, "الرسالة فارغة").max(2000, "الرسالة طويلة جدًا — الحد الأقصى 2000 حرف"),
   orderSupplierId: z.string().uuid().optional(),
 });
 
 engagementRouter.post("/orders/:orderId/messages", asyncRoute(async (req, res) => {
   const parsed = messageSchema.parse(req.body);
-  const threadType = resolveThreadType(req.actor, parsed.orderSupplierId || null);
-  await assertThreadAccess(req.actor, req.params.orderId, threadType, parsed.orderSupplierId || null);
+  const requestedOs = parsed.orderSupplierId || null;
+  const threadType = resolveThreadType(req.actor, requestedOs);
+  const { orderSupplierId, order } = await assertThreadAccess(req, req.params.orderId, threadType, requestedOs);
 
   const { rows } = await query(
     `INSERT INTO order_messages
        (order_id, order_supplier_id, thread_type, sender_type, sender_id, sender_name, body)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [req.params.orderId, parsed.orderSupplierId ?? null, threadType,
+    [req.params.orderId, orderSupplierId, threadType,
      req.actor.type, req.actor.id, req.actor.name, parsed.body]
   );
 
-  if (req.actor.type === "employee") {
-    if (threadType === "customer_support") {
-      const o = await query(`SELECT customer_id, order_number FROM orders WHERE id = $1`, [req.params.orderId]);
-      if (o.rows.length) {
+  // الإشعارات ثانوية: فشلها ما يمنع وصول الرسالة
+  try {
+    if (req.actor.type === "employee") {
+      if (threadType === "customer_support") {
         await queueNotification(pool, {
           templateCode: "message.received", recipientType: "customer",
-          recipientId: o.rows[0].customer_id, orderId: req.params.orderId,
-          vars: { order_number: o.rows[0].order_number },
+          recipientId: order.customer_id, orderId: req.params.orderId,
+          vars: { order_number: order.order_number },
         });
+      } else {
+        const os = await query(`SELECT supplier_id FROM order_suppliers WHERE id = $1`, [orderSupplierId]);
+        if (os.rows.length) {
+          await queueNotification(pool, {
+            templateCode: "message.received", recipientType: "supplier",
+            recipientId: os.rows[0].supplier_id, orderId: req.params.orderId,
+            vars: { order_number: order.order_number },
+          });
+        }
       }
-    } else if (parsed.orderSupplierId) {
-      const os = await query(
-        `SELECT os.supplier_id, o.order_number FROM order_suppliers os
-           JOIN orders o ON o.id = os.order_id WHERE os.id = $1`,
-        [parsed.orderSupplierId]
-      );
-      if (os.rows.length) {
-        await queueNotification(pool, {
-          templateCode: "message.received", recipientType: "supplier",
-          recipientId: os.rows[0].supplier_id, orderId: req.params.orderId,
-          vars: { order_number: os.rows[0].order_number },
-        });
-      }
+    } else {
+      // العميل أو المورد كتب → ينبَّه موظفو الطلبيات داخل لوحة الإدارة (بدون واتساب)
+      await notifyStaffWithPermission(pool, {
+        permissionCode: "orders.review", templateCode: "message.staff_received",
+        orderId: req.params.orderId,
+        vars: { order_number: order.order_number, sender: req.actor.name || (req.actor.type === "supplier" ? "مورد" : "عميل") },
+      });
     }
+  } catch (e) {
+    console.error("[CHAT_NOTIFY]", e);
   }
 
   res.status(201).json(rows[0]);
@@ -101,7 +135,7 @@ const feedbackSchema = z.object({
   rating: z.number().int().min(1).max(5).optional(),
   about: z.enum(["delivery", "supplier", "quality", "service"]).optional(),
   supplierId: z.string().uuid().optional(),
-  comment: z.string().optional(),
+  comment: z.string().trim().max(1000, "الملاحظة طويلة جدًا — الحد الأقصى 1000 حرف").optional(),
 });
 
 engagementRouter.post("/feedback", asyncRoute(async (req, res) => {
@@ -114,12 +148,30 @@ engagementRouter.post("/feedback", asyncRoute(async (req, res) => {
   );
   if (!order.rows.length) throw new ApiError(400, "لا يمكن التقييم إلا بعد تسليم الطلبية");
 
-  const { rows } = await query(
-    `INSERT INTO order_feedback (order_id, customer_id, rating, about, supplier_id, comment)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [body.orderId, req.actor.id, body.rating ?? null, body.about ?? null, body.supplierId ?? null, body.comment ?? null]
+  // المورد المقيَّم لازم يكون أحد موردي هذه الطلبية فعلًا
+  if (body.supplierId) {
+    const sup = await query(
+      `SELECT 1 FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2`, [body.orderId, body.supplierId]
+    );
+    if (!sup.rows.length) throw new ApiError(400, "هذا المورد ليس من موردي هذه الطلبية");
+  }
+
+  const already = await query(
+    `SELECT 1 FROM order_feedback WHERE order_id = $1 AND customer_id = $2`, [body.orderId, req.actor.id]
   );
-  res.status(201).json(rows[0]);
+  if (already.rows.length) throw new ApiError(409, "سبق أن أرسلت تقييمك لهذه الطلبية");
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO order_feedback (order_id, customer_id, rating, about, supplier_id, comment)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [body.orderId, req.actor.id, body.rating ?? null, body.about ?? null, body.supplierId ?? null, body.comment || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e?.code === "23505") throw new ApiError(409, "سبق أن أرسلت تقييمك لهذه الطلبية");
+    throw e;
+  }
 }));
 
 engagementRouter.get("/feedback", requirePermission("orders.review"), asyncRoute(async (req, res) => {

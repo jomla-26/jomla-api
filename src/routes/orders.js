@@ -1,12 +1,71 @@
 import { Router } from "express";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
-import { restoreOrderStock, ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode } from "../lib/helpers.js";
-import { authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope, assertSectionScope } from "../middleware/auth.js";
+import {
+  restoreOrderStock, adjustStock, stockReasons, round2, round3,
+  ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode,
+} from "../lib/helpers.js";
+import {
+  authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
+} from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 
 export const orderRouter = Router();
 orderRouter.use(authenticate);
+
+/* ===================================================================
+   ثوابت وأدوات مشتركة
+=================================================================== */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (v) => typeof v === "string" && UUID_RE.test(v);
+
+// أي معرّف في المسار لازم يكون UUID صحيح — بدل ما يوصل لقاعدة البيانات ويطلع خطأ 500
+orderRouter.param("id", (_req, _res, next, id) =>
+  isUuid(id) ? next() : next(new ApiError(404, "غير موجود")));
+orderRouter.param("osId", (_req, _res, next, id) =>
+  isUuid(id) ? next() : next(new ApiError(404, "غير موجود")));
+orderRouter.param("itemId", (_req, _res, next, id) =>
+  isUuid(id) ? next() : next(new ApiError(404, "غير موجود")));
+
+const TERMINAL = ["delivered", "closed", "cancelled"];
+// حالات جزء المورد قبل تأكيد التوفر (المخزون لسا ما اتخصمش)
+const PART_UNCONFIRMED = ["pending", "sent"];
+// صلاحيات تسمح لموظف بالاطلاع على الطلبيات (المندوب له مسار منفصل: طلبياته فقط)
+const STAFF_VIEW_PERMS = [
+  "orders.review", "orders.cancel", "orders.assign_driver", "orders.returns",
+  "finance.vouchers", "reports.view",
+];
+// طرق دفع يستلم فيها المورد المبلغ نقدًا عند تسليم الاستلام الشخصي
+const CASH_LIKE = ["pay_at_supplier", "cash", "card"];
+
+const STATUS_AR = {
+  draft: "مسودة", under_review: "قيد المراجعة", approved: "معتمدة",
+  sent_to_supplier: "مرسلة إلى المورد", supplier_preparing: "قيد التجهيز",
+  shortage: "يوجد نقص", ready: "جاهزة", ready_for_delivery: "جاهزة للتوصيل",
+  ready_for_pickup: "جاهزة للاستلام", assigned_to_driver: "مسندة لمندوب",
+  out_for_delivery: "في الطريق", awaiting_pickup: "بانتظار الاستلام",
+  delivered: "تم التسليم", closed: "مقفولة", postponed: "مؤجلة", cancelled: "ملغاة",
+};
+const statusAr = (s) => STATUS_AR[s] || s;
+
+// وحدات تُباع بالكسور (وزن/حجم/طول) — غيرها لازم تكون كمية صحيحة
+const FRACTIONAL_UNIT_RE = /(كغ|كجم|كيلو|كلغ|غرام|جرام|غم|لتر|متر|طن|\bkg\b|\bg\b|\bl\b|\bm\b|liter|litre|meter|metre|ton)/i;
+const isFractionalUnit = (u) => FRACTIONAL_UNIT_RE.test(String(u || ""));
+const MAX_LINE_QTY = 100000;
+
+function assertQtyForUnit(qty, unit, label) {
+  if (!(qty > 0) || qty > MAX_LINE_QTY) throw new ApiError(400, `كمية غير صالحة للصنف: ${label}`);
+  if (!isFractionalUnit(unit) && !Number.isInteger(qty)) {
+    throw new ApiError(400, `الكمية لازم تكون رقم صحيح للصنف: ${label}`);
+  }
+}
+
+function parsePaging(q) {
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 200, 1), 500);
+  const offset = Math.max(parseInt(q.offset, 10) || 0, 0);
+  return { limit, offset };
+}
 
 async function recordStatus(client, { orderId, orderSupplierId = null, from, to, actor, note = null }) {
   await client.query(
@@ -16,197 +75,520 @@ async function recordStatus(client, { orderId, orderSupplierId = null, from, to,
     [orderId, orderSupplierId, from, to, actor.id, actor.name, note]
   );
 }
+
+// هل الموظف عنده أي صلاحية من القائمة فعليًا (مع احترام الاستثناءات الفردية وحالة الحساب)
+async function employeeHasAny(employeeId, codes) {
+  const { rows } = await query(
+    `SELECT 1
+       FROM permissions p
+      WHERE p.code = ANY($2::TEXT[])
+        AND EXISTS (SELECT 1 FROM employees WHERE id = $1 AND is_active)
+        AND COALESCE(
+              (SELECT o.granted FROM employee_permission_overrides o
+                WHERE o.employee_id = $1 AND o.permission_id = p.id),
+              EXISTS (SELECT 1 FROM role_permissions rp JOIN employees e ON e.role_id = rp.role_id
+                       WHERE e.id = $1 AND rp.permission_id = p.id)
+            )
+      LIMIT 1`,
+    [employeeId, codes]
+  );
+  return rows.length > 0;
+}
+
+// نطاق الأقسام: موظف مقيّد بأقسام يتعامل بس مع الطلبيات اللي كل أصنافها ضمن نطاقه
+async function orderInEmployeeScope(employeeId, orderId) {
+  const scope = await getEmployeeSectionScope(employeeId);
+  if (scope === null) return true;
+  const { rows } = await query(
+    `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = $1`,
+    [orderId]
+  );
+  return rows.every((r) => scope.has(r.section_id));
+}
+
+const OUT_OF_SCOPE_MSG = "الطلبية تحتوي على صنف من قسم خارج نطاق صلاحياتك";
+
+const requireOrderScope = asyncRoute(async (req, _res, next) => {
+  if (req.actor.type === "employee" && !(await orderInEmployeeScope(req.actor.id, req.params.id))) {
+    throw new ApiError(403, OUT_OF_SCOPE_MSG);
+  }
+  next();
+});
+
 // نصيب جزء المورد من المبلغ المتبقي على العميل (للاستلام الشخصي).
 // لو الطلبية فيها أكثر من مورد والإدارة ما حددت مورد يستلم المتبقي: المتبقي يتقسم بنسبة قيمة كل جزء لسه ما اتسلمش،
 // وآخر جزء مفتوح ياخذ كل اللي فضل. لو الطلبية خالصة يرجع 0.
 function computePartDue(order, parts, part) {
   if (!part || part.pickup_confirmed || part.status === "cancelled") return 0;
-  const remaining = Math.max(0, Number(order.grand_total) - Number(order.paid_amount));
+  const remaining = Math.max(0, round2(Number(order.grand_total) - Number(order.paid_amount)));
   if (remaining <= 0) return 0;
   const open = parts.filter((p) => !p.pickup_confirmed && p.status !== "cancelled");
   const openTotal = open.reduce((sum, p) => sum + Number(p.subtotal || 0), 0);
-  if (open.length <= 1 || openTotal <= 0) return Math.round(remaining * 100) / 100;
+  if (open.length <= 1 || openTotal <= 0) return remaining;
   // لو الإدارة حددت مورد بعينه يستلم المتبقي كامل، هو بس اللي عليه التحصيل والباقي ما عليهم شي
   const collector = order.remaining_collector_id;
   if (collector && open.some((p) => p.supplier_id === collector)) {
-    return part.supplier_id === collector ? Math.round(remaining * 100) / 100 : 0;
+    return part.supplier_id === collector ? remaining : 0;
   }
-  return Math.round((remaining * Number(part.subtotal || 0) / openTotal) * 100) / 100;
+  return round2((remaining * Number(part.subtotal || 0)) / openTotal);
 }
 
-// إعادة حساب إجمالي كل جزء (مورد) وإجمالي الطلبية كاملة بعد أي تعديل على الأصناف
-async function recalcOrderTotals(client, orderId) {
+// المطلوب من المورد استلامه عند تسليم الاستلام الشخصي
+function partDueNow(order, parts, part) {
+  if (order.fulfillment !== "pickup" || !part || part.pickup_confirmed || part.status === "cancelled") return 0;
+  if (CASH_LIKE.includes(order.payment_method)) return round2(part.subtotal);
+  if (order.payment_method === "deferred") return 0;
+  return computePartDue(order, parts, part);
+}
+
+// المبلغ المطلوب تحصيله من المندوب عند التسليم (المتبقي على العميل، أو العربون للآجل)
+function computeCod(order) {
+  const remaining = Math.max(0, round2(Number(order.grand_total) - Number(order.paid_amount)));
+  if (order.payment_method === "deferred") {
+    return Math.min(remaining, Math.max(0, Number(order.deposit_due_at_delivery || 0)));
+  }
+  return remaining;
+}
+
+// حذف أجزاء الموردين الفاضية (بعد حذف كل أصنافها). السجلات المرتبطة (سجل الحالة/الرسائل) نفك ارتباطها
+// أولًا؛ ولو فشل الحذف لأي قيد آخر نكتفي بتعليم الجزء "ملغى" بدل ما نفشّل العملية كلها
+async function removeEmptyParts(client, orderId) {
+  const { rows: empty } = await client.query(
+    `SELECT os.id FROM order_suppliers os
+      WHERE os.order_id = $1 AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_supplier_id = os.id)`,
+    [orderId]
+  );
+  for (const { id } of empty) {
+    await client.query("SAVEPOINT rm_empty_part");
+    try {
+      await client.query(`UPDATE order_status_history SET order_supplier_id = NULL WHERE order_supplier_id = $1`, [id]);
+      await client.query(`UPDATE order_messages SET order_supplier_id = NULL WHERE order_supplier_id = $1`, [id]);
+      await client.query(`DELETE FROM order_suppliers WHERE id = $1`, [id]);
+      await client.query("RELEASE SAVEPOINT rm_empty_part");
+    } catch {
+      await client.query("ROLLBACK TO SAVEPOINT rm_empty_part");
+      await client.query(`UPDATE order_suppliers SET status = 'cancelled', subtotal = 0 WHERE id = $1`, [id]);
+      await client.query("RELEASE SAVEPOINT rm_empty_part");
+    }
+  }
+}
+
+// إعادة حساب كل المبالغ بعد أي تعديل على الأصناف: إجمالي كل جزء، رسوم التوصيل (من الموردين
+// اللي لسا عندهم أصناف، إلا لو الإدارة عدّلتها يدويًا)، إجمالي الطلبية، حالة الدفع، والمطلوب من المندوب
+// refreshFee=false: يبقي رسوم التوصيل الحالية (مثلًا عند تأكيد توفر المورد — ما تغيّر شي في الموردين)
+async function recalcOrderTotals(client, orderId, { refreshFee = true } = {}) {
+  await removeEmptyParts(client, orderId);
+
   await client.query(
     `UPDATE order_suppliers os SET subtotal = sub.total
-       FROM (SELECT order_supplier_id, COALESCE(SUM(line_total),0) AS total
+       FROM (SELECT order_supplier_id, ROUND(COALESCE(SUM(line_total),0), 2) AS total
                FROM order_items WHERE order_id = $1 GROUP BY order_supplier_id) sub
       WHERE os.id = sub.order_supplier_id`,
     [orderId]
   );
-  await client.query(
-    `UPDATE orders o SET
-       items_subtotal = sub.total,
-       grand_total    = sub.total + o.delivery_fee
-     FROM (SELECT order_id, COALESCE(SUM(line_total),0) AS total
-             FROM order_items WHERE order_id = $1 GROUP BY order_id) sub
-     WHERE o.id = $1 AND sub.order_id = o.id`,
-    [orderId]
+
+  const { rows: [o] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [orderId]);
+  if (!o) return null;
+  const { rows: [agg] } = await client.query(
+    `SELECT ROUND(COALESCE(SUM(line_total),0), 2) AS total FROM order_items WHERE order_id = $1`, [orderId]
   );
+  const itemsSubtotal = round2(agg.total);
+
+  let fee = Number(o.delivery_fee) || 0;
+  if (o.fulfillment !== "delivery") {
+    fee = 0;
+  } else if (refreshFee && !o.delivery_fee_overridden) {
+    const { rows: sup } = await client.query(
+      `SELECT DISTINCT os.supplier_id FROM order_suppliers os
+        WHERE os.order_id = $1 AND os.status <> 'cancelled'
+          AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_supplier_id = os.id)`,
+      [orderId]
+    );
+    const supplierIds = sup.map((r) => r.supplier_id);
+    fee = await calcDeliveryFee(client, {
+      zoneId: o.delivery_zone_id, vehicleTypeId: o.vehicle_type_id,
+      vehiclesCount: o.vehicles_count, supplierCount: supplierIds.length,
+      customerId: o.customer_id, supplierIds,
+    });
+  }
+
+  const grand = round2(itemsSubtotal + fee);
+  const paid = Number(o.paid_amount) || 0;
+  const paymentStatus = paid > 0 && paid >= grand ? "paid" : paid > 0 ? "partially_paid" : "unpaid";
   await client.query(
-    `UPDATE orders SET items_subtotal = 0, grand_total = delivery_fee
-      WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = $1)`,
-    [orderId]
+    `UPDATE orders SET items_subtotal = $2, delivery_fee = $3, grand_total = $4, payment_status = $5 WHERE id = $1`,
+    [orderId, itemsSubtotal, fee, grand, paymentStatus]
   );
+  if (["assigned_to_driver", "out_for_delivery"].includes(o.status)) {
+    await client.query(`UPDATE orders SET cod_amount = $2 WHERE id = $1`,
+      [orderId, computeCod({ ...o, grand_total: grand, paid_amount: paid })]);
+  }
+  return { itemsSubtotal, fee, grand };
 }
+
+// بعد حل أي نقص: لو ما بقاش نقص معلّق في فاتورة المورد نرجّع حالتها "قيد التجهيز" عشان يقدر يعلّمها جاهزة
+async function settlePartShortageStatus(client, orderSupplierId) {
+  if (!orderSupplierId) return;
+  const { rows: [pending] } = await client.query(
+    `SELECT COUNT(*)::INT AS remaining FROM order_shortages sh
+       JOIN order_items oi ON oi.id = sh.order_item_id
+      WHERE oi.order_supplier_id = $1 AND sh.resolved_at IS NULL`,
+    [orderSupplierId]
+  );
+  if (pending.remaining === 0) {
+    await client.query(
+      `UPDATE order_suppliers SET status = 'preparing' WHERE id = $1 AND status = 'shortage'`,
+      [orderSupplierId]
+    );
+  }
+}
+
+/* ---------- إشعارات الموردين (داخل التطبيق فقط — قوالب B-notifications.sql بدون واتساب) ---------- */
+
+// الموردون اللي وصلتهم الطلبية فعلًا (جزءهم ليس "pending") ولسا جزءهم فعّال — تُقرأ قبل تغيير حالة الأجزاء
+async function activeSupplierIds(client, orderId) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT supplier_id FROM order_suppliers
+      WHERE order_id = $1 AND status NOT IN ('pending','cancelled','closed','picked_up')`,
+    [orderId]
+  );
+  return rows.map((r) => r.supplier_id);
+}
+
+const reasonText = (reason) => (reason && String(reason).trim() ? ` (السبب: ${String(reason).trim()})` : "");
+
+async function notifySuppliers(client, { supplierIds, order, templateCode, reason = "", change = "" }) {
+  for (const supplierId of new Set(supplierIds || [])) {
+    await queueNotification(client, {
+      templateCode, recipientType: "supplier", recipientId: supplierId, orderId: order.id,
+      vars: { order_number: order.order_number, reason: reasonText(reason), change },
+    });
+  }
+}
+
+// الرصيد الحالي + قيمة الطلبية ما يتعداش سقف الآجل (نفس منطق دفتر العميل عند الاعتماد)
+async function assertCreditAllowed(client, customerId, grandTotal) {
+  // قفل على مستوى العميل: عشان طلبين/اعتمادين متزامنين ما يتجاوزوا السقف مع بعض
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`credit:${customerId}`]);
+  const cust = await client.query(`SELECT credit_enabled, credit_limit FROM customers WHERE id = $1`, [customerId]);
+  if (!cust.rows[0]?.credit_enabled) throw new ApiError(400, "البيع الآجل غير مفعّل لهذا العميل");
+  // سقف الآجل (0 = بدون سقف)
+  const limit = Number(cust.rows[0].credit_limit ?? 0);
+  if (limit > 0) {
+    const { rows: [bal] } = await client.query(
+      `SELECT COALESCE(SUM(debit),0)::numeric - COALESCE(SUM(credit),0)::numeric AS balance
+         FROM v_customer_ledger WHERE customer_id = $1`, [customerId]
+    );
+    const after = Number(bal.balance) + Number(grandTotal);
+    if (after > limit + 0.005) {
+      throw new ApiError(400, `تجاوز سقف الآجل: الرصيد الحالي ${Number(bal.balance).toFixed(2)} + الطلبية ${Number(grandTotal).toFixed(2)} أكبر من السقف ${limit.toFixed(2)} د.ل`);
+    }
+  }
+}
+
+/* ===================================================================
+   المخزون المتاح وقت الطلب
+   المتاح = المخزون − مجموع الكميات المطلوبة في طلبيات مفتوحة لسا ما اتأكدت (ما اتخصمتش)
+=================================================================== */
+
+// أقفال استشارية لكل صنف بترتيب ثابت (مرتبة) — تمنع طلبين متزامنين من حجز نفس الكمية
+async function lockStockForProducts(client, productIds) {
+  for (const id of [...new Set(productIds)].sort()) {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`stock:${id}`]);
+  }
+}
+
+// lines: [{ productId, variantId, qty, label }] — مدموجة (سطر واحد لكل صنف/نوع)
+async function assertStockAvailable(client, lines) {
+  if (!lines.length) return;
+  await lockStockForProducts(client, lines.map((l) => l.productId));
+
+  const productIds = [...new Set(lines.filter((l) => !l.variantId).map((l) => l.productId))];
+  const variantIds = [...new Set(lines.filter((l) => l.variantId).map((l) => l.variantId))];
+  // استعلام تجميعي واحد (لقطة واحدة) للمخزون والمحجوز معًا
+  const { rows } = await client.query(
+    `SELECT p.id AS product_id, NULL::uuid AS variant_id, p.stock_qty,
+            COALESCE((SELECT SUM(oi.qty_requested) FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                       WHERE oi.product_id = p.id AND oi.variant_id IS NULL AND oi.qty_confirmed IS NULL
+                         AND oi.order_supplier_id NOT IN (SELECT id FROM order_suppliers WHERE status = 'cancelled')
+                         AND o.status IN ('under_review','approved','sent_to_supplier','supplier_preparing','shortage')), 0) AS reserved
+       FROM products p WHERE p.id = ANY($1::uuid[])
+     UNION ALL
+     SELECT v.product_id, v.id, v.stock_qty,
+            COALESCE((SELECT SUM(oi.qty_requested) FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                       WHERE oi.variant_id = v.id AND oi.qty_confirmed IS NULL
+                         AND oi.order_supplier_id NOT IN (SELECT id FROM order_suppliers WHERE status = 'cancelled')
+                         AND o.status IN ('under_review','approved','sent_to_supplier','supplier_preparing','shortage')), 0)
+       FROM product_variants v WHERE v.id = ANY($2::uuid[])`,
+    [productIds, variantIds]
+  );
+  const map = new Map(rows.map((r) => [`${r.product_id}:${r.variant_id || ""}`, r]));
+  for (const l of lines) {
+    const r = map.get(`${l.productId}:${l.variantId || ""}`);
+    const stock = r ? Number(r.stock_qty) : 0;
+    const available = round3(stock - Number(r?.reserved || 0));
+    if (stock <= 0) throw new ApiError(400, `غير متوفر حاليًا: ${l.label}`);
+    if (available <= 0) throw new ApiError(400, `غير متوفر حاليًا (الكمية المتبقية محجوزة لطلبيات أخرى): ${l.label}`);
+    if (l.qty > available) {
+      throw new ApiError(400, `الكمية المطلوبة من ${l.label} أكبر من المتوفر حاليًا (${available})`);
+    }
+  }
+}
+
+/* ===================================================================
+   تجهيز أسطر الطلب (تحقق + دمج + تسعير) — مشترك بين الإنشاء والإضافة اليدوية
+=================================================================== */
+
+async function prepareLines(client, customerId, rawLines) {
+  // دمج السطور المكررة (نفس الصنف/النوع) قبل أي فحص — 5+5 تُفحص كـ 10
+  const merged = new Map();
+  for (const it of rawLines) {
+    const key = `${it.productId}:${it.variantId || ""}`;
+    const m = merged.get(key);
+    if (m) m.qty = round3(m.qty + it.qty);
+    else merged.set(key, { productId: it.productId, variantId: it.variantId || null, qty: round3(it.qty) });
+  }
+  const lines = [...merged.values()];
+
+  const { rows: prods } = await client.query(
+    `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
+            p.availability, p.is_active, p.approval_status, s.status AS supplier_status,
+            EXISTS (SELECT 1 FROM supplier_sections ss JOIN sections ps ON ps.id = p.section_id
+                     WHERE ss.supplier_id = p.supplier_id AND ss.section_id = COALESCE(ps.parent_id, ps.id)
+                       AND ss.enabled) AS supplier_section_enabled
+       FROM products p JOIN suppliers s ON s.id = p.supplier_id
+      WHERE p.id = ANY($1::uuid[])`,
+    [lines.map((l) => l.productId)]
+  );
+  const prodMap = new Map(prods.map((p) => [p.id, p]));
+
+  const variantIds = lines.filter((l) => l.variantId).map((l) => l.variantId);
+  const { rows: vars } = variantIds.length
+    ? await client.query(
+        `SELECT id, product_id, label, price, purchase_cost, is_active FROM product_variants WHERE id = ANY($1::uuid[])`,
+        [variantIds]
+      )
+    : { rows: [] };
+  const varMap = new Map(vars.map((v) => [v.id, v]));
+  const { rows: hv } = await client.query(
+    `SELECT DISTINCT product_id FROM product_variants WHERE product_id = ANY($1::uuid[]) AND is_active`,
+    [lines.map((l) => l.productId)]
+  );
+  const hasVariants = new Set(hv.map((r) => r.product_id));
+
+  const enriched = [];
+  for (const l of lines) {
+    const p = prodMap.get(l.productId);
+    if (!p || !p.is_active || p.approval_status !== "approved") {
+      throw new ApiError(404, `صنف غير متاح: ${p?.name ?? l.productId}`);
+    }
+    if (p.availability === "suspended") throw new ApiError(400, `الصنف موقوف مؤقتًا: ${p.name}`);
+    if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
+    if (!p.supplier_section_enabled) throw new ApiError(400, `قسم هذا الصنف معطّل عند المورد حاليًا: ${p.name}`);
+
+    let variant = null;
+    if (l.variantId) {
+      variant = varMap.get(l.variantId);
+      if (!variant || variant.product_id !== p.id || !variant.is_active) {
+        throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
+      }
+    } else if (hasVariants.has(p.id)) {
+      throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
+    }
+
+    const label = variant ? `${p.name} — ${variant.label}` : p.name;
+    assertQtyForUnit(l.qty, p.unit, label);
+    await assertCustomerSection(customerId, p.section_id);
+
+    const price = Number(await resolvePrice(client, {
+      productId: p.id, customerId, qty: l.qty, variantId: l.variantId || undefined,
+    }));
+    if (!Number.isFinite(price) || price < 0) throw new ApiError(400, `سعر غير صالح للصنف: ${label}`);
+
+    enriched.push({
+      productId: p.id, variantId: l.variantId || null, variantLabel: variant?.label ?? null,
+      supplier_id: p.supplier_id, unit: p.unit, supplier_sku: p.supplier_sku ?? null,
+      name: label, qty: l.qty, price,
+      purchase_cost: variant ? (variant.purchase_cost ?? p.purchase_cost) : p.purchase_cost,
+      lineTotal: round2(price * l.qty),
+    });
+  }
+  return enriched;
+}
+
+/* ===================================================================
+   عرض آمن للعميل (بدون حقول داخلية)
+=================================================================== */
+
+const CUSTOMER_ORDER_COLS = `o.id, o.order_number, o.status, o.fulfillment, o.payment_method, o.payment_status,
+  o.items_subtotal, o.delivery_fee, o.grand_total, o.paid_amount, o.delivery_zone_id, o.vehicle_type_id,
+  o.vehicles_count, o.deposit_due_at_delivery, o.deferred_due_date, o.cancel_reason, o.delivered_at, o.created_at`;
+const CUSTOMER_ORDER_FIELDS = CUSTOMER_ORDER_COLS.replace(/o\./g, "").split(",").map((s) => s.trim());
+function customerOrderView(row) {
+  const out = {};
+  for (const k of CUSTOMER_ORDER_FIELDS) out[k] = row[k];
+  if (row.supplierCount !== undefined) out.supplierCount = row.supplierCount;
+  if (row.duplicate) out.duplicate = true;
+  return out;
+}
+
+const DRIVER_ORDER_COLS = `${CUSTOMER_ORDER_COLS}, o.driver_id, o.assigned_at, o.cod_amount, o.cod_collected, o.cod_settled`;
+
+/* ===================================================================
+   إنشاء الطلبية (عميل / إدارة نيابةً عن عميل)
+=================================================================== */
 
 const createSchema = z.object({
   fulfillment: z.enum(["delivery", "pickup"]),
   paymentMethod: z.enum(["cash", "card", "transfer", "pay_at_supplier", "deferred"]),
   deliveryZoneId: z.string().uuid().optional(),
   vehicleTypeId: z.string().uuid().optional(),
-  vehiclesCount: z.number().int().min(1).default(1),
-  supplierNotes: z.record(z.string()).optional(),
+  vehiclesCount: z.number().int().min(1).max(50).default(1),
+  supplierNotes: z.record(z.string().max(1000)).optional(),
+  clientKey: z.string().uuid().optional(), // معرّف محاولة الإرسال — يمنع تكرار الطلب لو انقطع الاتصال وأُعيد الإرسال
   items: z.array(z.object({
     productId: z.string().uuid(),
-    qty: z.number().positive(),
+    qty: z.number().positive().max(MAX_LINE_QTY),
     variantId: z.string().uuid().optional(), // نوع الصنف (لون/مقاس/عبوة) لو الصنف عنده أنواع
-  })).min(1),
+  })).min(1).max(200),
 });
+
+async function createOrderCore(client, { customerId, body, actor, byAdmin, ip }) {
+  // 1) منع التكرار: نفس المفتاح لنفس العميل يرجّع الطلبية الموجودة
+  if (body.clientKey) {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`orderkey:${customerId}:${body.clientKey}`]);
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE customer_id = $1 AND client_key = $2`, [customerId, body.clientKey]
+    );
+    if (rows.length) {
+      const { rows: [{ n }] } = await client.query(
+        `SELECT COUNT(*)::INT AS n FROM order_suppliers WHERE order_id = $1`, [rows[0].id]
+      );
+      return { order: rows[0], supplierCount: n, duplicate: true };
+    }
+  }
+
+  // 2) حالة العميل
+  const { rows: [cust] } = await client.query(`SELECT status FROM customers WHERE id = $1`, [customerId]);
+  if (!cust) throw new ApiError(404, "العميل غير موجود");
+  if (cust.status !== "approved") throw new ApiError(403, "حسابك غير معتمد حاليًا — تواصل مع الإدارة");
+
+  // 3) توافق طريقة التسليم مع الدفع
+  let zoneId = null, vehicleTypeId = null, vehiclesCount = 1;
+  if (body.fulfillment === "delivery") {
+    if (!body.vehicleTypeId && !body.deliveryZoneId) {
+      throw new ApiError(400, "اختر نوع السيارة (أو منطقة التوصيل) للطلبات بالتوصيل");
+    }
+    if (body.paymentMethod === "pay_at_supplier") {
+      throw new ApiError(400, "الدفع عند المورد متاح للاستلام الشخصي فقط");
+    }
+    if (body.deliveryZoneId) {
+      const { rows } = await client.query(`SELECT is_active FROM delivery_zones WHERE id = $1`, [body.deliveryZoneId]);
+      if (!rows.length || rows[0].is_active === false) throw new ApiError(400, "منطقة التوصيل غير متاحة");
+      zoneId = body.deliveryZoneId;
+    }
+    if (body.vehicleTypeId) {
+      const { rows } = await client.query(`SELECT is_active FROM vehicle_types WHERE id = $1`, [body.vehicleTypeId]);
+      if (!rows.length || rows[0].is_active === false) throw new ApiError(400, "نوع السيارة غير متاح");
+      vehicleTypeId = body.vehicleTypeId;
+    }
+    vehiclesCount = body.vehiclesCount;
+  } else if (body.paymentMethod === "cash") {
+    throw new ApiError(400, "الاستلام الشخصي لا يدعم الدفع النقدي عند الاستلام — اختر الدفع عند المورد أو الحوالة");
+  }
+
+  // 4) قفل المخزون (صنف بصنف بترتيب ثابت) ثم تجهيز الأسطر والتحقق من المتاح
+  await lockStockForProducts(client, body.items.map((i) => i.productId));
+  const enriched = await prepareLines(client, customerId, body.items);
+  await assertStockAvailable(client, enriched.map((l) => ({
+    productId: l.productId, variantId: l.variantId, qty: l.qty, label: l.name,
+  })));
+
+  const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
+  const itemsSubtotal = round2(enriched.reduce((s, i) => s + i.lineTotal, 0));
+
+  const { rows: supplierRates } = await client.query(
+    `SELECT id, commission_rate_percent FROM suppliers WHERE id = ANY($1::uuid[])`, [supplierIds]
+  );
+  const rateMap = Object.fromEntries(supplierRates.map((s) => [s.id, s.commission_rate_percent ?? 0]));
+
+  const deliveryFee = body.fulfillment === "delivery"
+    ? await calcDeliveryFee(client, {
+        zoneId, vehicleTypeId, vehiclesCount,
+        supplierCount: supplierIds.length, customerId, supplierIds,
+      })
+    : 0;
+  const grandTotal = round2(itemsSubtotal + deliveryFee);
+
+  // 5) الآجل: مفعّل للعميل وضمن السقف (نفس منطق الاعتماد)
+  if (body.paymentMethod === "deferred") await assertCreditAllowed(client, customerId, grandTotal);
+
+  const orderNumber = await nextDocNumber(client, {
+    table: "orders", column: "order_number", prefix: "JOMLA", start: 3000,
+  });
+
+  const { rows: [created] } = await client.query(
+    `INSERT INTO orders
+       (order_number, customer_id, status, fulfillment, payment_method,
+        items_subtotal, delivery_fee, grand_total,
+        delivery_zone_id, vehicle_type_id, vehicles_count)
+     VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10)
+     RETURNING *`,
+    [orderNumber, customerId, body.fulfillment, body.paymentMethod,
+     itemsSubtotal, deliveryFee, grandTotal, zoneId, vehicleTypeId, vehiclesCount]
+  );
+  if (body.clientKey) {
+    await client.query(`UPDATE orders SET client_key = $2 WHERE id = $1`, [created.id, body.clientKey]);
+  }
+
+  for (const supplierId of supplierIds) {
+    const mine = enriched.filter((i) => i.supplier_id === supplierId);
+    const subtotal = round2(mine.reduce((s, i) => s + i.lineTotal, 0));
+    const { rows: [os] } = await client.query(
+      `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, supplier_note, commission_rate)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [created.id, supplierId, subtotal, body.supplierNotes?.[supplierId] ?? null, rateMap[supplierId] ?? 0]
+    );
+    for (const i of mine) {
+      await client.query(
+        `INSERT INTO order_items
+           (order_id, order_supplier_id, product_id, product_name, unit,
+            unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [created.id, os.id, i.productId, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.lineTotal,
+         i.supplier_sku, i.variantId, i.variantLabel]
+      );
+    }
+  }
+
+  await recordStatus(client, {
+    orderId: created.id, from: "draft", to: "under_review", actor,
+    note: byAdmin ? "أُنشئت بواسطة الدعم الفني نيابة عن العميل" : null,
+  });
+  await writeAudit(client, {
+    actorType: byAdmin ? "employee" : "customer", actorId: actor.id, actorName: actor.name,
+    action: byAdmin ? "order.created_by_admin" : "order.submitted",
+    entityType: "order", entityId: created.id, entityLabel: orderNumber, after: created, ip,
+  });
+  if (!byAdmin) {
+    await notifyStaffWithPermission(client, {
+      permissionCode: "orders.review", templateCode: "order.new_pending_review",
+      orderId: created.id,
+      vars: { order_number: orderNumber, customer_name: actor.name, total: grandTotal.toFixed(2) },
+    });
+  }
+
+  return { order: created, supplierCount: supplierIds.length, duplicate: false };
+}
 
 orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) => {
   const body = createSchema.parse(req.body);
-
-  const order = await withTransaction(async (client) => {
-    const enriched = [];
-    for (const item of body.items) {
-      const { rows } = await client.query(
-        `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
-                p.availability, p.stock_qty, s.status AS supplier_status
-           FROM products p JOIN suppliers s ON s.id = p.supplier_id
-          WHERE p.id = $1 AND p.is_active`,
-        [item.productId]
-      );
-      if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
-      const p = rows[0];
-      if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      // الصنف اللي له أنواع: التوفر يُحسب على مخزون النوع نفسه مش على علامة الصنف
-      if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
-
-      let variantLabel = null;
-      let purchaseCost = p.purchase_cost;
-      if (item.variantId) {
-        const { rows: vRows } = await client.query(
-          `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
-          [item.variantId, p.id]
-        );
-        if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
-        if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
-        if (Number(item.qty) > Number(vRows[0].stock_qty)) {
-          throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
-        }
-        variantLabel = vRows[0].label;
-        purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
-      } else {
-        const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-        if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
-        if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
-        if (Number(item.qty) > Number(p.stock_qty)) {
-          throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
-        }
-      }
-
-      await assertCustomerSection(req.actor.id, p.section_id);
-      const price = await resolvePrice(client, {
-        productId: p.id, customerId: req.actor.id, qty: item.qty, variantId: item.variantId,
-      });
-      enriched.push({
-        ...p, qty: item.qty, price, purchase_cost: purchaseCost,
-        variantId: item.variantId || null, variantLabel,
-        name: variantLabel ? `${p.name} — ${variantLabel}` : p.name,
-      });
-    }
-
-    const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
-    const itemsSubtotal = enriched.reduce((s, i) => s + i.price * i.qty, 0);
-
-    const { rows: supplierRates } = await client.query(
-      `SELECT id, business_name, commission_rate_percent FROM suppliers WHERE id = ANY($1)`,
-      [supplierIds]
-    );
-    const rateMap = Object.fromEntries(
-      supplierRates.map((s) => [s.id, s.commission_rate_percent ?? 0])
-    );
-    const supplierNameMap = Object.fromEntries(
-      supplierRates.map((s) => [s.id, s.business_name])
-    );
-
-    const deliveryFee = body.fulfillment === "delivery"
-      ? await calcDeliveryFee(client, {
-          zoneId: body.deliveryZoneId,
-          vehicleTypeId: body.vehicleTypeId,
-          vehiclesCount: body.vehiclesCount,
-          supplierCount: supplierIds.length,
-          customerId: req.actor.id,
-          supplierIds,
-        })
-      : 0;
-
-    const orderNumber = await nextDocNumber(client, {
-      table: "orders", column: "order_number", prefix: "JOMLA", start: 3000,
-    });
-
-    const { rows: [created] } = await client.query(
-      `INSERT INTO orders
-         (order_number, customer_id, status, fulfillment, payment_method,
-          items_subtotal, delivery_fee, grand_total,
-          delivery_zone_id, vehicle_type_id, vehicles_count)
-       VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING *`,
-      [orderNumber, req.actor.id, body.fulfillment, body.paymentMethod,
-       itemsSubtotal, deliveryFee, itemsSubtotal + deliveryFee,
-       body.deliveryZoneId ?? null, body.vehicleTypeId ?? null, body.vehiclesCount]
-    );
-
-    for (const supplierId of supplierIds) {
-      const mine = enriched.filter((i) => i.supplier_id === supplierId);
-      const subtotal = mine.reduce((s, i) => s + i.price * i.qty, 0);
-
-      const { rows: [os] } = await client.query(
-        `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, supplier_note, commission_rate)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-        [created.id, supplierId, subtotal, body.supplierNotes?.[supplierId] ?? null, rateMap[supplierId] ?? 0]
-      );
-
-      for (const i of mine) {
-        await client.query(
-          `INSERT INTO order_items
-             (order_id, order_supplier_id, product_id, product_name, unit,
-              unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null,
-           i.variantId, i.variantLabel]
-        );
-      }
-    }
-
-    await recordStatus(client, {
-      orderId: created.id, from: "draft", to: "under_review", actor: req.actor,
-    });
-    await writeAudit(client, {
-      actorType: "customer", actorId: req.actor.id, actorName: req.actor.name,
-      action: "order.submitted", entityType: "order", entityId: created.id,
-      entityLabel: orderNumber, after: created, ip: req.ip,
-    });
-        await notifyStaffWithPermission(client, {
-      permissionCode: "orders.review", templateCode: "order.new_pending_review",
-      orderId: created.id,
-      vars: { order_number: orderNumber, customer_name: req.actor.name, total: (itemsSubtotal + deliveryFee).toFixed(2) },
-    });
-
-    return { ...created, supplierCount: supplierIds.length };
-  });
-
-  res.status(201).json(order);
+  const r = await withTransaction((client) => createOrderCore(client, {
+    customerId: req.actor.id, body, actor: req.actor, byAdmin: false, ip: req.ip,
+  }));
+  res.status(r.duplicate ? 200 : 201)
+    .json(customerOrderView({ ...r.order, supplierCount: r.supplierCount, duplicate: r.duplicate }));
 }));
 
 // إنشاء طلبية من لوحة الإدارة نيابة عن عميل موجود ومعتمد
@@ -221,143 +603,30 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
   if (!cust.rows.length) throw new ApiError(404, "العميل غير موجود");
   if (cust.rows[0].status !== "approved") throw new ApiError(400, "لا يمكن إنشاء طلبية لعميل غير معتمد");
 
-  const order = await withTransaction(async (client) => {
-    const enriched = [];
-    for (const item of body.items) {
-      const { rows } = await client.query(
-        `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
-                p.availability, p.stock_qty, s.status AS supplier_status
-           FROM products p JOIN suppliers s ON s.id = p.supplier_id
-          WHERE p.id = $1 AND p.is_active`,
-        [item.productId]
-      );
-      if (!rows.length) throw new ApiError(404, `صنف غير متاح: ${item.productId}`);
-      const p = rows[0];
-      if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-      // الصنف اللي له أنواع: التوفر يُحسب على مخزون النوع نفسه مش على علامة الصنف
-      if (p.availability === "out" && !item.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
-
-      let variantLabel = null;
-      let purchaseCost = p.purchase_cost;
-      if (item.variantId) {
-        const { rows: vRows } = await client.query(
-          `SELECT id, label, purchase_cost, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
-          [item.variantId, p.id]
-        );
-        if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
-        if (Number(vRows[0].stock_qty) <= 0) throw new ApiError(400, `غير متوفر: ${p.name} — ${vRows[0].label}`);
-        if (Number(item.qty) > Number(vRows[0].stock_qty)) {
-          throw new ApiError(400, `الكمية المطلوبة من ${p.name} — ${vRows[0].label} أكبر من المتوفر (${vRows[0].stock_qty})`);
-        }
-        variantLabel = vRows[0].label;
-        purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
-      } else {
-        const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-        if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
-        if (Number(p.stock_qty) <= 0) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
-        if (Number(item.qty) > Number(p.stock_qty)) {
-          throw new ApiError(400, `الكمية المطلوبة من ${p.name} أكبر من المتوفر (${p.stock_qty})`);
-        }
-      }
-
-      await assertCustomerSection(body.customerId, p.section_id);
-      const price = await resolvePrice(client, {
-        productId: p.id, customerId: body.customerId, qty: item.qty, variantId: item.variantId,
-      });
-      enriched.push({
-        ...p, qty: item.qty, price, purchase_cost: purchaseCost,
-        variantId: item.variantId || null, variantLabel,
-        name: variantLabel ? `${p.name} — ${variantLabel}` : p.name,
-      });
-    }
-
-    const supplierIds = [...new Set(enriched.map((i) => i.supplier_id))];
-    const itemsSubtotal = enriched.reduce((s, i) => s + i.price * i.qty, 0);
-
-    const { rows: supplierRates } = await client.query(
-      `SELECT id, commission_rate_percent FROM suppliers WHERE id = ANY($1)`,
-      [supplierIds]
-    );
-    const rateMap = Object.fromEntries(
-      supplierRates.map((s) => [s.id, s.commission_rate_percent ?? 0])
-    );
-
-    const deliveryFee = body.fulfillment === "delivery"
-      ? await calcDeliveryFee(client, {
-          zoneId: body.deliveryZoneId,
-          vehicleTypeId: body.vehicleTypeId,
-          vehiclesCount: body.vehiclesCount,
-          supplierCount: supplierIds.length,
-          customerId: body.customerId,
-          supplierIds,
-        })
-      : 0;
-
-    const orderNumber = await nextDocNumber(client, {
-      table: "orders", column: "order_number", prefix: "JOMLA", start: 3000,
-    });
-
-    const { rows: [created] } = await client.query(
-      `INSERT INTO orders
-         (order_number, customer_id, status, fulfillment, payment_method,
-          items_subtotal, delivery_fee, grand_total,
-          delivery_zone_id, vehicle_type_id, vehicles_count)
-       VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING *`,
-      [orderNumber, body.customerId, body.fulfillment, body.paymentMethod,
-       itemsSubtotal, deliveryFee, itemsSubtotal + deliveryFee,
-       body.deliveryZoneId ?? null, body.vehicleTypeId ?? null, body.vehiclesCount]
-    );
-
-    for (const supplierId of supplierIds) {
-      const mine = enriched.filter((i) => i.supplier_id === supplierId);
-      const subtotal = mine.reduce((s, i) => s + i.price * i.qty, 0);
-
-      const { rows: [os] } = await client.query(
-        `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, supplier_note, commission_rate)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-        [created.id, supplierId, subtotal, body.supplierNotes?.[supplierId] ?? null, rateMap[supplierId] ?? 0]
-      );
-
-      for (const i of mine) {
-        await client.query(
-          `INSERT INTO order_items
-             (order_id, order_supplier_id, product_id, product_name, unit,
-              unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-          [created.id, os.id, i.id, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.price * i.qty, i.supplier_sku ?? null,
-           i.variantId, i.variantLabel]
-        );
-      }
-    }
-
-    await recordStatus(client, {
-      orderId: created.id, from: "draft", to: "under_review", actor: req.actor,
-      note: "أُنشئت بواسطة الدعم الفني نيابة عن العميل",
-    });
-    await writeAudit(client, {
-      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-      action: "order.created_by_admin", entityType: "order", entityId: created.id,
-      entityLabel: orderNumber, after: created, ip: req.ip,
-    });
-
-    return { ...created, supplierCount: supplierIds.length };
-  });
-
-  res.status(201).json(order);
+  const r = await withTransaction((client) => createOrderCore(client, {
+    customerId: body.customerId, body, actor: req.actor, byAdmin: true, ip: req.ip,
+  }));
+  res.status(r.duplicate ? 200 : 201).json({ ...r.order, supplierCount: r.supplierCount });
 }));
 
+/* ===================================================================
+   القوائم
+=================================================================== */
+
 orderRouter.get("/", asyncRoute(async (req, res) => {
-  const { status } = req.query;
+  const status = typeof req.query.status === "string" && req.query.status.length < 40 ? req.query.status : null;
+  const { limit, offset } = parsePaging(req.query);
   const a = req.actor;
 
   if (a.type === "customer") {
     const { rows } = await query(
-      `SELECT o.*, (SELECT COUNT(*) FROM order_suppliers WHERE order_id = o.id) AS supplier_count
+      `SELECT ${CUSTOMER_ORDER_COLS},
+              (SELECT COUNT(*) FROM order_suppliers WHERE order_id = o.id) AS supplier_count
          FROM orders o
         WHERE o.customer_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)
-        ORDER BY o.created_at DESC`,
-      [a.id, status || null]
+        ORDER BY o.created_at DESC
+        LIMIT $3 OFFSET $4`,
+      [a.id, status, limit, offset]
     );
     return res.json(rows);
   }
@@ -372,253 +641,372 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
         WHERE os.supplier_id = $1
           AND o.status NOT IN ('draft','under_review')
           AND ($2::TEXT IS NULL OR os.status = $2)
-        ORDER BY o.created_at DESC`,
-      [a.id, status || null]
+        ORDER BY o.created_at DESC
+        LIMIT $3 OFFSET $4`,
+      [a.id, status, limit, offset]
     );
     return res.json(rows);
   }
+
+  if (a.type !== "employee") throw new ApiError(403, "لا تملك صلاحية الوصول لهذه الشاشة");
 
   if (a.role === "driver") {
     const { rows } = await query(
-      `SELECT o.*, c.business_name AS customer_name, c.phone AS customer_phone, c.address
+      `SELECT ${DRIVER_ORDER_COLS}, c.business_name AS customer_name, c.phone AS customer_phone, c.address
          FROM orders o JOIN customers c ON c.id = o.customer_id
         WHERE o.driver_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)
-        ORDER BY o.created_at DESC`,
-      [a.id, status || null]
+        ORDER BY o.created_at DESC
+        LIMIT $3 OFFSET $4`,
+      [a.id, status, limit, offset]
     );
     return res.json(rows);
   }
 
+  if (!(await employeeHasAny(a.id, STAFF_VIEW_PERMS))) {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على الطلبيات");
+  }
+  // موظف مقيّد بأقسام يشوف بس الطلبيات اللي كل أصنافها ضمن نطاقه (فلترة داخل الاستعلام نفسه)
+  const scope = await getEmployeeSectionScope(a.id);
   const { rows } = await query(
     `SELECT o.*, c.business_name AS customer_name
        FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE ($1::TEXT IS NULL OR o.status = $1)
-      ORDER BY o.created_at DESC`,
-    [status || null]
+        AND ($2::UUID[] IS NULL OR NOT EXISTS (
+              SELECT 1 FROM order_items oi JOIN products p ON p.id = oi.product_id
+               WHERE oi.order_id = o.id AND NOT (p.section_id = ANY($2::UUID[]))))
+      ORDER BY o.created_at DESC
+      LIMIT $3 OFFSET $4`,
+    [status, scope ? [...scope] : null, limit, offset]
   );
-
-  const scope = await getEmployeeSectionScope(a.id);
-  if (scope === null) return res.json(rows);
-
-  // موظف مقيّد بأقسام يشوف بس الطلبيات اللي كل أصنافها ضمن نطاقه
-  const filtered = [];
-  for (const o of rows) {
-    const { rows: secs } = await query(
-      `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
-        WHERE oi.order_id = $1`,
-      [o.id]
-    );
-    if (secs.every((s) => scope.has(s.section_id))) filtered.push(o);
-  }
-  res.json(filtered);
+  res.json(rows);
 }));
 
+/* ===================================================================
+   تفاصيل طلبية — حسب هوية الطالب (كل جهة تشوف نصيبها فقط)
+=================================================================== */
+
 orderRouter.get("/:id", asyncRoute(async (req, res) => {
+  const a = req.actor;
+  const orderId = req.params.id;
+
   const { rows } = await query(
     `SELECT o.*, c.business_name AS customer_name, c.phone AS customer_phone,
             c.address, c.latitude AS customer_latitude, c.longitude AS customer_longitude
        FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE o.id = $1`,
-    [req.params.id]
+    [orderId]
   );
   if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
   const order = rows[0];
+  const FORBIDDEN = new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
 
-  if (req.actor.type === "customer" && order.customer_id !== req.actor.id) {
-    throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
-  }
-
-  const suppliers = await query(
+  // كل الأجزاء (للحساب الداخلي فقط) — الرد نفسه يحدده نوع الطالب
+  const { rows: allParts } = await query(
     `SELECT os.*, s.business_name AS supplier_name, s.phone AS supplier_phone,
             s.address AS supplier_address, s.latitude AS supplier_latitude, s.longitude AS supplier_longitude
        FROM order_suppliers os JOIN suppliers s ON s.id = os.supplier_id
       WHERE os.order_id = $1`,
-    [req.params.id]
-  );
-  const items = await query(`SELECT * FROM order_items WHERE order_id = $1`, [req.params.id]);
-  const history = await query(
-    `SELECT from_status, to_status, changed_by_name, note, changed_at
-       FROM order_status_history WHERE order_id = $1 ORDER BY changed_at`,
-    [req.params.id]
+    [orderId]
   );
 
+  /* ---------- عميل: صاحب الطلبية فقط، بدون أي حقل داخلي ---------- */
+  if (a.type === "customer") {
+    if (order.customer_id !== a.id) throw FORBIDDEN;
+    const { rows: items } = await query(
+      `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit,
+              unit_price, qty_requested, qty_confirmed, availability, line_total
+         FROM order_items WHERE order_id = $1 ORDER BY created_at`, [orderId]
+    );
+    const { rows: history } = await query(
+      `SELECT from_status, to_status, changed_at
+         FROM order_status_history
+        WHERE order_id = $1 AND order_supplier_id IS NULL AND from_status IS DISTINCT FROM to_status
+        ORDER BY changed_at`, [orderId]
+    );
+    const view = customerOrderView(order);
+    return res.json({
+      ...view,
+      customer_name: order.customer_name,
+      suppliers: allParts
+        .map((s) => ({
+          id: s.id, supplier_id: s.supplier_id, supplier_name: s.supplier_name,
+          status: s.status, subtotal: s.subtotal, supplier_note: s.supplier_note,
+          items: items.filter((i) => i.order_supplier_id === s.id),
+        }))
+        .filter((s) => s.items.length > 0),
+      history,
+    });
+  }
+
+  /* ---------- مورد: جزءه فقط ---------- */
+  if (a.type === "supplier") {
+    const mine = allParts.find((s) => s.supplier_id === a.id);
+    if (!mine || ["draft", "under_review"].includes(order.status)) throw FORBIDDEN;
+    const { rows: items } = await query(
+      `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit, supplier_sku,
+              unit_price, qty_requested, qty_confirmed, availability, line_total
+         FROM order_items WHERE order_supplier_id = $1 ORDER BY created_at`, [mine.id]
+    );
+    const { rows: history } = await query(
+      `SELECT from_status, to_status, changed_at
+         FROM order_status_history
+        WHERE order_id = $1 AND order_supplier_id = $2 AND from_status IS DISTINCT FROM to_status
+        ORDER BY changed_at`, [orderId, mine.id]
+    );
+    // رقم العميل فقط للاستلام الشخصي بعد تأكيد المورد لتوفر جزئه (عشان يتواصل معه للاستلام)؛ ما فيش عنوان/إحداثيات
+    const confirmed = !["pending", "sent", "cancelled"].includes(mine.status);
+    const collector = order.remaining_collector_id
+      ? allParts.find((s) => s.supplier_id === order.remaining_collector_id) : null;
+    return res.json({
+      id: order.id, order_number: order.order_number, status: order.status, fulfillment: order.fulfillment,
+      payment_method: order.payment_method, payment_status: order.payment_status,
+      paid_amount: order.paid_amount, grand_total: order.grand_total, created_at: order.created_at,
+      remaining_collector_id: order.remaining_collector_id,
+      remaining_collector_name: collector?.supplier_name ?? null,
+      customer_name: order.customer_name,
+      customer_phone: order.fulfillment === "pickup" && confirmed ? order.customer_phone : null,
+      suppliers: items.length ? [{
+        id: mine.id, supplier_id: mine.supplier_id, supplier_name: mine.supplier_name,
+        status: mine.status, subtotal: mine.subtotal, supplier_note: mine.supplier_note,
+        pickup_confirmed: mine.pickup_confirmed, payment_received: mine.payment_received,
+        due_now: partDueNow(order, allParts, mine),
+        items,
+      }] : [],
+      history,
+    });
+  }
+
+  if (a.type !== "employee") throw FORBIDDEN;
+
+  /* ---------- مندوب: طلبياته فقط، بدون عمولات/تكلفة ---------- */
+  if (a.role === "driver") {
+    if (order.driver_id !== a.id) throw FORBIDDEN;
+    const { rows: items } = await query(
+      `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit,
+              unit_price, qty_requested, qty_confirmed, availability, line_total
+         FROM order_items WHERE order_id = $1 ORDER BY created_at`, [orderId]
+    );
+    const { rows: history } = await query(
+      `SELECT from_status, to_status, changed_at
+         FROM order_status_history
+        WHERE order_id = $1 AND order_supplier_id IS NULL AND from_status IS DISTINCT FROM to_status
+        ORDER BY changed_at`, [orderId]
+    );
+    const {
+      reviewed_by, reviewed_at, credit_approved_by, remaining_collector_id, client_key,
+      delivery_fee_overridden, ...safe
+    } = order;
+    return res.json({
+      ...safe,
+      suppliers: allParts
+        .map((s) => ({
+          id: s.id, supplier_id: s.supplier_id, supplier_name: s.supplier_name,
+          supplier_phone: s.supplier_phone, supplier_address: s.supplier_address,
+          supplier_latitude: s.supplier_latitude, supplier_longitude: s.supplier_longitude,
+          status: s.status, subtotal: s.subtotal, supplier_note: s.supplier_note,
+          items: items.filter((i) => i.order_supplier_id === s.id),
+        }))
+        .filter((s) => s.items.length > 0),
+      history,
+    });
+  }
+
+  /* ---------- موظف إدارة: بصلاحية عرض الطلبيات وضمن نطاق أقسامه ---------- */
+  if (!(await employeeHasAny(a.id, STAFF_VIEW_PERMS))) throw FORBIDDEN;
+  if (!(await orderInEmployeeScope(a.id, orderId))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
+
+  const { rows: items } = await query(`SELECT * FROM order_items WHERE order_id = $1`, [orderId]);
+  const { rows: history } = await query(
+    `SELECT from_status, to_status, changed_by_name, note, changed_at
+       FROM order_status_history WHERE order_id = $1 ORDER BY changed_at`, [orderId]
+  );
   res.json({
     ...order,
-    suppliers: suppliers.rows
+    suppliers: allParts
       .map((s) => ({
         ...s,
         // المتبقي على العميل اللي لازم المورد يستلمه عند التسليم (استلام شخصي) — 0 لو خالصة
-        due_now: order.fulfillment === "pickup" ? computePartDue(order, suppliers.rows, s) : 0,
-        items: items.rows.filter((i) => i.order_supplier_id === s.id),
+        due_now: partDueNow(order, allParts, s),
+        items: items.filter((i) => i.order_supplier_id === s.id),
       }))
       .filter((s) => s.items.length > 0),
-    history: history.rows,
+    history,
   });
 }));
+
+/* ===================================================================
+   كرر آخر طلبية / مراجعة محتوى السلة بالأسعار والتوفر الحاليين
+=================================================================== */
+
+// يحوّل أسطر (product_id, variant_id, qty) إلى أصناف جاهزة للسلة بأسعار وتوفر الآن
+async function resolveCartLines(customerId, wanted) {
+  const items = [];
+  const unavailable = [];
+  for (const it of wanted) {
+    const { rows: p } = await query(
+      `SELECT p.id, p.name, p.unit, p.image_url, p.availability, p.supplier_id, p.section_id, p.stock_qty,
+              p.approval_status, s.business_name AS supplier_name, s.status AS supplier_status,
+              EXISTS (SELECT 1 FROM supplier_sections ss JOIN sections ps ON ps.id = p.section_id
+                       WHERE ss.supplier_id = p.supplier_id AND ss.section_id = COALESCE(ps.parent_id, ps.id)
+                         AND ss.enabled) AS supplier_section_enabled
+         FROM products p JOIN suppliers s ON s.id = p.supplier_id
+        WHERE p.id = $1 AND p.is_active`,
+      [it.product_id]
+    );
+    if (!p.length || p[0].approval_status !== "approved" || p[0].supplier_status !== "approved"
+        || p[0].availability === "suspended" || !p[0].supplier_section_enabled
+        || (p[0].availability === "out" && !it.variant_id)) {
+      unavailable.push(p[0]?.name ?? "صنف لم يعد متوفرًا");
+      continue;
+    }
+    try { await assertCustomerSection(customerId, p[0].section_id); }
+    catch { unavailable.push(p[0].name); continue; }
+
+    let variant = null;
+    let stock = Number(p[0].stock_qty);
+    if (it.variant_id) {
+      const { rows: v } = await query(
+        `SELECT id, label, price, stock_qty FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
+        [it.variant_id, it.product_id]
+      );
+      if (!v.length) { unavailable.push(`${p[0].name} (النوع لم يعد متوفرًا)`); continue; }
+      variant = v[0];
+      stock = Number(v[0].stock_qty);
+    }
+    if (!(stock > 0)) { unavailable.push(variant ? `${p[0].name} — ${variant.label}` : p[0].name); continue; }
+
+    const qty = Math.min(Number(it.qty), stock);
+    const price = await resolvePrice(pool, {
+      productId: p[0].id, customerId, qty, variantId: it.variant_id || undefined,
+    }).catch(() => null);
+    if (price == null) { unavailable.push(p[0].name); continue; }
+
+    const { supplier_status, supplier_section_enabled, approval_status, section_id, stock_qty, ...product } = p[0];
+    items.push({
+      ...product, price: Number(price), qty, stock_qty: stock,
+      variantId: it.variant_id || null, variantLabel: variant?.label ?? null,
+      name: variant ? `${product.name} — ${variant.label}` : product.name,
+    });
+  }
+  return { items, unavailable };
+}
 
 // "كرر آخر طلبية" — يرجّع أصناف طلبية سابقة بأسعارها وتوفّرها الحاليين (مش
 // المحفوظين وقتها)، عشان العميل يقدر يضيفهم للسلة الجديدة بضغطة وحدة
 orderRouter.get("/:id/reorder-items", requireActorType("customer"), asyncRoute(async (req, res) => {
-  const { rows: orderRows } = await query(
-    `SELECT customer_id FROM orders WHERE id = $1`, [req.params.id]
-  );
+  const { rows: orderRows } = await query(`SELECT customer_id FROM orders WHERE id = $1`, [req.params.id]);
   if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
   if (orderRows[0].customer_id !== req.actor.id) {
     throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
   }
-
   const { rows: pastItems } = await query(
     `SELECT product_id, variant_id, MAX(qty_requested) AS qty
        FROM order_items WHERE order_id = $1
       GROUP BY product_id, variant_id`,
     [req.params.id]
   );
-
-  const items = [];
-  const unavailable = [];
-  for (const it of pastItems) {
-    const { rows: p } = await query(
-      `SELECT p.id, p.name, p.unit, p.image_url, p.availability, p.supplier_id,
-              s.business_name AS supplier_name, s.status AS supplier_status
-         FROM products p JOIN suppliers s ON s.id = p.supplier_id
-        WHERE p.id = $1 AND p.is_active`,
-      [it.product_id]
-    );
-    if (!p.length || p[0].supplier_status !== "approved" || (p[0].availability === "out" && !it.variant_id)) {
-      unavailable.push(p[0]?.name ?? "صنف لم يعد متوفرًا");
-      continue;
-    }
-    let variant = null;
-    if (it.variant_id) {
-      const { rows: v } = await query(
-        `SELECT id, label, price FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
-        [it.variant_id, it.product_id]
-      );
-      if (!v.length) { unavailable.push(`${p[0].name} (النوع لم يعد متوفرًا)`); continue; }
-      variant = v[0];
-    }
-    const price = await resolvePrice(pool, {
-      productId: p[0].id, customerId: req.actor.id, qty: it.qty, variantId: it.variant_id,
-    }).catch(() => null);
-    if (price == null) { unavailable.push(p[0].name); continue; }
-    const { supplier_status, ...product } = p[0];
-    items.push({
-      ...product, price, qty: Number(it.qty),
-      variantId: it.variant_id, variantLabel: variant?.label ?? null,
-      name: variant ? `${product.name} — ${variant.label}` : product.name,
-    });
-  }
-
-  res.json({ items, unavailable });
+  res.json(await resolveCartLines(req.actor.id, pastItems));
 }));
 
-// تقدير تكلفة التوصيل قبل تأكيد الطلبية — نفس حساب السيرفر بالضبط (المسافة من
-// كل مورد بالسلة للزبون)، عشان العميل يشوف رقم قريب من الفاتورة الفعلية قبل
-// ما يأكد، مش يتفاجأ بعدها
+// مراجعة السلة المحفوظة عند العميل: يرجّع الأسعار والتوفر الحاليين لكل سطر (والأصناف اللي ما عادت متاحة)
+orderRouter.post("/cart-items", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    items: z.array(z.object({
+      productId: z.string().uuid(),
+      variantId: z.string().uuid().nullish(),
+      qty: z.number().positive().max(MAX_LINE_QTY),
+    })).max(100),
+  }).parse(req.body);
+  const wanted = body.items.map((i) => ({ product_id: i.productId, variant_id: i.variantId || null, qty: i.qty }));
+  res.json(await resolveCartLines(req.actor.id, wanted));
+}));
+
+// تقدير تكلفة التوصيل قبل تأكيد الطلبية — نفس حساب السيرفر بالضبط (المنطقة + نوع السيارة +
+// المسافة من كل مورد بالسلة للزبون)، عشان العميل يشوف رقم قريب من الفاتورة الفعلية قبل ما يأكد
 orderRouter.post("/estimate-delivery-fee", requireActorType("customer"), asyncRoute(async (req, res) => {
   const body = z.object({
+    zoneId: z.string().uuid().optional(),
+    deliveryZoneId: z.string().uuid().optional(),
     vehicleTypeId: z.string().uuid().optional(),
-    vehiclesCount: z.number().int().min(1).default(1),
-    supplierIds: z.array(z.string().uuid()).min(1),
+    vehiclesCount: z.number().int().min(1).max(50).default(1),
+    supplierIds: z.array(z.string().uuid()).min(1).max(50),
   }).parse(req.body);
 
+  const supplierIds = [...new Set(body.supplierIds)];
   const fee = await calcDeliveryFee(pool, {
+    zoneId: body.zoneId ?? body.deliveryZoneId,
     vehicleTypeId: body.vehicleTypeId,
     vehiclesCount: body.vehiclesCount,
-    supplierCount: body.supplierIds.length,
+    supplierCount: supplierIds.length,
     customerId: req.actor.id,
-    supplierIds: body.supplierIds,
+    supplierIds,
   });
 
   res.json({ fee });
 }));
 
-orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+/* ===================================================================
+   اعتماد / رفض / إلغاء
+=================================================================== */
+
+// اعتماد طلبية قيد المراجعة وإرسالها للموردين (مشترك بين /approve والتحويل اليدوي من قيد المراجعة)
+async function approveInTx(client, order, actor, { depositDueAtDelivery, deferredDueDate, ip, audit = true }) {
+  if (order.status !== "under_review") throw new ApiError(400, "الطلبية ليست قيد المراجعة");
+
+  if (order.payment_method === "deferred") await assertCreditAllowed(client, order.customer_id, order.grand_total);
+
+  const { rows: [updated] } = await client.query(
+    `UPDATE orders SET
+       status = 'sent_to_supplier',
+       reviewed_by = $2, reviewed_at = now(),
+       deposit_due_at_delivery = COALESCE($3, deposit_due_at_delivery),
+       deferred_due_date       = COALESCE($4::DATE, deferred_due_date),
+       credit_approved_by = CASE WHEN payment_method = 'deferred' THEN $2 ELSE credit_approved_by END
+     WHERE id = $1 RETURNING *`,
+    [order.id, actor.id, depositDueAtDelivery ?? null, deferredDueDate ?? null]
+  );
+
+  // فقط الأجزاء اللي لسا ما أُرسلت (لو الطلبية كانت مؤجلة وفيها أجزاء مؤكدة ما نرجّعها لـ "مرسل")
+  await client.query(
+    `UPDATE order_suppliers SET status = 'sent' WHERE order_id = $1 AND status = 'pending'`, [order.id]
+  );
+  await recordStatus(client, { orderId: order.id, from: order.status, to: "sent_to_supplier", actor });
+  if (audit) {
+    await writeAudit(client, {
+      actorType: "employee", actorId: actor.id, actorName: actor.name,
+      action: "order.approved", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip,
+    });
+  }
+
+  await queueNotification(client, {
+    templateCode: "order.status", recipientType: "customer",
+    recipientId: order.customer_id, orderId: order.id,
+    vars: { order_number: order.order_number, status: "مرسلة إلى المورد" },
+  });
+  const { rows: suppliers } = await client.query(
+    `SELECT DISTINCT supplier_id FROM order_suppliers WHERE order_id = $1 AND status <> 'cancelled'`, [order.id]
+  );
+  for (const s of suppliers) {
+    await queueNotification(client, {
+      templateCode: "order.new_for_supplier", recipientType: "supplier",
+      recipientId: s.supplier_id, orderId: order.id,
+      vars: { order_number: order.order_number },
+    });
+  }
+  return updated;
+}
+
+orderRouter.post("/:id/approve", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const body = z.object({
     depositDueAtDelivery: z.number().nonnegative().optional(),
     deferredDueDate: z.string().optional(),
   }).parse(req.body ?? {});
 
-  const scope = await getEmployeeSectionScope(req.actor.id);
-  if (scope !== null) {
-    const { rows: secs } = await query(
-      `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
-        WHERE oi.order_id = $1`,
-      [req.params.id]
-    );
-    if (!secs.every((s) => scope.has(s.section_id))) {
-      throw new ApiError(403, "الطلبية تحتوي على صنف من قسم خارج نطاق صلاحياتك");
-    }
-  }
-
   const result = await withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]
-    );
+    const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
-    const order = rows[0];
-    if (order.status !== "under_review") throw new ApiError(400, "الطلبية ليست قيد المراجعة");
-
-    if (order.payment_method === "deferred") {
-      // قفل على مستوى العميل: عشان اعتمادين متزامنين ما يتجاوزوا السقف مع بعض
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`credit:${order.customer_id}`]);
-      const cust = await client.query(`SELECT credit_enabled, credit_limit FROM customers WHERE id = $1`, [order.customer_id]);
-      if (!cust.rows[0]?.credit_enabled) throw new ApiError(400, "البيع الآجل غير مفعّل لهذا العميل");
-      // سقف الآجل (0 = بدون سقف): الرصيد الحالي + قيمة هذي الطلبية ما يتعداش السقف
-      const limit = Number(cust.rows[0].credit_limit ?? 0);
-      if (limit > 0) {
-        const { rows: [bal] } = await client.query(
-          `SELECT COALESCE(SUM(debit),0)::numeric - COALESCE(SUM(credit),0)::numeric AS balance
-             FROM v_customer_ledger WHERE customer_id = $1`, [order.customer_id]
-        );
-        const after = Number(bal.balance) + Number(order.grand_total);
-        if (after > limit + 0.005) {
-          throw new ApiError(400, `تجاوز سقف الآجل: الرصيد الحالي ${Number(bal.balance).toFixed(2)} + الطلبية ${Number(order.grand_total).toFixed(2)} أكبر من السقف ${limit.toFixed(2)} د.ل`);
-        }
-      }
-    }
-
-    const { rows: [updated] } = await client.query(
-      `UPDATE orders SET
-         status = 'sent_to_supplier',
-         reviewed_by = $2, reviewed_at = now(),
-         deposit_due_at_delivery = COALESCE($3, deposit_due_at_delivery),
-         deferred_due_date       = COALESCE($4::DATE, deferred_due_date),
-         credit_approved_by = CASE WHEN payment_method = 'deferred' THEN $2 ELSE credit_approved_by END
-       WHERE id = $1 RETURNING *`,
-      [order.id, req.actor.id, body.depositDueAtDelivery ?? null, body.deferredDueDate ?? null]
-    );
-
-    await client.query(
-      `UPDATE order_suppliers SET status = 'sent' WHERE order_id = $1`, [order.id]
-    );
-    await recordStatus(client, {
-      orderId: order.id, from: order.status, to: "sent_to_supplier", actor: req.actor,
-    });
-    await writeAudit(client, {
-      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-      action: "order.approved", entityType: "order", entityId: order.id,
-      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
-    });
-
-    await queueNotification(client, {
-      templateCode: "order.status", recipientType: "customer",
-      recipientId: order.customer_id, orderId: order.id,
-      vars: { order_number: order.order_number, status: "مرسلة إلى المورد" },
-    });
-
-    const { rows: suppliers } = await client.query(
-      `SELECT DISTINCT supplier_id FROM order_suppliers WHERE order_id = $1`, [order.id]
-    );
-    for (const s of suppliers) {
-      await queueNotification(client, {
-        templateCode: "order.new_for_supplier", recipientType: "supplier",
-        recipientId: s.supplier_id, orderId: order.id,
-        vars: { order_number: order.order_number },
-      });
-    }
-
-    return updated;
+    return approveInTx(client, rows[0], req.actor, { ...body, ip: req.ip });
   });
 
   res.json(result);
@@ -627,8 +1015,13 @@ orderRouter.post("/:id/approve", requirePermission("orders.review"), asyncRoute(
 // تأكيد قيمة حوالة مصرفية دخلت فعليًا لحساب الشركة (بعد ما يتأكد الأدمن منها بنفسه بالبنك) —
 // يسجّل إيصال قبض معتمد فورًا في خزينة الحوالات، ويحدّث المبلغ المدفوع على الطلبية،
 // عشان "المبلغ المطلوب من المندوب" بعدين يُحسب صح (المتبقي بس، مش المبلغ كامل)
-orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
-  const { amount } = z.object({ amount: z.number().positive() }).parse(req.body);
+orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"), requireOrderScope, asyncRoute(async (req, res) => {
+  const { amount, clientKey: rawKey } = z.object({
+    amount: z.number().positive().max(100000000),
+    clientKey: z.string().min(8).max(100).optional(), // يمنع تكرار الإيصال لو انضغط الزر مرتين
+  }).parse(req.body);
+  // نفس نمط finance.js: المفتاح مرتبط بالموظف حتى لا يتصادم بين موظفين
+  const clientKey = rawKey ? `${req.actor.id}:${rawKey}` : null;
 
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
@@ -636,13 +1029,35 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
     );
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
+
+    // نفس الضغطة أُعيد إرسالها: نرجّع الإيصال الأول بدل إنشاء ثاني
+    if (clientKey) {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ["vkey:" + clientKey]);
+      const { rows: existing } = await client.query(`SELECT * FROM vouchers WHERE client_key = $1`, [clientKey]);
+      if (existing.length) {
+        return { order, voucher: existing[0], excessAsCredit: 0, duplicate: true };
+      }
+    }
+
     if (order.payment_method !== "transfer") throw new ApiError(400, "الطلبية ليست بطريقة الحوالة المصرفية");
     if (["cancelled", "closed"].includes(order.status)) throw new ApiError(409, "الطلبية ملغاة أو مغلقة");
 
-    const remaining = Number(order.grand_total) - Number(order.paid_amount);
+    const remaining = round2(Number(order.grand_total) - Number(order.paid_amount));
+    // الحوالات المؤكدة سابقًا (paid_amount) أو الحوالات المعلّقة عند الإدارة تغطي المتبقي كامل: ما فيش داعي لإيصال جديد
+    const { rows: [pend] } = await client.query(
+      `SELECT COALESCE(SUM(amount),0)::numeric AS pending FROM vouchers
+        WHERE order_id = $1 AND voucher_type = 'receipt' AND method = 'transfer' AND approval_status = 'pending'`,
+      [order.id]
+    );
+    if (remaining <= 0.005) {
+      throw new ApiError(409, "الحوالات المؤكدة سابقًا تغطي كامل قيمة هذه الطلبية — لا يمكن تأكيد حوالة إضافية");
+    }
+    if (round2(remaining - Number(pend.pending)) <= 0.005) {
+      throw new ApiError(409, "توجد حوالة معلّقة على هذه الطلبية تغطي المتبقي — اعتمدها من شاشة السندات بدل تسجيل حوالة جديدة");
+    }
     // الزيادة عن قيمة الفاتورة تُسجَّل بالكامل في الإيصال (تظهر كرصيد للعميل بكشف حسابه)،
     // بس المُطبَّق على هذي الطلبية بالذات محدود بالمتبقي عليها بس
-    const appliedToOrder = Math.min(amount, Math.max(remaining, 0));
+    const appliedToOrder = round2(Math.min(amount, Math.max(remaining, 0)));
 
     const { rows: cust } = await client.query(`SELECT business_name FROM customers WHERE id = $1`, [order.customer_id]);
 
@@ -657,16 +1072,16 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
     const { rows: [voucher] } = await client.query(
       `INSERT INTO vouchers
          (voucher_number, voucher_type, party_type, party_id, party_name,
-          amount, method, treasury_id, order_id, approval_status, approved_by, approved_at, note, created_by)
-       VALUES ($1,'receipt','customer',$2,$3,$4,'transfer',$5,$6,'approved',$7,now(),$8,$7)
+          amount, method, treasury_id, order_id, approval_status, approved_by, approved_at, note, created_by, client_key)
+       VALUES ($1,'receipt','customer',$2,$3,$4,'transfer',$5,$6,'approved',$7,now(),$8,$7,$9)
        RETURNING *`,
       [vNumber, order.customer_id, cust[0]?.business_name ?? "عميل", amount, tr[0].id, order.id,
-       req.actor.id, `تأكيد حوالة — طلبية ${order.order_number}`]
+       req.actor.id, `تأكيد حوالة — طلبية ${order.order_number}`, clientKey]
     );
 
     let { rows: [updated] } = await client.query(
       `UPDATE orders SET
-         paid_amount = paid_amount + $2,
+         paid_amount = ROUND(paid_amount + $2, 2),
          payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
        WHERE id = $1 RETURNING *`,
       [order.id, appliedToOrder]
@@ -674,7 +1089,7 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
     // لو الطلبية عند مندوب قبل ما تتأكد الحوالة، نحدّث "المطلوب تحصيله" عشان يطلع المتبقي بس (أو صفر لو خالصة)
     if (updated.driver_id && ["assigned_to_driver", "out_for_delivery"].includes(updated.status)) {
       const { rows: [u2] } = await client.query(
-        `UPDATE orders SET cod_amount = GREATEST(grand_total - paid_amount, 0) WHERE id = $1 RETURNING *`,
+        `UPDATE orders SET cod_amount = GREATEST(ROUND(grand_total - paid_amount, 2), 0) WHERE id = $1 RETURNING *`,
         [order.id]
       );
       updated = u2;
@@ -686,15 +1101,15 @@ orderRouter.post("/:id/confirm-transfer", requirePermission("finance.vouchers"),
       entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
     });
 
-    return { order: updated, voucher, excessAsCredit: Math.max(0, amount - remaining) };
+    return { order: updated, voucher, excessAsCredit: Math.max(0, round2(amount - remaining)) };
   });
 
   res.json(result);
 }));
 
-orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(async (req, res) => {
+orderRouter.post("/:id/reject", requirePermission("orders.cancel"), requireOrderScope, asyncRoute(async (req, res) => {
   const { reason, postpone } = z.object({
-    reason: z.string().min(3),
+    reason: z.string().min(3).max(500),
     postpone: z.boolean().default(false),
   }).parse(req.body);
 
@@ -705,8 +1120,10 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
     if (["delivered", "closed", "cancelled"].includes(order.status)) {
       throw new ApiError(400, "لا يمكن تعديل حالة طلبية مغلقة أو ملغاة");
     }
+    if (postpone && order.status === "postponed") throw new ApiError(400, "الطلبية مؤجلة بالفعل");
 
     const to = postpone ? "postponed" : "cancelled";
+    const supplierIds = await activeSupplierIds(client, order.id); // قبل ما تتغير حالة الأجزاء
     const { rows: [updated] } = await client.query(
       `UPDATE orders SET status = $2, cancel_reason = $3 WHERE id = $1 RETURNING *`,
       [order.id, to, reason]
@@ -720,6 +1137,10 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
       );
       await restoreOrderStock(client, order.id, req.actor.id);
     }
+    await notifySuppliers(client, {
+      supplierIds, order, reason,
+      templateCode: postpone ? "order.part_postponed" : "order.part_cancelled",
+    });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: postpone ? "order.postponed" : "order.cancelled",
@@ -732,9 +1153,53 @@ orderRouter.post("/:id/reject", requirePermission("orders.cancel"), asyncRoute(a
   res.json(result);
 }));
 
+// العميل يلغي طلبيته بنفسه — فقط وهي لسا قيد المراجعة (المخزون ما اتخصمش، فما فيش شي يتُرجع)
+orderRouter.post("/:id/cancel", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const { reason } = z.object({ reason: z.string().max(300).optional() }).parse(req.body ?? {});
+
+  const result = await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE id = $1 AND customer_id = $2 FOR UPDATE`, [req.params.id, req.actor.id]
+    );
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+    if (order.status !== "under_review") {
+      throw new ApiError(409, "ما تقدرش تلغي الطلبية بعد ما بدأت مراجعتها — تواصل مع الدعم الفني");
+    }
+
+    const note = reason?.trim() ? `ألغاها العميل: ${reason.trim()}` : "ألغاها العميل";
+    const { rows: [updated] } = await client.query(
+      `UPDATE orders SET status = 'cancelled', cancel_reason = $2 WHERE id = $1 RETURNING *`,
+      [order.id, note]
+    );
+    const supplierIds = await activeSupplierIds(client, order.id);
+    await client.query(
+      `UPDATE order_suppliers SET status = 'cancelled' WHERE order_id = $1 AND status NOT IN ('cancelled','closed')`,
+      [order.id]
+    );
+    // لو الطلبية رجعت للمراجعة بعد تأجيل وفيها أجزاء مؤكدة (مخزونها اتخصم) نرجّعه — آمن للتكرار ولا يعمل شي لو ما اتخصم شي
+    await restoreOrderStock(client, order.id, req.actor.id);
+    await notifySuppliers(client, { supplierIds, order, reason: reason?.trim() || "", templateCode: "order.part_cancelled" });
+    await recordStatus(client, { orderId: order.id, from: order.status, to: "cancelled", actor: req.actor, note });
+    await writeAudit(client, {
+      actorType: "customer", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.cancelled_by_customer", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
+    });
+    await notifyStaffWithPermission(client, {
+      permissionCode: "orders.review", templateCode: "order.cancelled_by_customer",
+      orderId: order.id,
+      vars: { order_number: order.order_number, customer_name: req.actor.name },
+    });
+    return customerOrderView(updated);
+  });
+
+  res.json(result);
+}));
+
 // الإدارة تحدد أي مورد يستلم المبلغ المتبقي على العميل كامل (طلبية استلام شخصي بالحوالة فيها أكثر من مورد).
 // لو supplierId = null يرجع التقسيم التلقائي بنسبة الفواتير.
-orderRouter.post("/:id/remaining-collector", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+orderRouter.post("/:id/remaining-collector", requirePermission("finance.vouchers"), requireOrderScope, asyncRoute(async (req, res) => {
   const { supplierId } = z.object({ supplierId: z.string().uuid().nullable() }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -770,60 +1235,194 @@ orderRouter.post("/:id/remaining-collector", requirePermission("finance.vouchers
   res.json(result);
 }));
 
-orderRouter.patch("/:id/status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+/* ===================================================================
+   تغيير الحالة يدويًا (فردي + جماعي) — مصفوفة انتقالات مسموحة
+=================================================================== */
+
+const MANUAL_TRANSITIONS = {
+  draft: ["under_review", "cancelled"],
+  under_review: ["sent_to_supplier", "postponed", "cancelled"],
+  approved: ["sent_to_supplier", "postponed", "cancelled"],
+  sent_to_supplier: ["supplier_preparing", "postponed", "cancelled"],
+  supplier_preparing: ["sent_to_supplier", "shortage", "ready_for_delivery", "ready_for_pickup", "postponed", "cancelled"],
+  shortage: ["supplier_preparing", "postponed", "cancelled"],
+  ready: ["ready_for_delivery", "ready_for_pickup", "postponed", "cancelled"],
+  ready_for_delivery: ["supplier_preparing", "postponed", "cancelled"],
+  ready_for_pickup: ["awaiting_pickup", "delivered", "postponed", "cancelled"],
+  awaiting_pickup: ["ready_for_pickup", "delivered", "cancelled"],
+  assigned_to_driver: ["ready_for_delivery", "cancelled"],
+  out_for_delivery: ["cancelled"],
+  postponed: ["under_review", "cancelled"],
+};
+
+// يرجع نص سبب الرفض (بالعربي) أو null لو الانتقال مسموح من ناحية الحالة والتسليم
+function checkTransition(order, to) {
+  if (TERMINAL.includes(order.status)) return "لا يمكن تغيير حالة طلبية تم تسليمها أو إلغاؤها";
+  if (order.status === to) return "بالفعل في هذه الحالة";
+  if (to === "assigned_to_driver") return "الإسناد لمندوب يتم بزر «إسناد مندوب» فقط";
+  if (to === "closed") return "إقفال الطلبية يتم بإصدار الإيصال بعد التسليم";
+  const allowed = MANUAL_TRANSITIONS[order.status] || [];
+  if (!allowed.includes(to)) return `لا يمكن تحويل الطلبية من «${statusAr(order.status)}» إلى «${statusAr(to)}» يدويًا`;
+  if (to === "ready_for_delivery" && order.fulfillment !== "delivery") return "الطلبية استلام شخصي";
+  if (to === "ready_for_pickup" && order.fulfillment !== "pickup") return "الطلبية توصيل";
+  if (to === "delivered" && order.fulfillment !== "pickup") {
+    return "طلبيات التوصيل تُسلَّم من تطبيق المندوب (إسناد ثم بدء توصيل ثم تأكيد تسليم)";
+  }
+  return null;
+}
+
+// تحقق داخل المعاملة من أن كل أجزاء الطلبية جاهزة قبل تحويلها لـ "جاهزة"
+async function assertAllPartsReady(client, orderId) {
+  const { rows: [r] } = await client.query(
+    `SELECT COUNT(*)::INT AS total,
+            COUNT(*) FILTER (WHERE status NOT IN ('ready','picked_up'))::INT AS notready
+       FROM order_suppliers WHERE order_id = $1 AND status <> 'cancelled'`, [orderId]
+  );
+  if (!r.total || r.notready > 0) throw new ApiError(409, "لسا فيه أجزاء موردين غير جاهزة");
+}
+
+// تطبيق تغيير الحالة اليدوي (بعد التحقق من الانتقال والصلاحية)
+async function applyManualStatus(client, order, to, actor, { note, ip, audit = true }) {
+  let updated;
+  if (to === "sent_to_supplier" && order.status === "under_review") {
+    updated = await approveInTx(client, order, actor, { ip, audit });
+    return updated; // الاعتماد يسجّل الحالة والإشعارات بنفسه
+  }
+  if (to === "ready_for_delivery" || to === "ready_for_pickup") await assertAllPartsReady(client, order.id);
+  const supplierIds = ["cancelled", "postponed"].includes(to) ? await activeSupplierIds(client, order.id) : [];
+
+  ({ rows: [updated] } = await client.query(
+    `UPDATE orders SET status = $2::TEXT,
+            delivered_at = CASE WHEN $2::TEXT = 'delivered' THEN now() ELSE delivered_at END,
+            cancel_reason = CASE WHEN $2::TEXT IN ('cancelled','postponed') THEN COALESCE($3, cancel_reason) ELSE cancel_reason END
+      WHERE id = $1 RETURNING *`,
+    [order.id, to, note ?? null]
+  ));
+
+  if (!["under_review", "draft", "postponed", "cancelled"].includes(to)) {
+    await client.query(
+      `UPDATE order_suppliers SET status = 'sent' WHERE order_id = $1 AND status = 'pending'`, [order.id]
+    );
+  }
+  if (to === "cancelled") {
+    await client.query(
+      `UPDATE order_suppliers SET status = 'cancelled'
+        WHERE order_id = $1 AND status NOT IN ('picked_up','closed','cancelled')`,
+      [order.id]
+    );
+    await restoreOrderStock(client, order.id, actor.id);
+  }
+  if (to === "delivered") {
+    // تسليم يدوي لاستلام شخصي: نقفل فواتير الموردين ونعلّم الاستلام مؤكدًا.
+    // ما نحوّلش المبلغ لـ"مدفوع" تلقائيًا (ما حدا استلم فلوس فعليًا) — المتبقي يبقى على العميل لحد تسجيل سند قبض
+    await client.query(
+      `UPDATE order_suppliers SET status = 'closed', pickup_confirmed = TRUE,
+              confirmed_at = COALESCE(confirmed_at, now())
+        WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
+      [order.id]
+    );
+  }
+
+  if (supplierIds.length) {
+    await notifySuppliers(client, {
+      supplierIds, order, reason: note || "",
+      templateCode: to === "cancelled" ? "order.part_cancelled" : "order.part_postponed",
+    });
+  }
+  await recordStatus(client, { orderId: order.id, from: order.status, to, actor, note });
+  if (audit) {
+    await writeAudit(client, {
+      actorType: "employee", actorId: actor.id, actorName: actor.name,
+      action: "order.status_changed", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip,
+    });
+  }
+  await queueNotification(client, {
+    templateCode: "order.status", recipientType: "customer",
+    recipientId: order.customer_id, orderId: order.id,
+    vars: { order_number: order.order_number, status: statusAr(to) },
+  });
+  return updated;
+}
+
+orderRouter.patch("/:id/status", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const { status, note } = z.object({
-    status: z.string(), note: z.string().optional(),
+    status: z.string().max(40), note: z.string().max(500).optional(),
   }).parse(req.body);
+
+  // الإلغاء والتأجيل بنفس صلاحية /reject
+  if (["cancelled", "postponed"].includes(status) && !(await employeeHasAny(req.actor.id, ["orders.cancel"]))) {
+    throw new ApiError(403, "لا تملك صلاحية إلغاء أو تأجيل الطلبيات");
+  }
 
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
-
-    if (["delivered", "cancelled", "closed"].includes(order.status)) {
-      throw new ApiError(400, "لا يمكن تغيير حالة طلبية تم تسليمها أو إلغاؤها");
-    }
-
-    const { rows: [updated] } = await client.query(
-      `UPDATE orders SET status = $2 WHERE id = $1 RETURNING *`, [order.id, status]
-    );
-
-    // لو الإدارة حطّت حالة الطلبية "تم التسليم"/"مغلقة" يدويًا (بدون المرور بمسار المندوب)،
-    // لازم نقفل فواتير الموردين المرتبطة بالطلبية بنفس الوقت، وإلا تفضل ظاهرة "مفتوحة" عند المورد
-    if (status === "cancelled") {
-      await client.query(
-        `UPDATE order_suppliers SET status = 'cancelled'
-          WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
-        [order.id]
-      );
-      await restoreOrderStock(client, order.id, req.actor.id);
-    }
-    if (status === "delivered" || status === "closed") {
-      await client.query(
-        `UPDATE order_suppliers SET status = 'closed'
-          WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
-        [order.id]
-      );
-    }
-
-    await recordStatus(client, { orderId: order.id, from: order.status, to: status, actor: req.actor, note });
-    await writeAudit(client, {
-      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-      action: "order.status_changed", entityType: "order", entityId: order.id,
-      entityLabel: order.order_number, before: order, after: updated, ip: req.ip,
-    });
-    await queueNotification(client, {
-      templateCode: "order.status", recipientType: "customer",
-      recipientId: order.customer_id, orderId: order.id,
-      vars: { order_number: order.order_number, status },
-    });
-    return updated;
+    const why = checkTransition(order, status);
+    if (why) throw new ApiError(400, why);
+    return applyManualStatus(client, order, status, req.actor, { note, ip: req.ip });
   });
 
   res.json(result);
 }));
 
-// تغيير طريقة تسليم الطلبية (استلام شخصي ↔ توصيل) — قبل إسناد مندوب
+// أهلية السائق: موظف نشط بدور "مندوب"
+async function assertActiveDriver(client, driverId) {
+  const { rows } = await client.query(
+    `SELECT 1 FROM employees e JOIN roles r ON r.id = e.role_id
+      WHERE e.id = $1 AND e.is_active AND r.code = 'driver'`, [driverId]
+  );
+  if (!rows.length) throw new ApiError(400, "المندوب المختار غير موجود أو غير نشط");
+}
+
+const ASSIGNABLE_STATUSES = ["sent_to_supplier", "supplier_preparing", "shortage", "ready", "ready_for_delivery", "assigned_to_driver"];
+
+// يرجع نص سبب الرفض أو null لو الطلبية قابلة للإسناد لمندوب
+async function checkAssignable(client, order) {
+  if (order.fulfillment !== "delivery") return "الطلبية للاستلام الشخصي";
+  if (["out_for_delivery", "delivered", "closed"].includes(order.status)) {
+    return "الطلبية خرجت للتوصيل أو تم تسليمها — ما يصحش إعادة إسنادها";
+  }
+  if (!ASSIGNABLE_STATUSES.includes(order.status)) return "حالة الطلبية الحالية لا تسمح بإسنادها لمندوب";
+  const { rows: [r] } = await client.query(
+    `SELECT COUNT(*)::INT AS total,
+            COUNT(*) FILTER (WHERE status IN ('pending','sent','shortage'))::INT AS unconfirmed
+       FROM order_suppliers WHERE order_id = $1 AND status <> 'cancelled'`, [order.id]
+  );
+  if (!r.total) return "الطلبية ما فيهاش أجزاء موردين فعّالة";
+  if (r.unconfirmed > 0) return "لسا فيه أجزاء ما أكدها الموردين أو فيها نقص ما اتحلش";
+  return null;
+}
+
+async function assignDriverTx(client, order, driverId, actor, { note, ip, audit = true }) {
+  const reassign = order.status === "assigned_to_driver" && order.driver_id && order.driver_id !== driverId;
+  // الإسناد لا يبدأ التوصيل فعليًا — بس يربط الطلبية بالمندوب وتصير تظهرله في تطبيقه
+  // تحت "المسندة إليّ". المندوب نفسه هو اللي يضغط "بدء التوصيل" لما يطلع فعليًا بالطلبية
+  const { rows: [updated] } = await client.query(
+    `UPDATE orders SET driver_id = $2, assigned_at = now(), status = 'assigned_to_driver', cod_amount = $3
+     WHERE id = $1 RETURNING *`,
+    [order.id, driverId, computeCod(order)]
+  );
+  await recordStatus(client, {
+    orderId: order.id, from: order.status, to: "assigned_to_driver", actor,
+    note: note ?? (reassign ? "إعادة إسناد لمندوب آخر" : null),
+  });
+  if (audit) {
+    await writeAudit(client, {
+      actorType: "employee", actorId: actor.id, actorName: actor.name,
+      action: "order.driver_assigned", entityType: "order", entityId: order.id,
+      entityLabel: order.order_number, before: order, after: updated, ip,
+    });
+  }
+  await queueNotification(client, {
+    templateCode: "delivery.scheduled", recipientType: "customer",
+    recipientId: order.customer_id, orderId: order.id,
+    vars: { order_number: order.order_number },
+  });
+  return updated;
+}
+
 // تعديل نسبة العمولة لفاتورة (جزء مورد) واحدة فقط — استثناء معزول، لا يمس نسبة المورد الأساسية
 // ولا أي فاتورة أخرى قديمة أو جديدة. متاح حتى بعد التسليم (تسوية لاحقة)، بصلاحية خاصة بيه
 // (orders.commission_override) منفصلة عن صلاحية تعديل نسبة المورد الأساسية، ويتسجل في سجل
@@ -842,6 +1441,7 @@ orderRouter.patch("/order-suppliers/:id/commission-rate", requirePermission("ord
     );
     if (!rows.length) throw new ApiError(404, "الجزء غير موجود");
     const before = rows[0];
+    if (!(await orderInEmployeeScope(req.actor.id, before.order_id))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
 
     const { rows: [updated] } = await client.query(
       `UPDATE order_suppliers SET commission_rate = $2 WHERE id = $1 RETURNING *`,
@@ -864,12 +1464,13 @@ orderRouter.patch("/order-suppliers/:id/commission-rate", requirePermission("ord
   res.json(result);
 }));
 
-orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+// تغيير طريقة تسليم الطلبية (استلام شخصي ↔ توصيل) — قبل إسناد مندوب
+orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const body = z.object({
     fulfillment: z.enum(["delivery", "pickup"]),
     deliveryZoneId: z.string().uuid().optional(),
     vehicleTypeId: z.string().uuid().optional(),
-    vehiclesCount: z.number().int().min(1).default(1),
+    vehiclesCount: z.number().int().min(1).max(50).default(1),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -883,34 +1484,32 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
     if (order.driver_id) {
       throw new ApiError(400, "لا يمكن تغيير طريقة التسليم بعد إسناد الطلبية لمندوب");
     }
-
-    let deliveryFee = 0;
-    if (body.fulfillment === "delivery") {
-      const { rows: osRows } = await client.query(
-        `SELECT supplier_id FROM order_suppliers WHERE order_id = $1`, [order.id]
-      );
-      const supplierIds = osRows.map((r) => r.supplier_id);
-      deliveryFee = await calcDeliveryFee(client, {
-        zoneId: body.deliveryZoneId, vehicleTypeId: body.vehicleTypeId,
-        vehiclesCount: body.vehiclesCount, supplierCount: supplierIds.length,
-        customerId: order.customer_id, supplierIds,
-      });
+    if (body.fulfillment === "delivery" && !body.vehicleTypeId && !body.deliveryZoneId) {
+      throw new ApiError(400, "اختر نوع السيارة (أو منطقة التوصيل) للتوصيل");
     }
 
-    const { rows: [updated] } = await client.query(
-      `UPDATE orders SET
-         fulfillment = $2, delivery_fee = $3, grand_total = items_subtotal + $3,
-         delivery_zone_id = $4, vehicle_type_id = $5, vehicles_count = $6
-       WHERE id = $1 RETURNING *`,
-      [order.id, body.fulfillment, deliveryFee,
-       body.fulfillment === "delivery" ? (body.deliveryZoneId ?? null) : null,
-       body.fulfillment === "delivery" ? (body.vehicleTypeId ?? null) : null,
-       body.fulfillment === "delivery" ? body.vehiclesCount : 1]
+    // طريقة الدفع لازم تتوافق مع نوع التسليم (نقدًا عند الاستلام ↔ الدفع عند المورد)
+    let paymentMethod = order.payment_method;
+    if (body.fulfillment === "pickup" && paymentMethod === "cash") paymentMethod = "pay_at_supplier";
+    if (body.fulfillment === "delivery" && paymentMethod === "pay_at_supplier") paymentMethod = "cash";
+
+    const isDelivery = body.fulfillment === "delivery";
+    await client.query(
+      `UPDATE orders SET fulfillment = $2, payment_method = $3, delivery_fee_overridden = FALSE,
+              delivery_zone_id = $4, vehicle_type_id = $5, vehicles_count = $6
+        WHERE id = $1`,
+      [order.id, body.fulfillment, paymentMethod,
+       isDelivery ? (body.deliveryZoneId ?? null) : null,
+       isDelivery ? (body.vehicleTypeId ?? null) : null,
+       isDelivery ? body.vehiclesCount : 1]
     );
+    await recalcOrderTotals(client, order.id); // يحسب رسوم التوصيل من الموردين الفعليين
+    const { rows: [updated] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
-      note: `تم تغيير طريقة التسليم إلى: ${body.fulfillment === "delivery" ? "توصيل" : "استلام شخصي"}`,
+      note: `تم تغيير طريقة التسليم إلى: ${isDelivery ? "توصيل" : "استلام شخصي"}` +
+            (paymentMethod !== order.payment_method ? ` (وتعديل طريقة الدفع تلقائيًا لتتوافق)` : ""),
     });
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -927,10 +1526,10 @@ orderRouter.patch("/:id/fulfillment", requirePermission("orders.review"), asyncR
 // تعديل يدوي لرسوم التوصيل — حسب الاتفاق مع العميل، بدل الاعتماد حصرًا على حساب
 // المنطقة+نوع السيارة الثابت. متاح حتى بعد التسليم (تسوية لاحقة)، بصلاحية خاصة بيه
 // (orders.delivery_fee_override) منفصلة عن صلاحية مراجعة الطلبيات العامة
-orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_override"), asyncRoute(async (req, res) => {
+orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_override"), requireOrderScope, asyncRoute(async (req, res) => {
   const { deliveryFee, note } = z.object({
-    deliveryFee: z.number().nonnegative(),
-    note: z.string().optional(),
+    deliveryFee: z.number().nonnegative().max(10000000),
+    note: z.string().max(300).optional(),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -945,10 +1544,13 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_ov
       throw new ApiError(400, "ما تقدرش تعدل رسوم التوصيل بعد تسليم الطلبية أو إلغائها");
     }
 
-    const { rows: [updated] } = await client.query(
-      `UPDATE orders SET delivery_fee = $2, grand_total = items_subtotal + $2 WHERE id = $1 RETURNING *`,
-      [order.id, deliveryFee]
+    // العلم delivery_fee_overridden يحمي الرقم اليدوي من إعادة الحساب التلقائية بعد أي تعديل على الأصناف
+    await client.query(
+      `UPDATE orders SET delivery_fee = $2, delivery_fee_overridden = TRUE WHERE id = $1`,
+      [order.id, round2(deliveryFee)]
     );
+    await recalcOrderTotals(client, order.id);
+    const { rows: [updated] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
@@ -970,9 +1572,9 @@ orderRouter.patch("/:id/delivery-fee", requirePermission("orders.delivery_fee_ov
 // تحويل دفعي لحالة عدة طلبيات مرة واحدة — تُستخدم من شاشة "كل الطلبيات"
 orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const { orderIds, status, note, driverId } = z.object({
-    orderIds: z.array(z.string().uuid()).min(1),
-    status: z.string(),
-    note: z.string().optional(),
+    orderIds: z.array(z.string().uuid()).min(1).max(100),
+    status: z.string().max(40),
+    note: z.string().max(500).optional(),
     driverId: z.string().uuid().optional(),
   }).parse(req.body);
 
@@ -981,8 +1583,18 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
   if (status === "assigned_to_driver" && !driverId) {
     throw new ApiError(400, "يلزم اختيار مندوب للتحويل الجماعي إلى هذه الحالة");
   }
+  // الإلغاء والتأجيل بنفس صلاحية /reject
+  if (["cancelled", "postponed"].includes(status) && !(await employeeHasAny(req.actor.id, ["orders.cancel"]))) {
+    throw new ApiError(403, "لا تملك صلاحية إلغاء أو تأجيل الطلبيات");
+  }
+  const canAssign = status !== "assigned_to_driver" || await employeeHasAny(req.actor.id, ["orders.assign_driver"]);
+  if (!canAssign) throw new ApiError(403, "لا تملك صلاحية إسناد الطلبيات لمندوب");
+
+  const scope = await getEmployeeSectionScope(req.actor.id);
 
   const result = await withTransaction(async (client) => {
+    if (status === "assigned_to_driver") await assertActiveDriver(client, driverId);
+
     const updated = [];
     const skipped = [];
 
@@ -990,86 +1602,49 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
       const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
       if (!rows.length) { skipped.push({ orderId, reason: "غير موجودة" }); continue; }
       const order = rows[0];
+      const skip = (reason) => skipped.push({ orderId, orderNumber: order.order_number, reason });
 
-      if (["delivered", "cancelled", "closed"].includes(order.status)) {
-        skipped.push({ orderId, orderNumber: order.order_number, reason: "مغلقة أو ملغاة" });
-        continue;
+      if (scope !== null) {
+        const { rows: secs } = await client.query(
+          `SELECT DISTINCT p.section_id FROM order_items oi JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = $1`, [orderId]
+        );
+        if (!secs.every((s) => scope.has(s.section_id))) { skip("خارج نطاق أقسامك"); continue; }
       }
-      if (order.status === status) {
-        skipped.push({ orderId, orderNumber: order.order_number, reason: "بالفعل في هذه الحالة" });
-        continue;
-      }
-      if (status === "assigned_to_driver") {
-        if (order.fulfillment !== "delivery") {
-          skipped.push({ orderId, orderNumber: order.order_number, reason: "طلبية استلام شخصي، تم تخطيها" });
-          continue;
+
+      // كل طلبية داخل SAVEPOINT: فشل طلبية واحدة (مثلًا مخزون/سقف آجل) ما يلغي الباقي
+      await client.query("SAVEPOINT bulk_one");
+      try {
+        if (status === "assigned_to_driver") {
+          const why = await checkAssignable(client, order);
+          if (why) { await client.query("RELEASE SAVEPOINT bulk_one"); skip(why); continue; }
+          updated.push(await assignDriverTx(client, order, driverId, req.actor, { note, ip: req.ip, audit: false }));
+        } else {
+          const why = checkTransition(order, status);
+          if (why) { await client.query("RELEASE SAVEPOINT bulk_one"); skip(why); continue; }
+          updated.push(await applyManualStatus(client, order, status, req.actor, { note, ip: req.ip, audit: false }));
         }
-
-        const cod = order.payment_method === "deferred"
-          ? Number(order.deposit_due_at_delivery || 0)
-          : Number(order.grand_total) - Number(order.paid_amount);
-
-        const { rows: [u] } = await client.query(
-          `UPDATE orders SET driver_id = $2, assigned_at = now(),
-                  status = 'assigned_to_driver', cod_amount = $3
-           WHERE id = $1 RETURNING *`,
-          [orderId, driverId, cod > 0 ? cod : 0]
-        );
-        await recordStatus(client, { orderId, from: order.status, to: status, actor: req.actor, note });
-        await writeAudit(client, {
-          actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-          action: "order.driver_assigned", entityType: "order", entityId: orderId,
-          entityLabel: order.order_number, before: order, after: u, ip: req.ip,
-        });
-        await queueNotification(client, {
-          templateCode: "delivery.scheduled", recipientType: "customer",
-          recipientId: order.customer_id, orderId,
-          vars: { order_number: order.order_number },
-        });
-        updated.push(u);
-        continue;
+        await client.query("RELEASE SAVEPOINT bulk_one");
+      } catch (err) {
+        await client.query("ROLLBACK TO SAVEPOINT bulk_one");
+        await client.query("RELEASE SAVEPOINT bulk_one");
+        if (!(err instanceof ApiError)) throw err;
+        skip(err.message);
       }
-
-      const { rows: [u] } = await client.query(
-        `UPDATE orders SET status = $2 WHERE id = $1 RETURNING *`, [orderId, status]
-      );
-
-      if (!["under_review", "draft"].includes(status)) {
-        await client.query(
-          `UPDATE order_suppliers SET status = 'sent' WHERE order_id = $1 AND status = 'pending'`,
-          [orderId]
-        );
-      }
-      if (status === "cancelled") {
-        await client.query(
-          `UPDATE order_suppliers SET status = 'cancelled'
-            WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
-          [orderId]
-        );
-        await restoreOrderStock(client, orderId, req.actor.id);
-      }
-      // نفس منطق /:id/status — تسليم/إغلاق جماعي من لوحة الإدارة لازم يقفل فواتير الموردين معاه
-      if (status === "delivered" || status === "closed") {
-        await client.query(
-          `UPDATE order_suppliers SET status = 'closed'
-            WHERE order_id = $1 AND status NOT IN ('closed','cancelled')`,
-          [orderId]
-        );
-      }
-
-      await recordStatus(client, { orderId, from: order.status, to: status, actor: req.actor, note });
-      await writeAudit(client, {
-        actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-        action: "order.status_changed", entityType: "order", entityId: orderId,
-        entityLabel: order.order_number, before: order, after: u, ip: req.ip,
-      });
-      await queueNotification(client, {
-        templateCode: "order.status", recipientType: "customer",
-        recipientId: order.customer_id, orderId,
-        vars: { order_number: order.order_number, status },
-      });
-      updated.push(u);
     }
+
+    // سجل تدقيق ملخّص واحد للعملية كلها
+    await writeAudit(client, {
+      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      action: "order.bulk_status_changed", entityType: "order", entityId: null,
+      entityLabel: `${status} (${updated.length}/${orderIds.length})`,
+      after: {
+        status, driverId: driverId ?? null, note: note ?? null, requested: orderIds.length,
+        updated: updated.map((u) => u.order_number),
+        skipped: skipped.map((s) => ({ order: s.orderNumber ?? s.orderId, reason: s.reason })),
+      },
+      ip: req.ip,
+    });
 
     return { updated, skipped };
   });
@@ -1082,14 +1657,28 @@ orderRouter.patch("/bulk-status", requirePermission("orders.review"), asyncRoute
   });
 }));
 
+/* ===================================================================
+   توفر الأصناف عند المورد (تأكيد + خصم المخزون)
+=================================================================== */
+
 orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const body = z.object({
     items: z.array(z.object({
       orderItemId: z.string().uuid(),
-      availability: z.enum(["full", "partial", "out"]),
-      qtyConfirmed: z.number().nonnegative(),
-    })).min(1),
+      availability: z.string().nullish(),
+      qtyConfirmed: z.number().nonnegative().max(MAX_LINE_QTY).optional(),
+    })).min(1).max(500),
   }).parse(req.body);
+
+  // لازم المورد يحدد حالة التوفر لكل صنف صراحة — ما فيش افتراضي مخفي من السيرفر
+  for (const it of body.items) {
+    if (!["full", "partial", "out"].includes(it.availability)) {
+      throw new ApiError(400, "يلزم تحديد حالة التوفر لكل صنف (متوفر كامل / جزئي / غير متوفر)");
+    }
+    if (it.availability === "partial" && it.qtyConfirmed === undefined) {
+      throw new ApiError(400, "يلزم إدخال الكمية المتوفرة للأصناف المتوفرة جزئيًا");
+    }
+  }
 
   const result = await withTransaction(async (client) => {
     // قفل الطلبية أولًا (ترتيب موحّد للأقفال: الطلبية ثم جزء المورد) لمنع التعارض والـdeadlock
@@ -1098,7 +1687,7 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
       [req.params.osId]
     );
     const { rows } = await client.query(
-      `SELECT os.*, o.order_number, o.customer_id
+      `SELECT os.*, o.order_number, o.customer_id, o.status AS order_status
          FROM order_suppliers os JOIN orders o ON o.id = os.order_id
         WHERE os.id = $1 AND os.supplier_id = $2 FOR UPDATE`,
       [req.params.osId, req.actor.id]
@@ -1109,71 +1698,70 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
     if (part.status !== "sent") {
       throw new ApiError(400, "تم تسجيل توفر هذا الجزء من قبل");
     }
-    {
-      const { rows: [ost] } = await client.query(`SELECT status FROM orders WHERE id = $1`, [part.order_id]);
-      if (["cancelled", "closed", "delivered"].includes(ost?.status)) {
-        throw new ApiError(409, "الطلبية ملغاة أو منتهية ولا يمكن تسجيل التوفر عليها");
-      }
-      const seen = new Set();
-      for (const it of body.items) {
-        if (seen.has(it.orderItemId)) throw new ApiError(400, "صنف مكرر في الطلب");
-        seen.add(it.orderItemId);
-      }
+    // الطلبية المؤجلة/الملغاة/قيد المراجعة ما ينفعش يتأكد توفرها
+    if (!["sent_to_supplier", "supplier_preparing", "shortage"].includes(part.order_status)) {
+      throw new ApiError(409, "الطلبية غير مفعّلة حاليًا (مؤجلة أو ملغاة أو منتهية) ولا يمكن تسجيل التوفر عليها");
+    }
+
+    // الأصناف المرسلة لازم تطابق بالضبط أصناف هذا الجزء — لا ناقص ولا غريب ولا مكرر
+    const { rows: partItems } = await client.query(
+      `SELECT * FROM order_items WHERE order_supplier_id = $1 FOR UPDATE`, [part.id]
+    );
+    const itemById = new Map(partItems.map((i) => [i.id, i]));
+    const seen = new Set();
+    for (const it of body.items) {
+      if (seen.has(it.orderItemId)) throw new ApiError(400, "صنف مكرر في الطلب");
+      seen.add(it.orderItemId);
+      if (!itemById.has(it.orderItemId)) throw new ApiError(404, "صنف غير موجود في هذا الجزء");
+    }
+    if (seen.size !== partItems.length) {
+      throw new ApiError(400, "لازم تحدد توفر كل أصناف الفاتورة — فيه أصناف ناقصة في الطلب");
     }
 
     let hasShortage = false;
     let subtotal = 0;
 
     for (const it of body.items) {
-      const { rows: itemRows } = await client.query(
-        `SELECT * FROM order_items WHERE id = $1 AND order_supplier_id = $2`,
-        [it.orderItemId, part.id]
-      );
-      if (!itemRows.length) throw new ApiError(404, "صنف غير موجود في هذا الجزء");
-      const item = itemRows[0];
+      const item = itemById.get(it.orderItemId);
+      const requested = Number(item.qty_requested);
 
-      const qty = it.availability === "full" ? item.qty_requested
-                : it.availability === "out"  ? 0
-                : Math.min(it.qtyConfirmed, item.qty_requested);
-
-      await client.query(
-        `UPDATE order_items
-            SET availability = $2, qty_confirmed = $3, line_total = unit_price * $3
-          WHERE id = $1`,
-        [item.id, it.availability, qty]
-      );
-      subtotal += item.unit_price * qty;
-
-            if (qty > 0) {
-        if (item.variant_id) {
-          const r = await client.query(
-            `UPDATE product_variants SET stock_qty = stock_qty - $2 WHERE id = $1 AND stock_qty >= $2`,
-            [item.variant_id, qty]
-          );
-          if (!r.rowCount) throw new ApiError(409, "الكمية المؤكدة أكبر من المخزون المسجّل لأحد الأصناف — حدّث المخزون أولًا");
-        } else {
-          const r = await client.query(
-            `UPDATE products SET stock_qty = stock_qty - $2 WHERE id = $1 AND stock_qty >= $2`,
-            [item.product_id, qty]
-          );
-          if (!r.rowCount) throw new ApiError(409, "الكمية المؤكدة أكبر من المخزون المسجّل لأحد الأصناف — حدّث المخزون أولًا");
+      // تطبيع الحالة: جزئي بكمية >= المطلوب = كامل، وجزئي بكمية صفر = غير متوفر
+      let availability = it.availability;
+      let qty;
+      if (availability === "full") qty = requested;
+      else if (availability === "out") qty = 0;
+      else {
+        qty = round3(Math.min(it.qtyConfirmed, requested));
+        if (!isFractionalUnit(item.unit) && !Number.isInteger(qty)) {
+          throw new ApiError(400, `الكمية لازم تكون رقم صحيح للصنف: ${item.product_name}`);
         }
-        await client.query(
-          `INSERT INTO stock_movements (product_id, variant_id, change_qty, reason, created_by)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [item.product_id, item.variant_id || null, -qty, `بيع — طلب ${part.order_number}`, req.actor.id]
-        );
+        if (qty >= requested) { availability = "full"; qty = requested; }
+        else if (qty <= 0) { availability = "out"; qty = 0; }
       }
 
-      if (it.availability !== "full") {
+      const lineTotal = round2(Number(item.unit_price) * qty);
+      await client.query(
+        `UPDATE order_items SET availability = $2, qty_confirmed = $3, line_total = $4 WHERE id = $1`,
+        [item.id, availability, qty, lineTotal]
+      );
+      subtotal += lineTotal;
+
+      if (qty > 0) {
+        await adjustStock(client, {
+          productId: item.product_id, variantId: item.variant_id, delta: -qty,
+          reason: stockReasons(part.order_number).sale, actorId: req.actor.id,
+        });
+      }
+
+      if (availability !== "full") {
         hasShortage = true;
         await client.query(
-          `INSERT INTO order_shortages (order_item_id, qty_missing)
-           VALUES ($1,$2)`,
-          [item.id, item.qty_requested - qty]
+          `INSERT INTO order_shortages (order_item_id, qty_missing) VALUES ($1,$2)`,
+          [item.id, round3(requested - qty)]
         );
       }
     }
+    subtotal = round2(subtotal);
 
     const newStatus = hasShortage ? "shortage" : "preparing";
     await client.query(
@@ -1184,7 +1772,7 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
       orderId: part.order_id, orderSupplierId: part.id,
       from: part.status, to: newStatus, actor: req.actor,
     });
-    await recalcOrderTotals(client, part.order_id);
+    await recalcOrderTotals(client, part.order_id, { refreshFee: false });
 
     if (hasShortage) {
       await client.query(`UPDATE orders SET status = 'shortage' WHERE id = $1`, [part.order_id]);
@@ -1201,7 +1789,7 @@ orderRouter.post("/supplier-parts/:osId/availability", requireActorType("supplie
   res.json(result);
 }));
 
-orderRouter.get("/:id/shortages", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+orderRouter.get("/:id/shortages", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const { rows } = await query(
     `SELECT sh.*, oi.product_name, oi.unit, oi.qty_requested, os.supplier_id, s.business_name AS supplier_name
        FROM order_shortages sh
@@ -1224,7 +1812,19 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
 
   if (!body.customerApproved) throw new ApiError(400, "يلزم تأكيد موافقة الزبون أولًا");
 
+  // نعرف الطلبية أولًا لنطبّق نطاق الأقسام ونقفلها قبل سجل النقص (ترتيب موحّد للأقفال)
+  const { rows: [pre] } = await query(
+    `SELECT oi.order_id FROM order_shortages sh JOIN order_items oi ON oi.id = sh.order_item_id WHERE sh.id = $1`,
+    [req.params.id]
+  );
+  if (!pre) throw new ApiError(404, "سجل النقص غير موجود");
+  if (!(await orderInEmployeeScope(req.actor.id, pre.order_id))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
+
   const result = await withTransaction(async (client) => {
+    const { rows: [order] } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [pre.order_id]);
+    if (["delivered", "closed", "cancelled"].includes(order.status)) {
+      throw new ApiError(400, "لا يمكن تعديل طلبية مغلقة أو ملغاة");
+    }
     const { rows } = await client.query(
       `SELECT sh.*, oi.order_id, oi.order_supplier_id FROM order_shortages sh
          JOIN order_items oi ON oi.id = sh.order_item_id
@@ -1236,10 +1836,50 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
 
     if (body.resolution === "cancel_item") {
       // "إلغاء الصنف" يشيله فعليًا من الفاتورة فورًا (مش بس يصفّره وينتظر حذف يدوي لاحقًا) —
-      // هذا يمنع بقاء أصناف صفرية عالقة تظهر بالغلط في الفاتورة وعند مندوب التوصيل
+      // هذا يمنع بقاء أصناف صفرية عالقة تظهر بالغلط في الفاتورة وعند مندوب التوصيل.
+      // الكمية المؤكدة (اللي اتخصمت من المخزون وقت التأكيد) ترجع للمخزون في نفس المعاملة
+      const { rows: [item] } = await client.query(`SELECT * FROM order_items WHERE id = $1 FOR UPDATE`, [shortage.order_item_id]);
+      if (item && Number(item.qty_confirmed || 0) > 0) {
+        await adjustStock(client, {
+          productId: item.product_id, variantId: item.variant_id, delta: Number(item.qty_confirmed),
+          reason: stockReasons(order.order_number).editBack, actorId: req.actor.id,
+        });
+      }
+      const { rows: [shPart] } = await client.query(`SELECT supplier_id FROM order_suppliers WHERE id = $1`, [shortage.order_supplier_id]);
       await client.query(`DELETE FROM order_shortages WHERE order_item_id = $1`, [shortage.order_item_id]);
       await client.query(`DELETE FROM order_items WHERE id = $1`, [shortage.order_item_id]);
       await recalcOrderTotals(client, shortage.order_id);
+      await settlePartShortageStatus(client, shortage.order_supplier_id);
+
+      // لو انشال آخر صنف في الطلبية ما يبقى معنى لها — تُلغى
+      const { rows: [left] } = await client.query(
+        `SELECT COUNT(*)::INT AS n FROM order_items WHERE order_id = $1`, [shortage.order_id]
+      );
+      if (shPart && left.n > 0) {
+        await notifySuppliers(client, {
+          supplierIds: [shPart.supplier_id], order, templateCode: "order.part_items_changed",
+          change: `أُلغي الصنف ${item?.product_name ?? ""} بسبب النقص`.trim(),
+        });
+      }
+      if (left.n === 0) {
+        const allSuppliers = await activeSupplierIds(client, shortage.order_id);
+        await notifySuppliers(client, {
+          supplierIds: [...allSuppliers, ...(shPart ? [shPart.supplier_id] : [])], order, reason: "إلغاء كل الأصناف بسبب النقص", templateCode: "order.part_cancelled",
+        });
+        await client.query(
+          `UPDATE orders SET status = 'cancelled', cancel_reason = 'تم إلغاء كل أصناف الطلبية بسبب النقص' WHERE id = $1`,
+          [shortage.order_id]
+        );
+        await client.query(
+          `UPDATE order_suppliers SET status = 'cancelled' WHERE order_id = $1 AND status NOT IN ('picked_up','closed','cancelled')`,
+          [shortage.order_id]
+        );
+        await recordStatus(client, {
+          orderId: shortage.order_id, from: order.status, to: "cancelled", actor: req.actor,
+          note: "تم إلغاء كل أصناف الطلبية بسبب النقص",
+        });
+        await restoreOrderStock(client, shortage.order_id, req.actor.id);
+      }
 
       await writeAudit(client, {
         actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -1247,7 +1887,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
         before: shortage, ip: req.ip,
       });
 
-      return { orderId: shortage.order_id, resolution: "cancel_item", itemRemoved: true };
+      return { orderId: shortage.order_id, resolution: "cancel_item", itemRemoved: true, orderCancelled: left.n === 0 };
     }
 
     const { rows: [updated] } = await client.query(
@@ -1259,32 +1899,8 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       [shortage.id, body.resolution, body.substituteProductId ?? null, req.actor.id]
     );
 
-    await client.query(
-      `UPDATE orders o SET
-         items_subtotal = sub.total,
-         grand_total    = sub.total + o.delivery_fee
-       FROM (SELECT order_id, COALESCE(SUM(line_total),0) AS total
-               FROM order_items WHERE order_id = $1 GROUP BY order_id) sub
-       WHERE o.id = $1`,
-      [shortage.order_id]
-    );
-
-    // بعد ما يتحل النقص، لو ما بقاش عندنا نواقص أخرى معلّقة لنفس فاتورة المورد،
-    // نرجّع حالتها من "يوجد نقص" إلى "قيد التجهيز" عشان المورد يقدر يكمل ويعلّمها جاهزة
-    if (shortage.order_supplier_id) {
-      const { rows: [pending] } = await client.query(
-        `SELECT COUNT(*)::INT AS remaining FROM order_shortages sh
-           JOIN order_items oi ON oi.id = sh.order_item_id
-          WHERE oi.order_supplier_id = $1 AND sh.resolved_at IS NULL`,
-        [shortage.order_supplier_id]
-      );
-      if (pending.remaining === 0) {
-        await client.query(
-          `UPDATE order_suppliers SET status = 'preparing' WHERE id = $1 AND status = 'shortage'`,
-          [shortage.order_supplier_id]
-        );
-      }
-    }
+    await recalcOrderTotals(client, shortage.order_id);
+    await settlePartShortageStatus(client, shortage.order_supplier_id);
 
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
@@ -1297,44 +1913,21 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
   res.json(result);
 }));
 
-orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver"), asyncRoute(async (req, res) => {
+/* ===================================================================
+   إسناد المندوب والتوصيل
+=================================================================== */
+
+orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver"), requireOrderScope, asyncRoute(async (req, res) => {
   const { driverId } = z.object({ driverId: z.string().uuid() }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
+    await assertActiveDriver(client, driverId);
     const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
     const order = rows[0];
-    if (order.fulfillment !== "delivery") throw new ApiError(400, "الطلبية للاستلام الشخصي");
-    if (["delivered", "cancelled", "closed", "out_for_delivery", "draft", "under_review", "postponed"].includes(order.status)) {
-      throw new ApiError(409, "حالة الطلبية الحالية لا تسمح بإسنادها لمندوب");
-    }
-
-    const cod = order.payment_method === "deferred"
-      ? Number(order.deposit_due_at_delivery || 0)
-      : Number(order.grand_total) - Number(order.paid_amount);
-
-    // الإسناد لا يبدأ التوصيل فعليًا — بس يربط الطلبية بالمندوب وتصير تظهرله في تطبيقه
-    // تحت "المسندة إليّ". المندوب نفسه هو اللي يضغط "بدء التوصيل" لما يطلع فعليًا بالطلبية
-    const { rows: [updated] } = await client.query(
-      `UPDATE orders SET driver_id = $2, assigned_at = now(),
-              status = 'assigned_to_driver', cod_amount = $3
-       WHERE id = $1 RETURNING *`,
-      [order.id, driverId, cod > 0 ? cod : 0]
-    );
-    await recordStatus(client, {
-      orderId: order.id, from: order.status, to: "assigned_to_driver", actor: req.actor,
-    });
-    await writeAudit(client, {
-      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
-      action: "order.driver_assigned", entityType: "order", entityId: order.id,
-      entityLabel: order.order_number, after: updated, ip: req.ip,
-    });
-    await queueNotification(client, {
-      templateCode: "delivery.scheduled", recipientType: "customer",
-      recipientId: order.customer_id, orderId: order.id,
-      vars: { order_number: order.order_number },
-    });
-    return updated;
+    const why = await checkAssignable(client, order);
+    if (why) throw new ApiError(409, why);
+    return assignDriverTx(client, order, driverId, req.actor, { ip: req.ip });
   });
 
   res.json(result);
@@ -1398,7 +1991,7 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
     // المندوب ما يقدر يسلّم لو باقي مبلغ إلا بعد ما يؤكد إنه استلمه (الآجل له معاملته الخاصة).
     const dueNow = order.payment_method === "deferred"
       ? Number(order.cod_amount || 0)
-      : Math.max(0, Number(order.grand_total) - Number(order.paid_amount));
+      : Math.max(0, round2(Number(order.grand_total) - Number(order.paid_amount)));
     if (order.payment_method !== "deferred" && dueNow > 0 && !collected) {
       throw new ApiError(400, `باقي على الزبون ${dueNow} د.ل — لازم تستلمه وتأكد الاستلام قبل التسليم`);
     }
@@ -1480,10 +2073,14 @@ orderRouter.post("/:id/deliver", requireActorType("employee"), asyncRoute(async 
   res.json(result);
 }));
 
+/* ===================================================================
+   استلام شخصي من المورد
+=================================================================== */
+
 orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const { paymentReceived, amountReceived } = z.object({
     paymentReceived: z.boolean(),
-    amountReceived: z.number().min(0).optional(),
+    amountReceived: z.number().min(0).max(100000000).optional(),
   }).parse(req.body);
 
   const result = await withTransaction(async (client) => {
@@ -1493,7 +2090,7 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       [req.params.osId]
     );
     const { rows } = await client.query(
-      `SELECT os.*, o.order_number, o.payment_method, o.customer_id
+      `SELECT os.*, o.order_number, o.payment_method, o.customer_id, o.fulfillment, o.status AS order_status
          FROM order_suppliers os JOIN orders o ON o.id = os.order_id
         WHERE os.id = $1 AND os.supplier_id = $2 FOR UPDATE`,
       [req.params.osId, req.actor.id]
@@ -1501,14 +2098,29 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
     if (!rows.length) throw new ApiError(404, "الجزء غير موجود");
     const part = rows[0];
 
+    if (part.fulfillment !== "pickup") {
+      throw new ApiError(400, "هذه طلبية توصيل — تُسلَّم عبر مندوب جملة وليس من هنا");
+    }
+    if (!["sent_to_supplier", "supplier_preparing", "shortage", "ready_for_pickup", "awaiting_pickup"].includes(part.order_status)) {
+      throw new ApiError(409, "حالة الطلبية الحالية لا تسمح بتأكيد الاستلام (مؤجلة أو ملغاة أو منتهية)");
+    }
     if (part.status !== "ready") {
       throw new ApiError(400, "لازم تعلّم الفاتورة كجاهزة أولًا قبل تأكيد حضور العميل");
     }
 
-    // الحوالة: المدفوع فعليًا هو اللي أكدته الإدارة. لو باقي مبلغ على العميل، المورد لازم يستلمه نقدًا
-    // ويأكد استلامه قبل التسليم. لو الطلبية خالصة، يسلّم بدون أي تحصيل.
-    let transferDue = 0;
-    if (part.payment_method === "transfer") {
+    // المبلغ المطلوب استلامه نقدًا من العميل عند التسليم
+    let due = 0;
+    if (CASH_LIKE.includes(part.payment_method)) {
+      due = round2(part.subtotal);
+      if (due > 0) {
+        if (!paymentReceived) throw new ApiError(400, "يلزم تأكيد استلام قيمة الفاتورة من العميل قبل التسليم");
+        if (amountReceived === undefined || Math.abs(amountReceived - due) > 0.01) {
+          throw new ApiError(400, `لازم تدخل المبلغ المستلم، وقيمة هذه الفاتورة ${due} د.ل`);
+        }
+      }
+    } else if (part.payment_method === "transfer") {
+      // الحوالة: المدفوع فعليًا هو اللي أكدته الإدارة. لو باقي مبلغ على العميل، المورد لازم يستلمه نقدًا
+      // ويأكد استلامه قبل التسليم. لو الطلبية خالصة، يسلّم بدون أي تحصيل.
       const { rows: [ord] } = await client.query(
         `SELECT grand_total, paid_amount, remaining_collector_id FROM orders WHERE id = $1`, [part.order_id]
       );
@@ -1518,42 +2130,34 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
       if (Number(ord.paid_amount) <= 0) {
         throw new ApiError(409, "الحوالة لم تُؤكَّد من الإدارة بعد — انتظر تأكيد الإدارة قبل تسليم الطلبية");
       }
-      transferDue = computePartDue(ord, allParts, part);
-      if (transferDue > 0) {
+      due = computePartDue(ord, allParts, part);
+      if (due > 0) {
         if (!paymentReceived) {
-          throw new ApiError(400, `باقي على الزبون ${transferDue} د.ل — لازم تستلمه وتأكد الاستلام قبل التسليم`);
+          throw new ApiError(400, `باقي على الزبون ${due} د.ل — لازم تستلمه وتأكد الاستلام قبل التسليم`);
         }
-        if (amountReceived === undefined || Math.abs(amountReceived - transferDue) > 0.01) {
-          throw new ApiError(400, `المبلغ المتبقي المطلوب استلامه من الزبون هو ${transferDue} د.ل`);
+        if (amountReceived === undefined || Math.abs(amountReceived - due) > 0.01) {
+          throw new ApiError(400, `المبلغ المتبقي المطلوب استلامه من الزبون هو ${due} د.ل`);
         }
       }
-    }
+    } // الآجل: لا تحصيل عند التسليم
 
-    if (!paymentReceived && part.payment_method !== "deferred"
-        && !(part.payment_method === "transfer" && transferDue === 0)) {
-      throw new ApiError(400, "يلزم تأكيد استلام قيمة الفاتورة أو اعتماد الحوالة");
-    }
-
+    const received = due > 0 && paymentReceived;
     await client.query(
       `UPDATE order_suppliers
           SET pickup_confirmed = TRUE, payment_received = $2,
               status = 'picked_up', confirmed_at = now()
         WHERE id = $1`,
-      [part.id, paymentReceived]
+      [part.id, received]
     );
 
-    // المبلغ اللي استلمه المورد نقدًا من العميل: كامل قيمة فاتورته (دفع عند المورد/نقد)، أو المتبقي بعد الحوالة
-    const cashAmount = ["pay_at_supplier", "cash"].includes(part.payment_method)
-      ? Number(part.subtotal)
-      : transferDue;
     const cashNote = part.payment_method === "transfer" ? " (المتبقي بعد الحوالة)" : "";
-    if (paymentReceived && cashAmount > 0) {
+    if (received) {
       await client.query(
         `UPDATE orders SET
-            paid_amount = paid_amount + $2,
+            paid_amount = ROUND(paid_amount + $2, 2),
             payment_status = CASE WHEN paid_amount + $2 >= grand_total THEN 'paid' ELSE 'partially_paid' END
           WHERE id = $1`,
-        [part.order_id, cashAmount]
+        [part.order_id, due]
       );
 
       // سند قبض حقيقي برقم رسمي — يظهر في كشف حساب العميل كدفعة موثّقة بدل سطر بلا رقم
@@ -1573,7 +2177,7 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
               note, created_by, off_treasury)
            VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", cashAmount,
+          [vNumber, part.customer_id, custRows[0]?.business_name ?? "عميل", due,
            tr[0].id, part.order_id, `دفع نقدًا عند الاستلام${cashNote} — استلمها المورد ${req.actor.name} لطلبية ${part.order_number}`]
         );
       }
@@ -1592,15 +2196,16 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
               amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
               note, created_by, off_treasury)
            VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber2, req.actor.id, req.actor.name, cashAmount, trPay[0].id, part.order_id,
+          [vNumber2, req.actor.id, req.actor.name, due, trPay[0].id, part.order_id,
            `استلمها المورد مباشرة من العميل عند الاستلام${cashNote} — طلبية ${part.order_number}`]
         );
       }
     }
 
+    // الأجزاء الملغاة ما تُحسب كمعلّقة (وإلا الطلبية ما تتسلّم أبدًا)
     const { rows: [pending] } = await client.query(
       `SELECT COUNT(*)::INT AS remaining FROM order_suppliers
-        WHERE order_id = $1 AND NOT pickup_confirmed`,
+        WHERE order_id = $1 AND NOT pickup_confirmed AND status <> 'cancelled'`,
       [part.order_id]
     );
 
@@ -1610,7 +2215,7 @@ orderRouter.post("/supplier-parts/:osId/pickup-confirm", requireActorType("suppl
         [part.order_id]
       );
       await recordStatus(client, {
-        orderId: part.order_id, from: "awaiting_pickup", to: "delivered", actor: req.actor,
+        orderId: part.order_id, from: part.order_status, to: "delivered", actor: req.actor,
       });
 
       const { rows: supplierNames } = await client.query(
@@ -1657,6 +2262,9 @@ orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"
     if (part.status !== "preparing") {
       throw new ApiError(400, "لا يمكن تعليم هذا الجزء كجاهز في حالته الحالية");
     }
+    if (!["sent_to_supplier", "supplier_preparing", "shortage"].includes(part.order_status)) {
+      throw new ApiError(409, "الطلبية غير مفعّلة حاليًا (مؤجلة أو ملغاة أو منتهية)");
+    }
 
     await client.query(`UPDATE order_suppliers SET status = 'ready' WHERE id = $1`, [part.id]);
     await recordStatus(client, {
@@ -1666,7 +2274,7 @@ orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"
 
     const { rows: [pending] } = await client.query(
       `SELECT COUNT(*)::INT AS remaining FROM order_suppliers
-        WHERE order_id = $1 AND status NOT IN ('ready','picked_up')`,
+        WHERE order_id = $1 AND status NOT IN ('ready','picked_up','cancelled')`,
       [part.order_id]
     );
 
@@ -1687,7 +2295,11 @@ orderRouter.post("/supplier-parts/:osId/mark-ready", requireActorType("supplier"
   res.json(result);
 }));
 
-orderRouter.post("/:id/receipt", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+/* ===================================================================
+   الإيصالات
+=================================================================== */
+
+orderRouter.post("/:id/receipt", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const receipt = await withTransaction(async (client) => {
     const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
@@ -1699,7 +2311,7 @@ orderRouter.post("/:id/receipt", requirePermission("orders.review"), asyncRoute(
     const number = await nextDocNumber(client, {
       table: "order_receipts", column: "receipt_number", prefix: "REC", start: 1000,
     });
-    const remaining = Math.max(0, Number(order.grand_total) - Number(order.paid_amount));
+    const remaining = Math.max(0, round2(Number(order.grand_total) - Number(order.paid_amount)));
 
     const { rows: created } = await client.query(
       `INSERT INTO order_receipts
@@ -1726,21 +2338,40 @@ orderRouter.post("/:id/receipt", requirePermission("orders.review"), asyncRoute(
   res.status(201).json(receipt);
 }));
 
+// الإيصالات: العميل صاحب الطلبية أو موظف بصلاحية عرض الطلبيات (ضمن نطاقه) — لا موردين ولا مندوبين
 orderRouter.get("/:id/receipts", asyncRoute(async (req, res) => {
-  const order = await query(`SELECT customer_id FROM orders WHERE id = $1`, [req.params.id]);
-  if (!order.rows.length) throw new ApiError(404, "الطلبية غير موجودة");
-  if (req.actor.type === "customer" && order.rows[0].customer_id !== req.actor.id) {
-    throw new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
+  const { rows: ord } = await query(`SELECT customer_id FROM orders WHERE id = $1`, [req.params.id]);
+  if (!ord.length) throw new ApiError(404, "الطلبية غير موجودة");
+  const a = req.actor;
+  const FORBIDDEN = new ApiError(403, "لا تملك صلاحية الاطلاع على هذه الطلبية");
+  if (a.type === "customer") {
+    if (ord[0].customer_id !== a.id) throw FORBIDDEN;
+  } else if (a.type === "employee" && a.role !== "driver") {
+    if (!(await employeeHasAny(a.id, STAFF_VIEW_PERMS))) throw FORBIDDEN;
+    if (!(await orderInEmployeeScope(a.id, req.params.id))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
+  } else {
+    throw FORBIDDEN;
   }
-  const { rows } = await query(`SELECT * FROM order_receipts WHERE order_id = $1 ORDER BY issued_at DESC`, [req.params.id]);
+  const { rows } = await query(
+    `SELECT id, receipt_number, order_id, invoice_total, amount_paid, amount_remaining,
+            payment_method, due_date, issued_at
+       FROM order_receipts WHERE order_id = $1 ORDER BY issued_at DESC`,
+    [req.params.id]
+  );
   res.json(rows);
 }));
 
+/* ===================================================================
+   تعديل أصناف فاتورة طلبية (إدارة) — مع إبقاء المخزون متسقًا
+   القاعدة: لو جزء المورد أكّد التوفر (status خارج pending/sent) فالمخزون اتخصم بقيمة
+   qty_confirmed، وأي تعديل بعدها يكتب فرق المخزون + حركة مخزون في نفس المعاملة.
+=================================================================== */
+
 // إضافة صنف جديد لفاتورة طلبية بعد اعتمادها
-orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+orderRouter.post("/:id/items", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const body = z.object({
     productId: z.string().uuid(),
-    qty: z.number().positive(),
+    qty: z.number().positive().max(MAX_LINE_QTY),
     variantId: z.string().uuid().optional(),
   }).parse(req.body);
 
@@ -1752,80 +2383,82 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
       throw new ApiError(400, "لا يمكن تعديل فاتورة طلبية تم تسليمها أو إلغاؤها");
     }
 
-    const { rows: prodRows } = await client.query(
-      `SELECT p.id, p.name, p.unit, p.section_id, p.supplier_id, p.purchase_cost, p.supplier_sku,
-              p.availability, s.status AS supplier_status
-         FROM products p JOIN suppliers s ON s.id = p.supplier_id
-        WHERE p.id = $1 AND p.is_active`,
-      [body.productId]
-    );
-    if (!prodRows.length) throw new ApiError(404, "الصنف غير موجود");
-    const p = prodRows[0];
-    if (p.supplier_status !== "approved") throw new ApiError(400, "المورد غير معتمد حاليًا");
-    if (p.availability === "out" && !body.variantId) throw new ApiError(400, `الصنف غير متوفر: ${p.name}`);
-
-    let variantLabel = null;
-    let purchaseCost = p.purchase_cost;
-    if (body.variantId) {
-      const { rows: vRows } = await client.query(
-        `SELECT id, label, purchase_cost FROM product_variants WHERE id = $1 AND product_id = $2 AND is_active`,
-        [body.variantId, p.id]
-      );
-      if (!vRows.length) throw new ApiError(404, `نوع الصنف غير متاح: ${p.name}`);
-      variantLabel = vRows[0].label;
-      purchaseCost = vRows[0].purchase_cost ?? purchaseCost;
-    } else {
-      const { rows: hv } = await client.query(`SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active LIMIT 1`, [p.id]);
-      if (hv.length) throw new ApiError(400, `لازم تختار نوع (لون/مقاس/عبوة) للصنف: ${p.name}`);
-    }
-    const productName = variantLabel ? `${p.name} — ${variantLabel}` : p.name;
-
-    await assertCustomerSection(order.customer_id, p.section_id);
-    const price = await resolvePrice(client, {
-      productId: p.id, customerId: order.customer_id, qty: body.qty, variantId: body.variantId,
-    });
+    await lockStockForProducts(client, [body.productId]);
+    const [line] = await prepareLines(client, order.customer_id, [body]);
 
     const { rows: osRows } = await client.query(
-      `SELECT id FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2`,
-      [order.id, p.supplier_id]
+      `SELECT id, status FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2 FOR UPDATE`,
+      [order.id, line.supplier_id]
     );
     let orderSupplierId;
+    let partConfirmed = false;
+    let partStatusNow = order.status === "under_review" ? "pending" : "sent";
     if (osRows.length) {
+      partStatusNow = osRows[0].status;
       orderSupplierId = osRows[0].id;
+      partConfirmed = !PART_UNCONFIRMED.includes(osRows[0].status) && osRows[0].status !== "cancelled";
+      if (osRows[0].status === "cancelled") throw new ApiError(400, "فاتورة هذا المورد ملغاة في هذه الطلبية");
     } else {
       const { rows: rateRows } = await client.query(
-        `SELECT commission_rate_percent FROM suppliers WHERE id = $1`, [p.supplier_id]
+        `SELECT commission_rate_percent FROM suppliers WHERE id = $1`, [line.supplier_id]
       );
       const { rows: createdOs } = await client.query(
         `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, status, commission_rate)
          VALUES ($1,$2,0, CASE WHEN $3 = 'under_review' THEN 'pending' ELSE 'sent' END, $4)
          RETURNING id`,
-        [order.id, p.supplier_id, order.status, rateRows[0]?.commission_rate_percent ?? 0]
+        [order.id, line.supplier_id, order.status, rateRows[0]?.commission_rate_percent ?? 0]
       );
       orderSupplierId = createdOs[0].id;
+      // مورد جديد لسا ما أكّد: لو الطلبية كانت "جاهزة" نرجعها لمرحلة الإرسال للمورد عشان تنتظره
+      if (["ready", "ready_for_delivery", "ready_for_pickup"].includes(order.status)) {
+        await client.query(`UPDATE orders SET status = 'sent_to_supplier' WHERE id = $1`, [order.id]);
+        await recordStatus(client, {
+          orderId: order.id, from: order.status, to: "sent_to_supplier", actor: req.actor,
+          note: "إضافة مورد جديد للطلبية — بانتظار تأكيد توفره",
+        });
+      }
     }
 
-    const lineTotal = price * body.qty;
+    if (partConfirmed) {
+      // الجزء مؤكّد: الصنف الجديد يُعتبر مؤكّدًا فورًا ويُخصم من المخزون (يرفض لو ما يكفي)
+      await adjustStock(client, {
+        productId: line.productId, variantId: line.variantId, delta: -line.qty,
+        reason: stockReasons(order.order_number).sale, actorId: req.actor.id,
+      });
+    } else {
+      // الجزء لسا ما أكّد: المورد بيأكده لاحقًا وقتها يتخصم — هنا نتحقق بس من المتاح بعد المحجوز
+      await assertStockAvailable(client, [{
+        productId: line.productId, variantId: line.variantId, qty: line.qty, label: line.name,
+      }]);
+    }
+
     const { rows: [item] } = await client.query(
       `INSERT INTO order_items
          (order_id, order_supplier_id, product_id, product_name, unit,
           unit_price, purchase_cost, qty_requested, qty_confirmed, availability, line_total, supplier_sku,
           variant_id, variant_label)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'full',$9,$10,$11,$12) RETURNING *`,
-      [order.id, orderSupplierId, p.id, productName, p.unit, price, purchaseCost, body.qty, lineTotal, p.supplier_sku ?? null,
-       body.variantId || null, variantLabel]
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [order.id, orderSupplierId, line.productId, line.name, line.unit, line.price, line.purchase_cost, line.qty,
+       partConfirmed ? line.qty : null, partConfirmed ? "full" : null, line.lineTotal, line.supplier_sku,
+       line.variantId, line.variantLabel]
     );
 
     await recalcOrderTotals(client, order.id);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
-      note: `تمت إضافة صنف: ${productName} × ${body.qty} ${p.unit}`,
+      note: `تمت إضافة صنف: ${line.name} × ${line.qty} ${line.unit}`,
     });
+    if (partStatusNow !== "pending") {
+      await notifySuppliers(client, {
+        supplierIds: [line.supplier_id], order, templateCode: "order.part_items_changed",
+        change: `أُضيف الصنف ${line.name} بكمية ${line.qty} ${line.unit ?? ""}`.trim(),
+      });
+    }
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "order_item.added", entityType: "order_item", entityId: item.id,
-      entityLabel: `${order.order_number} — ${p.name}`, after: item, ip: req.ip,
+      entityLabel: `${order.order_number} — ${line.name}`, after: item, ip: req.ip,
     });
 
     const { rows: [updatedOrder] } = await client.query(`SELECT * FROM orders WHERE id = $1`, [order.id]);
@@ -1836,8 +2469,9 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), asyncRoute(as
 }));
 
 // تعديل كمية صنف موجود في فاتورة طلبية
-orderRouter.patch("/:id/items/:itemId", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const { qty } = z.object({ qty: z.number().positive() }).parse(req.body);
+orderRouter.patch("/:id/items/:itemId", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
+  const { qty: rawQty } = z.object({ qty: z.number().positive().max(MAX_LINE_QTY) }).parse(req.body);
+  const qty = round3(rawQty);
 
   const result = await withTransaction(async (client) => {
     const { rows: orderRows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
@@ -1848,24 +2482,71 @@ orderRouter.patch("/:id/items/:itemId", requirePermission("orders.review"), asyn
     }
 
     const { rows: itemRows } = await client.query(
-      `SELECT * FROM order_items WHERE id = $1 AND order_id = $2 FOR UPDATE`,
+      `SELECT oi.*, os.status AS part_status FROM order_items oi
+         JOIN order_suppliers os ON os.id = oi.order_supplier_id
+        WHERE oi.id = $1 AND oi.order_id = $2 FOR UPDATE OF oi`,
       [req.params.itemId, order.id]
     );
     if (!itemRows.length) throw new ApiError(404, "الصنف غير موجود في هذه الطلبية");
     const before = itemRows[0];
+    assertQtyForUnit(qty, before.unit, before.product_name);
 
-    const { rows: [updated] } = await client.query(
-      `UPDATE order_items SET qty_requested = $2, qty_confirmed = $2, line_total = unit_price * $2
-        WHERE id = $1 RETURNING *`,
-      [before.id, qty]
-    );
+    const partConfirmed = !PART_UNCONFIRMED.includes(before.part_status) && before.part_status !== "cancelled";
+    const lineTotal = round2(Number(before.unit_price) * qty);
+    let updated;
+    if (partConfirmed) {
+      // المخزون اتخصم بقيمة qty_confirmed — نكتب الفرق فقط (رجوع لو نقصت الكمية، خصم إضافي لو زادت)
+      const deducted = Number(before.qty_confirmed || 0);
+      const delta = round3(qty - deducted);
+      if (delta !== 0) {
+        await lockStockForProducts(client, [before.product_id]);
+        const r = stockReasons(order.order_number);
+        await adjustStock(client, {
+          productId: before.product_id, variantId: before.variant_id, delta: -delta,
+          reason: delta > 0 ? r.sale : r.editBack, actorId: req.actor.id,
+        });
+      }
+      ({ rows: [updated] } = await client.query(
+        `UPDATE order_items SET qty_requested = $2, qty_confirmed = $2, availability = 'full', line_total = $3 WHERE id = $1 RETURNING *`,
+        [before.id, qty, lineTotal]
+      ));
+      // الكمية المطلوبة صارت = المؤكدة: ما بقي نقص معلّق على هذا الصنف
+      await client.query(
+        `UPDATE order_shortages SET resolution = 'reduce_qty', customer_approved = TRUE, admin_approved = TRUE,
+                resolved_by = $2, resolved_at = now()
+          WHERE order_item_id = $1 AND resolved_at IS NULL`,
+        [before.id, req.actor.id]
+      );
+    } else {
+      // الجزء لسا ما أكّد: ما فيش خصم مخزون بعد؛ نتحقق بس من المتاح لو الكمية زادت
+      const extra = round3(qty - Number(before.qty_requested));
+      if (extra > 0) {
+        await assertStockAvailable(client, [{
+          productId: before.product_id, variantId: before.variant_id, qty: extra, label: before.product_name,
+        }]);
+      }
+      ({ rows: [updated] } = await client.query(
+        `UPDATE order_items SET qty_requested = $2, line_total = $3 WHERE id = $1 RETURNING *`,
+        [before.id, qty, lineTotal]
+      ));
+    }
 
     await recalcOrderTotals(client, order.id);
+    await settlePartShortageStatus(client, before.order_supplier_id);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
       note: `تم تعديل كمية صنف: ${before.product_name} — من ${before.qty_requested} إلى ${qty}`,
     });
+    if (before.part_status !== "pending") {
+      const { rows: [pt] } = await client.query(`SELECT supplier_id FROM order_suppliers WHERE id = $1`, [before.order_supplier_id]);
+      if (pt) {
+        await notifySuppliers(client, {
+          supplierIds: [pt.supplier_id], order, templateCode: "order.part_items_changed",
+          change: `تعديل كمية ${before.product_name} من ${Number(before.qty_requested)} إلى ${qty}`,
+        });
+      }
+    }
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "order_item.qty_updated", entityType: "order_item", entityId: before.id,
@@ -1880,7 +2561,7 @@ orderRouter.patch("/:id/items/:itemId", requirePermission("orders.review"), asyn
 }));
 
 // حذف صنف من فاتورة طلبية
-orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), requireOrderScope, asyncRoute(async (req, res) => {
   const result = await withTransaction(async (client) => {
     const { rows: orderRows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!orderRows.length) throw new ApiError(404, "الطلبية غير موجودة");
@@ -1890,7 +2571,9 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
     }
 
     const { rows: itemRows } = await client.query(
-      `SELECT * FROM order_items WHERE id = $1 AND order_id = $2 FOR UPDATE`,
+      `SELECT oi.*, os.status AS part_status FROM order_items oi
+         JOIN order_suppliers os ON os.id = oi.order_supplier_id
+        WHERE oi.id = $1 AND oi.order_id = $2 FOR UPDATE OF oi`,
       [req.params.itemId, order.id]
     );
     if (!itemRows.length) throw new ApiError(404, "الصنف غير موجود في هذه الطلبية");
@@ -1903,22 +2586,37 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
       throw new ApiError(400, "لا يمكن حذف آخر صنف في الطلبية — استخدم إلغاء الطلبية بدلاً من ذلك");
     }
 
+    // لو الجزء مؤكّد فالكمية المؤكدة اتخصمت من المخزون — نرجّعها مع حركة مخزون في نفس المعاملة
+    const partConfirmed = !PART_UNCONFIRMED.includes(item.part_status) && item.part_status !== "cancelled";
+    if (partConfirmed && Number(item.qty_confirmed || 0) > 0) {
+      await lockStockForProducts(client, [item.product_id]);
+      await adjustStock(client, {
+        productId: item.product_id, variantId: item.variant_id, delta: Number(item.qty_confirmed),
+        reason: stockReasons(order.order_number).editBack, actorId: req.actor.id,
+      });
+    }
+
+    const { rows: [delPart] } = await client.query(`SELECT supplier_id FROM order_suppliers WHERE id = $1`, [item.order_supplier_id]);
+
     // لازم نحذف أي سجل نقص مرتبط بهذا الصنف أول، وإلا الحذف يترفض بسبب قيد
     // المفتاح الأجنبي (يصير هذا كثير مع أصناف مرّت بمسار "نقص" قبل كذا)
     await client.query(`DELETE FROM order_shortages WHERE order_item_id = $1`, [item.id]);
     await client.query(`DELETE FROM order_items WHERE id = $1`, [item.id]);
 
-    // ملاحظة: ما نحذفش صف "فاتورة المورد" (order_suppliers) حتى لو صار فاضي من كل
-    // الأصناف — هذا الصف مربوط بسجل حالة الطلبية (order_status_history) وغيره، وحذفه
-    // كان يفشل بنفس مشكلة قيد المفتاح الأجنبي. بدل كده، أي مورد فاضي من الأصناف
-    // يُستثنى تلقائيًا من الفاتورة وقائمة مواقع الاستلام عند المندوب (انظر GET /:id)
-
+    // recalcOrderTotals يشيل فاتورة المورد لو فضيت من كل أصنافها، ويعيد حساب رسوم التوصيل من الموردين الباقين
     await recalcOrderTotals(client, order.id);
+    await settlePartShortageStatus(client, item.order_supplier_id);
 
     await recordStatus(client, {
       orderId: order.id, from: order.status, to: order.status, actor: req.actor,
       note: `تم حذف صنف: ${item.product_name} × ${item.qty_requested} ${item.unit}`,
     });
+    if (item.part_status !== "pending" && delPart) {
+      await notifySuppliers(client, {
+        supplierIds: [delPart.supplier_id], order, templateCode: "order.part_items_changed",
+        change: `حُذف الصنف ${item.product_name} (${Number(item.qty_requested)} ${item.unit ?? ""})`.trim(),
+      });
+    }
     await writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: "order_item.removed", entityType: "order_item", entityId: item.id,
@@ -1929,162 +2627,5 @@ orderRouter.delete("/:id/items/:itemId", requirePermission("orders.review"), asy
     return { removed: true, order: updatedOrder };
   });
 
-  res.json(result);
-}));
-
-
-// نقطة مؤقتة تُستدعى مرة واحدة: تصحح paid_amount/payment_status للطلبيات
-// السابقة اللي كان دفعها "عند المورد" واستلمها المورد كاش قبل إضافة هذا المنطق
-orderRouter.post("/admin/backfill-pay-at-supplier", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const result = await withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `WITH collected AS (
-         SELECT os.order_id, SUM(os.subtotal) AS amt
-           FROM order_suppliers os JOIN orders o ON o.id = os.order_id
-          WHERE os.payment_received = TRUE AND o.payment_method = 'pay_at_supplier'
-          GROUP BY os.order_id
-       )
-       UPDATE orders o SET
-           paid_amount = c.amt,
-           payment_status = CASE WHEN c.amt >= o.grand_total THEN 'paid' ELSE 'partially_paid' END
-         FROM collected c
-        WHERE o.id = c.order_id AND o.paid_amount IS DISTINCT FROM c.amt
-        RETURNING o.id`
-    );
-    return { updatedCount: rows.length };
-  });
-  res.json(result);
-}));
-
-// نقطة مؤقتة تُستدعى مرة واحدة: تصحح paid_amount/payment_status للطلبيات اللي
-// اتسلّمت واتقفلت بتحديث حالة يدوي من لوحة الإدارة (قبل إضافة منطق الدفع تلقائيًا)
-// وطريقة دفعها نقدًا عند الاستلام أو عند المورد، بس المبلغ المدفوع فيها فضل صفر
-orderRouter.post("/admin/backfill-pickup-cash", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const result = await withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `UPDATE orders o SET
-           paid_amount = o.grand_total,
-           payment_status = 'paid'
-         WHERE o.status = 'delivered'
-           AND o.fulfillment = 'pickup'
-           AND o.payment_method IN ('cash', 'pay_at_supplier')
-           AND o.paid_amount < o.grand_total
-         RETURNING o.id, o.order_number`
-    );
-
-    // نفس الطلبيات: نصحح جزء المورد (order_suppliers) اللي فاته التحديث لما
-    // الحالة اتغيّرت يدويًا من لوحة الإدارة (تجاوز الزر العادي لتأكيد الاستلام)،
-    // عشان يبان صح في كشف حساب العميل والمورد بعدين
-    const { rows: osRows } = await client.query(
-      `UPDATE order_suppliers os SET
-           payment_received = TRUE,
-           pickup_confirmed = TRUE,
-           status = CASE WHEN os.status NOT IN ('picked_up','closed','cancelled') THEN 'picked_up' ELSE os.status END,
-           confirmed_at = COALESCE(os.confirmed_at, now())
-         FROM orders o
-        WHERE o.id = os.order_id
-          AND o.status = 'delivered'
-          AND o.fulfillment = 'pickup'
-          AND o.payment_method IN ('cash', 'pay_at_supplier')
-          AND os.payment_received = FALSE
-        RETURNING os.id`
-    );
-
-    const { rows: tr } = await client.query(
-      `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("receipt", "cash")]
-    );
-    const { rows: trPay } = await client.query(
-      `SELECT id FROM treasuries WHERE code = $1`, [resolveTreasuryCode("payment", "cash")]
-    );
-
-    // نصحح أي طلبية "استلام شخصي" محصّلة نقدًا (عند المورد أو نقدًا) ماعندهاش سند قبض/دفع
-    // حقيقي بعد بسبب أنها اتقفلت قبل ما نضيف إنشاء السندات التلقائي
-    const { rows: missing } = await client.query(
-      `SELECT os.id AS os_id, os.order_id, os.supplier_id, os.subtotal, s.business_name AS supplier_name,
-              o.order_number, o.customer_id, c.business_name AS customer_name
-         FROM order_suppliers os
-         JOIN orders o ON o.id = os.order_id
-         JOIN suppliers s ON s.id = os.supplier_id
-         JOIN customers c ON c.id = o.customer_id
-        WHERE os.payment_received = TRUE
-          AND o.payment_method IN ('cash', 'pay_at_supplier')
-          AND NOT EXISTS (
-            SELECT 1 FROM vouchers v
-             WHERE v.order_id = os.order_id AND v.party_type = 'customer' AND v.voucher_type = 'receipt'
-          )`
-    );
-
-    let vouchersCreated = 0;
-    for (const m of missing) {
-      if (tr.length) {
-        const vNumber = await nextDocNumber(client, {
-          table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
-        });
-        await client.query(
-          `INSERT INTO vouchers
-             (voucher_number, voucher_type, party_type, party_id, party_name,
-              amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by, off_treasury)
-           VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber, m.customer_id, m.customer_name, m.subtotal, tr[0].id, m.order_id,
-           `دفع نقدًا عند الاستلام — استلمها المورد ${m.supplier_name} لطلبية ${m.order_number} (تصحيح رصيد)`]
-        );
-        vouchersCreated += 1;
-      }
-      if (trPay.length) {
-        const vNumber2 = await nextDocNumber(client, {
-          table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
-        });
-        await client.query(
-          `INSERT INTO vouchers
-             (voucher_number, voucher_type, party_type, party_id, party_name,
-              amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-              note, created_by, off_treasury)
-           VALUES ($1,'payment','supplier',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-          [vNumber2, m.supplier_id, m.supplier_name, m.subtotal, trPay[0].id, m.order_id,
-           `استلمها المورد مباشرة من العميل عند الاستلام — طلبية ${m.order_number} (تصحيح رصيد)`]
-        );
-      }
-    }
-
-    // نفس الشي لطلبيات التوصيل اللي حصّلها مندوب نقدًا (COD) وماعندهاش سند قبض بعد
-    const { rows: missingCod } = await client.query(
-      `SELECT o.id AS order_id, o.order_number, o.customer_id, o.cod_amount,
-              c.business_name AS customer_name, e.name AS driver_name
-         FROM orders o
-         JOIN customers c ON c.id = o.customer_id
-         LEFT JOIN employees e ON e.id = o.driver_id
-        WHERE o.cod_collected = TRUE
-          AND o.fulfillment = 'delivery'
-          AND o.cod_amount > 0
-          AND NOT EXISTS (
-            SELECT 1 FROM vouchers v
-             WHERE v.order_id = o.id AND v.party_type = 'customer' AND v.voucher_type = 'receipt'
-          )`
-    );
-    for (const m of missingCod) {
-      if (!tr.length) continue;
-      const vNumber = await nextDocNumber(client, {
-        table: "vouchers", column: "voucher_number", prefix: "V", start: 1000,
-      });
-      await client.query(
-        `INSERT INTO vouchers
-           (voucher_number, voucher_type, party_type, party_id, party_name,
-            amount, method, treasury_id, order_id, approval_status, approved_by, approved_at,
-            note, created_by, off_treasury)
-         VALUES ($1,'receipt','customer',$2,$3,$4,'cash',$5,$6,'approved',NULL,now(),$7,NULL,true)`,
-        [vNumber, m.customer_id, m.customer_name, m.cod_amount, tr[0].id, m.order_id,
-         `تحصيل نقدي عند التسليم — حصّلها المندوب ${m.driver_name ?? "غير معروف"} لطلبية ${m.order_number} (تصحيح رصيد)`]
-      );
-      vouchersCreated += 1;
-    }
-
-    return {
-      updatedCount: rows.length,
-      orders: rows.map((r) => r.order_number),
-      supplierPartsFixed: osRows.length,
-      vouchersCreated,
-    };
-  });
   res.json(result);
 }));
