@@ -522,7 +522,7 @@ async function normalizeTestProducts(client) {
     if (rule) {
       const parent = map.get(rule.key);
       const subId = subIds.get(`${rule.key}|${norm(rule.sub)}`);
-      if (parent && subId && enabled.has(`${p.supplier_id}|${parent.id}`) && String(p.section_id) !== subId) {
+      if (parent && subId && (enabled.has(`${p.supplier_id}|${parent.id}`) || String(p.section_id) === String(parent.id)) && String(p.section_id) !== subId) {
         await client.query(`UPDATE products SET section_id = $2 WHERE id = $1`, [p.id, subId]);
         moved++;
       }
@@ -578,5 +578,6 @@ export async function runBootstrap() {
   await runJob("merge_food_duplicate_v1", mergeFoodDuplicate);
   await runJob("normalize_test_products_v2", normalizeTestProducts);
   await runJob("normalize_test_products_v3", normalizeTestProducts);
+  await runJob("normalize_test_products_v4", normalizeTestProducts);
   log("اكتملت");
 }
