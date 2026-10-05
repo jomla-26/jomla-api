@@ -540,6 +540,199 @@ async function normalizeTestProducts(client, opts = {}) {
   return { testSuppliers: suppliers.length, products: products.length, unitFixed, imageSet, stockSet, moved };
 }
 
+/* ------------------------------ الإصدار الثاني (v2): توسعة الأقسام والبانرات ------------------------------ */
+// ملاحظة: MAIN/SUBS/BANNER_TEXT أعلاه لا تُمَس (مهام v1 منفَّذة وتبقى بنفس سلوكها).
+// المفاتيح الجديدة هنا في MAIN_V2 المنفصلة، وتُطابَق مع المفاتيح القديمة عبر resolveMainSectionsV2 فقط.
+
+const MAIN_V2 = [
+  // يجب أن يُفحص قبل electrical ("أجهزة كهربائية منزلية" تطابق /كهرب/ و/منزليه/ في aliases القديمة)
+  { key: "appliances", name: "أجهزة كهربائية منزلية", alias: wordRe("اجهزه كهربائيه|كهربائيه منزليه") },
+  { key: "paints", name: "الدهانات", alias: wordRe("دهان") },
+  { key: "handtools", name: "الأدوات اليدوية", alias: wordRe("يدويه|عدد") },
+  { key: "workshop", name: "معدات الورش", alias: wordRe("ورش") },
+  { key: "meat", name: "لحوم ودواجن ومجمدات", alias: wordRe("لحوم|دواجن|مجمد") },
+  { key: "produce", name: "خضر وفواكه", alias: wordRe("خضر|خضار|فواكه|فاكهه") },
+  { key: "bakery", name: "مخابز وحلويات", alias: wordRe("مخابز|حلويات|معجنات") },
+  { key: "packaging", name: "مواد تغليف وبلاستيك", alias: wordRe("تغليف|بلاستيك") },
+  { key: "agriculture", name: "زراعة وبيطرة", alias: wordRe("زراع|بيطر|اعلاف") },
+  { key: "clothing", name: "ملابس وأحذية وأقمشة", alias: wordRe("ملابس|احذيه|اقمشه") },
+  { key: "kids", name: "ألعاب ومستلزمات أطفال", alias: wordRe("العاب|اطفال") },
+  { key: "furniture", name: "أثاث ومفروشات", alias: wordRe("اثاث|مفروشات") },
+  { key: "sports", name: "رياضة ورحلات", alias: wordRe("رياضه|رحلات") },
+  { key: "party", name: "مستلزمات حفلات وهدايا", alias: wordRe("حفلات|هدايا") },
+  { key: "accessories", name: "ساعات ونظارات وإكسسوارات", alias: wordRe("ساعات|نظارات|اكسسوار") },
+];
+
+// ترتيب المطابقة في v2: appliances أولًا، ثم المفاتيح القديمة بترتيبها (electrical تبقى للـ"الكهربائية")، ثم باقي الجديدة
+const V2_MATCH_ORDER = [
+  MAIN_V2[0],
+  ...MAIN,
+  ...MAIN_V2.slice(1),
+];
+
+// الأقسام الفرعية المطلوب إضافتها (الناقص فقط): مفاتيح جديدة + إضافات للمفاتيح القديمة
+const SUBS_V2 = {
+  meat: ["لحوم حمراء", "دواجن", "أسماك ومأكولات بحرية", "مجمدات وخضار مجمدة", "نقانق ومصنعات لحوم"],
+  produce: ["خضر طازجة", "فواكه", "بطاطس وبصل وثوم", "أعشاب وورقيات", "تمور ومكسرات"],
+  bakery: ["مواد الخبز والدقيق", "خميرة ومحسنات", "حلويات شرقية", "كيك ومعجنات", "شوكولاتة وسكاكر"],
+  packaging: ["أكياس وأكياس نفايات", "علب وحافظات", "أكواب وصحون للاستعمال الواحد", "ورق وبلاستيك تغليف", "عبوات وقوارير"],
+  agriculture: ["بذور وشتلات", "أسمدة ومبيدات", "أنظمة ري", "معدات زراعية", "أعلاف ومستلزمات حيوانات", "أدوية بيطرية"],
+  clothing: ["ملابس رجالية", "ملابس نسائية", "ملابس أطفال", "أحذية", "أقمشة وخياطة", "ملابس عمل وزي موحد"],
+  kids: ["ألعاب", "حفاضات ورضاعات", "عربات ومقاعد أطفال", "أدوات مدرسية للأطفال", "ألعاب رياضية"],
+  furniture: ["غرف نوم", "صالونات وجلوس", "مكاتب وأثاث مكتبي", "مطابخ وخزائن", "مراتب ولحف ومخدات", "سجاد وستائر", "أثاث فنادق ومطاعم"],
+  appliances: ["ثلاجات وفريزرات", "غسالات", "مكيفات وتبريد", "أفران وطباخات", "أجهزة مطبخ صغيرة", "مراوح وسخانات"],
+  sports: ["معدات رياضية", "خيم ومستلزمات رحلات", "دراجات", "لياقة وأوزان"],
+  party: ["بالونات وزينة", "هدايا وتغليف", "شموع وورود صناعية", "أدوات مناسبات"],
+  accessories: ["ساعات", "نظارات", "حقائب ومحافظ", "مجوهرات وإكسسوار"],
+  paints: ["دهانات داخلية", "دهانات خارجية", "أصباغ وملونات", "معجون وورنيش", "فرش وأدوات دهان"],
+  handtools: ["عدد يدوية", "عدد كهربائية", "لحام وقطع", "مسامير وبراغي وإكسسوارات", "سلالم ومعدات سلامة"],
+  workshop: ["ماكينات ورش", "مولدات وضواغط", "معدات رفع ونقل", "قطع غيار معدات"],
+  // إضافات للمفاتيح القديمة
+  food: ["عسل ومربى", "مخللات وزيتون", "مياه معدنية", "أغذية أطفال وحليب أطفال", "مكسرات وتسالي", "بيض"],
+  building: ["سيراميك وبلاط", "رخام وجرانيت", "زجاج وألمنيوم", "حديد تشكيل وأنابيب", "صرف وأنابيب بلاستيك"],
+  electrical: ["طاقة شمسية", "كاميرات مراقبة وإنذار", "مراوح وسخانات صغيرة"],
+  household: ["ديكور وإضاءة منزلية", "منظمات وتخزين"],
+  electronics: ["كمبيوتر ولابتوب", "شبكات وراوترات", "سماعات وصوتيات"],
+  auto: ["غسيل وتلميع سيارات", "عدد ومعدات سيارات"],
+  cleaning: ["مبيدات حشرات ومعطرات"],
+  cafe: ["عصائر وشراب مركز", "مواد حلويات للمقاهي"],
+};
+
+// مطابقة v2: key -> صف القسم الرئيسي (لكل المفاتيح القديمة والجديدة)، كل صف يُحجز لمفتاح واحد فقط
+async function resolveMainSectionsV2(client) {
+  const { rows } = await client.query(
+    `SELECT id, name, sort_order, is_active, image_url FROM sections
+      WHERE parent_id IS NULL ORDER BY is_active DESC, sort_order, name`
+  );
+  const map = new Map();
+  const used = new Set();
+  for (const def of V2_MATCH_ORDER) {
+    const hit = rows.find((r) => !used.has(String(r.id)) && def.alias.test(norm(r.name)));
+    if (hit) { map.set(def.key, hit); used.add(String(hit.id)); }
+  }
+  return { map, rows };
+}
+
+async function seedSectionsV2(client) {
+  const cols = await getColumns(client, "sections");
+  if (!hasCols(cols, ["id", "name", "slug", "parent_id", "sort_order", "image_url", "is_active"])) {
+    return { skipped: "مخطط sections مختلف" };
+  }
+  const ctx = await insertContext(client, "sections", cols);
+  const { map, rows: mains } = await resolveMainSectionsV2(client);
+
+  const { rows: allRows } = await client.query(`SELECT name, slug FROM sections`);
+  const slugs = new Set(allRows.map((r) => r.slug));
+  // اسم القسم فريد عالميًا (sections_name_key): نتجنّب أي اسم موجود في أي مكان حتى لا تفشل المعاملة
+  const allNames = new Set(allRows.map((r) => norm(r.name)));
+  const makeSlug = (base) => {
+    let s = base, n = 2;
+    while (slugs.has(s)) s = `${base}-${n++}`;
+    slugs.add(s);
+    return s;
+  };
+
+  const newKeys = new Set(MAIN_V2.map((d) => d.key));
+  let maxSort = mains.reduce((m, r) => Math.max(m, Number(r.sort_order) || 0), 0);
+  let createdMain = 0, createdSub = 0, imagesFilled = 0, matched = 0, skippedMain = 0, skippedSub = 0;
+
+  for (const def of V2_MATCH_ORDER) {
+    const imageUrl = `${BASE_URL}/sections/${def.key}.svg`;
+    const parent = map.get(def.key);
+    let parentId;
+    if (parent) {
+      matched++;
+      parentId = parent.id; // لا نعيد تسمية القسم الموجود أبدًا
+      if (!parent.image_url || !String(parent.image_url).trim()) {
+        await client.query(`UPDATE sections SET image_url = $2 WHERE id = $1`, [parent.id, imageUrl]);
+        imagesFilled++;
+      }
+    } else if (newKeys.has(def.key)) {
+      if (allNames.has(norm(def.name))) { skippedMain++; continue; }
+      maxSort += 1;
+      parentId = await insertRow(client, "sections", ctx,
+        ["name", "slug", "parent_id", "sort_order", "image_url", "is_active"],
+        [def.name, makeSlug(def.key), null, maxSort, imageUrl, true]);
+      allNames.add(norm(def.name));
+      createdMain++;
+    } else {
+      continue; // مفتاح قديم بلا قسم مطابق: v1 مسؤولة عنه، لا ننشئه هنا
+    }
+
+    const { rows: kids } = await client.query(`SELECT sort_order FROM sections WHERE parent_id = $1`, [parentId]);
+    let sort = kids.reduce((m, k) => Math.max(m, Number(k.sort_order) || 0), 0);
+    for (const [i, subName] of (SUBS_V2[def.key] || []).entries()) {
+      if (allNames.has(norm(subName))) { skippedSub++; continue; }
+      sort += 1;
+      await insertRow(client, "sections", ctx,
+        ["name", "slug", "parent_id", "sort_order", "image_url", "is_active"],
+        [subName, makeSlug(`${def.key}-v2-${i + 1}`), parentId, sort, null, true]);
+      allNames.add(norm(subName));
+      createdSub++;
+    }
+  }
+  return { matchedExistingMain: matched, createdMain, createdSub, imagesFilled, skippedMain, skippedSub };
+}
+
+const BANNER_TEXT_V2 = {
+  meat: [["اللحوم والدواجن بالجملة", "طازجة ومجمدة بأفضل سعر"], ["مجمدات وأسماك بأسعار التجار", "اطلب بالكرتونة ووفّر"], ["موّن مطعمك ومتجرك", "توصيل مبرّد لكل المدن"]],
+  produce: [["الخضر والفواكه بالجملة", "طازجة يوميًا بأسعار مميزة"], ["بطاطس وبصل وثوم", "اطلب بالشوال ووفّر"], ["تمور ومكسرات فاخرة", "عروض خاصة للتجار"]],
+  bakery: [["مواد المخابز والحلويات", "دقيق وخميرة بأسعار الجملة"], ["حلويات وكيك ومعجنات", "جودة عالية وكميات متاحة"], ["شوكولاتة وسكاكر", "عروض حصرية للمحلات"]],
+  packaging: [["مواد التغليف بالجملة", "أكياس وعلب بأسعار منافسة"], ["أكواب وصحون للاستعمال الواحد", "اطلب بالكرتونة ووفّر"], ["عبوات وقوارير", "كل احتياجات التغليف في مكان واحد"]],
+  agriculture: [["مستلزمات الزراعة بالجملة", "بذور وأسمدة بأفضل سعر"], ["أنظمة ري ومعدات زراعية", "جهّز مزرعتك بأسعار مناسبة"], ["أعلاف وأدوية بيطرية", "توفر دائم وتوصيل سريع"]],
+  clothing: [["الملابس والأحذية بالجملة", "موديلات متنوعة بأسعار التجار"], ["أقمشة وزي موحد", "كميات كبيرة وأسعار خاصة"], ["ملابس رجالية ونسائية وأطفال", "تشكيلة واسعة لمتجرك"]],
+  kids: [["ألعاب ومستلزمات الأطفال", "بأسعار الجملة للمحلات"], ["حفاضات ورضاعات", "اطلب بالكرتونة ووفّر"], ["عربات ومقاعد أطفال", "جودة وأمان بأفضل سعر"]],
+  furniture: [["الأثاث والمفروشات بالجملة", "غرف نوم وصالونات بأسعار مميزة"], ["أثاث المكاتب والفنادق", "عروض خاصة للمشاريع"], ["مراتب وسجاد وستائر", "تشكيلة واسعة وتوصيل للموقع"]],
+  appliances: [["الأجهزة الكهربائية المنزلية", "ثلاجات وغسالات بأسعار الجملة"], ["مكيفات وتبريد", "جاهزة للتوريد بكميات كبيرة"], ["أجهزة مطبخ صغيرة", "عروض حصرية للتجار"]],
+  sports: [["مستلزمات الرياضة والرحلات", "بأسعار الجملة للمتاجر"], ["خيم ومعدات رحلات", "جهّز موسم الرحلات بأفضل سعر"], ["دراجات وأوزان ولياقة", "عروض خاصة على الكميات"]],
+  party: [["مستلزمات الحفلات والهدايا", "بالونات وزينة بأسعار الجملة"], ["هدايا وتغليف", "تشكيلة موسمية متجددة"], ["شموع وورود وأدوات مناسبات", "اطلب بالكرتونة ووفّر"]],
+  accessories: [["الساعات والنظارات بالجملة", "موديلات عصرية بأسعار التجار"], ["حقائب ومحافظ", "تشكيلة واسعة لمتجرك"], ["مجوهرات وإكسسوارات", "عروض حصرية للموزعين"]],
+  paints: [["الدهانات بأسعار الجملة", "داخلية وخارجية بجودة عالية"], ["أصباغ وملونات ومعجون", "كل ما يحتاجه المقاول"], ["فرش وأدوات دهان", "اطلب بالكرتونة ووفّر"]],
+  handtools: [["الأدوات اليدوية بالجملة", "عدد يدوية وكهربائية بأفضل سعر"], ["مسامير وبراغي ولحام", "كميات كبيرة وأسعار منافسة"], ["سلالم ومعدات سلامة", "جودة مضمونة وتوصيل سريع"]],
+  workshop: [["معدات الورش بالجملة", "ماكينات ومولدات بأسعار مميزة"], ["ضواغط ومعدات رفع", "جهّز ورشتك بأفضل الأسعار"], ["قطع غيار المعدات", "توفر دائم وتوصيل سريع"]],
+};
+
+async function seedBannersV2(client) {
+  const bCols = await getColumns(client, "promo_banners");
+  if (!hasCols(bCols, ["id", "image_url", "title", "subtitle", "sort_order", "is_active"])) {
+    return { skipped: "مخطط promo_banners مختلف" };
+  }
+  const bsCols = await getColumns(client, "banner_sections");
+  if (!hasCols(bsCols, ["banner_id", "section_id"])) return { skipped: "banner_sections غير موجود" };
+  // لا نبدأ قبل نجاح مهمة الأقسام v2 (وإلا نُسجّل الإنجاز بلا بانرات)
+  const st = await client.query(`SELECT value FROM app_state WHERE key = 'bootstrap:seed_sections_v2'`);
+  if (!st.rows.length || !String(st.rows[0].value).startsWith("done")) {
+    return { skipped: "seed_sections_v2 لم تكتمل بعد" };
+  }
+  const ctx = await insertContext(client, "promo_banners", bCols);
+  const { map } = await resolveMainSectionsV2(client);
+
+  const { rows: mx } = await client.query(`SELECT COALESCE(MAX(sort_order), 0) AS m FROM promo_banners`);
+  let sort = Number(mx[0].m) || 0;
+  let created = 0, skippedExisting = 0, missingSection = 0;
+  const exists = async (img) => (await client.query(`SELECT 1 FROM promo_banners WHERE image_url = $1 LIMIT 1`, [img])).rows.length > 0;
+
+  for (const def of MAIN_V2) {
+    const section = map.get(def.key);
+    if (!section) { missingSection++; continue; }
+    for (let n = 1; n <= 3; n++) {
+      const img = `${BASE_URL}/banners/${def.key}-${n}.svg`;
+      if (await exists(img)) { skippedExisting++; continue; }
+      const [title, subtitle] = BANNER_TEXT_V2[def.key][n - 1];
+      sort += 1;
+      const id = await insertRow(client, "promo_banners", ctx,
+        ["image_url", "title", "subtitle", "sort_order", "is_active"],
+        [img, title, subtitle, sort, true]);
+      await client.query(
+        `INSERT INTO banner_sections (banner_id, section_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [id, section.id]
+      );
+      created++;
+    }
+  }
+  return { created, skippedExisting, missingSection };
+}
+
 /* ------------------------------ نقطة الدخول ------------------------------ */
 
 
@@ -590,5 +783,7 @@ export async function runBootstrap() {
   await runJob("normalize_test_products_v4", normalizeTestProducts);
   await runJob("relocate_test_products_v1", (c) => normalizeTestProducts(c, { relocate: true }));
   await runJob("relocate_test_products_v2", (c) => normalizeTestProducts(c, { relocate: true }));
+  await runJob("seed_sections_v2", seedSectionsV2);
+  await runJob("seed_banners_v2", seedBannersV2);
   log("اكتملت");
 }
