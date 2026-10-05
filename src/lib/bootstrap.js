@@ -395,7 +395,7 @@ const SUB_RULES = [
   ["household", "أدوات مائدة", "ملعقه|شوكه|سكين|كاس|اكواب|كوب"],
   ["stationery", "طابعات وأحبار", "طابعه|حبر|احبار|تونر|خرطوشه"],
   ["stationery", "حقائب مدرسية", "شنطه|حقيبه|حقائب"],
-  ["stationery", "أقلام وأدوات", "قلم|اقلام|ممحاه|مسطره|ماركر|براية|مقص"],
+  ["stationery", "أقلام وأدوات", "(?<!معكرونه )قلم|اقلام|ممحاه|مسطره|ماركر|براية|مقص"],
   ["stationery", "دفاتر وأوراق", "دفتر|دفاتر|ورق|كراس|مفكره"],
   ["food", "صلصات ومعجون طماطم", "طماطم|صلصه|كاتشب|مايونيز|خل(?=\\s|$)"],
   ["food", "معكرونة وشعيرية", "معكرونه|مكرونه|شعيريه|شعريه|اسباغيتي"],
@@ -589,5 +589,6 @@ export async function runBootstrap() {
   await runJob("normalize_test_products_v3", normalizeTestProducts);
   await runJob("normalize_test_products_v4", normalizeTestProducts);
   await runJob("relocate_test_products_v1", (c) => normalizeTestProducts(c, { relocate: true }));
+  await runJob("relocate_test_products_v2", (c) => normalizeTestProducts(c, { relocate: true }));
   log("اكتملت");
 }
