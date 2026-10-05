@@ -120,6 +120,52 @@ export function ensureBannerSections() {
   return ensurePromise;
 }
 
+/* --------------- DDL: customer_carts + search_logs (سلات العملاء وسجل البحث) --------------- */
+
+let cartsPromise = null;
+
+async function createCartsAndSearchTables() {
+  const client = await pool.connect();
+  try {
+    const customers = await getColumns(client, "customers");
+    if (!customers.has("id")) throw new Error("جدول customers غير موجود");
+    if (customers.get("id").data_type !== "uuid") throw new Error(`customers.id نوعه ${customers.get("id").data_type} وليس uuid`);
+    const run = async (sql) => {
+      try { await client.query(sql); }
+      catch (e) { if (!["42P07", "23505", "42710"].includes(e?.code)) throw e; } // سباق إنشاء
+    };
+    await run(
+      `CREATE TABLE IF NOT EXISTS customer_carts (
+         customer_id UUID PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+         items       JSONB NOT NULL DEFAULT '[]'::jsonb,
+         updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+       )`
+    );
+    await run(
+      `CREATE TABLE IF NOT EXISTS search_logs (
+         id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         customer_id   UUID REFERENCES customers(id) ON DELETE SET NULL,
+         query         TEXT NOT NULL,
+         normalized    TEXT NOT NULL,
+         results_count INTEGER NOT NULL DEFAULT 0,
+         created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+       )`
+    );
+    await run(`CREATE INDEX IF NOT EXISTS idx_search_logs_normalized ON search_logs (normalized)`);
+    await run(`CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs (created_at)`);
+  } finally {
+    client.release();
+  }
+}
+
+// يُنشئ الجدولين مرة واحدة لكل عملية (ويعيد المحاولة لو فشل)
+export function ensureCartsAndSearchTables() {
+  if (!cartsPromise) {
+    cartsPromise = createCartsAndSearchTables().catch((e) => { cartsPromise = null; throw e; });
+  }
+  return cartsPromise;
+}
+
 /* ------------------------------ تشغيل المهام ------------------------------ */
 
 async function runJob(name, fn) {
@@ -769,6 +815,7 @@ export async function runBootstrap() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await ensureBannerSections();
+    await ensureCartsAndSearchTables();
   } catch (e) {
     console.error("[bootstrap] DDL فشل (لا تأثير على السيرفر):", e?.message || e);
     return;

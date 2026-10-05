@@ -21,6 +21,8 @@ import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
 import { bannerRouter } from "./routes/banners.js";
 import { agentRouter } from "./routes/agent.js";
+import { cartRouter } from "./routes/carts.js";
+import { searchLogRouter } from "./routes/searchlog.js";
 import { runBootstrap } from "./lib/bootstrap.js";
 import { dispatchManagerVoucherAlerts, dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
@@ -76,6 +78,8 @@ app.use("/api/assets", assetsRouter);
 app.use("/api/uploads", uploadRouter);
 app.use("/api/banners", bannerRouter);
 app.use("/api/agent", agentRouter);
+app.use("/api/carts", cartRouter);
+app.use("/api/search-log", searchLogRouter);
 
 app.use((_req, res) => res.status(404).json({ error: "المسار غير موجود" }));
 

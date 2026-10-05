@@ -839,7 +839,7 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
 =================================================================== */
 
 // يحوّل أسطر (product_id, variant_id, qty) إلى أصناف جاهزة للسلة بأسعار وتوفر الآن
-async function resolveCartLines(customerId, wanted) {
+export async function resolveCartLines(customerId, wanted) {
   const items = [];
   const unavailable = [];
   for (const it of wanted) {
