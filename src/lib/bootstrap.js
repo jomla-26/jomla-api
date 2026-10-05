@@ -555,10 +555,11 @@ async function mergeFoodDuplicate(client) {
     `DELETE FROM banner_sections WHERE section_id = $2
         AND banner_id IN (SELECT banner_id FROM banner_sections WHERE section_id = $1)`, [old.id, dupe.id]);
   await client.query(`UPDATE banner_sections SET section_id = $1 WHERE section_id = $2`, [old.id, dupe.id]);
+  // الحذف أولًا لأن اسم القسم فريد (sections_name_key) ثم إعادة تسمية القديم
+  await client.query(`DELETE FROM sections WHERE id = $1`, [dupe.id]);
   await client.query(
     `UPDATE sections SET name = 'مواد غذائية', image_url = COALESCE(NULLIF(image_url, ''), $2) WHERE id = $1`,
     [old.id, dupe.image_url]);
-  await client.query(`DELETE FROM sections WHERE id = $1`, [dupe.id]);
   return { merged: true };
 }
 
@@ -576,5 +577,6 @@ export async function runBootstrap() {
   await runJob("normalize_test_products_v1", normalizeTestProducts);
   await runJob("merge_food_duplicate_v1", mergeFoodDuplicate);
   await runJob("normalize_test_products_v2", normalizeTestProducts);
+  await runJob("normalize_test_products_v3", normalizeTestProducts);
   log("اكتملت");
 }
