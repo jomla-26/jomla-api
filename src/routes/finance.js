@@ -506,6 +506,56 @@ financeRouter.get("/treasuries", requirePermission("finance.vouchers"), asyncRou
   res.json(rows);
 }));
 
+// كشف حركة خزينة واحدة (سندات معتمدة + تحويلات + مصروفات) مع رصيد افتتاحي عند from
+financeRouter.get("/treasuries/:code/statement", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const range = parseRange(req.query);
+  const { rows: tr } = await query(`SELECT id, code, name FROM treasuries WHERE code = $1`, [req.params.code]);
+  if (!tr.length) throw new ApiError(404, "الخزينة غير موجودة");
+  const id = tr[0].id;
+  const { rows } = await query(
+    `SELECT * FROM (
+       SELECT v.created_at AS entry_date,
+              CASE WHEN v.voucher_type = 'receipt' THEN 'إيصال قبض' ELSE 'إيصال صرف' END
+                || COALESCE(' - ' || v.party_name, '') AS label,
+              v.voucher_number AS reference,
+              CASE WHEN v.voucher_type = 'receipt' THEN v.amount ELSE 0 END AS in_amount,
+              CASE WHEN v.voucher_type = 'receipt' THEN 0 ELSE v.amount END AS out_amount
+         FROM vouchers v
+        WHERE v.treasury_id = $1 AND v.approval_status = 'approved' AND NOT v.off_treasury
+       UNION ALL
+       SELECT x.created_at, 'تحويل وارد', x.transfer_number, x.amount, 0
+         FROM treasury_transfers x WHERE x.to_treasury_id = $1
+       UNION ALL
+       SELECT x.created_at, 'تحويل صادر', x.transfer_number, 0, x.amount
+         FROM treasury_transfers x WHERE x.from_treasury_id = $1
+       UNION ALL
+       SELECT e.created_at, 'مصروف - ' || e.description, e.expense_number, 0, e.amount
+         FROM expenses e WHERE e.treasury_id = $1
+     ) x ORDER BY entry_date`,
+    [id]
+  );
+  res.json(buildLedger(rows, range, "in-out", { treasury_code: tr[0].code }));
+}));
+
+// قائمة التحويلات بين الخزائن
+financeRouter.get("/transfers", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
+  const range = parseRange(req.query);
+  const params = [];
+  const conds = [];
+  addRange("x.created_at", range, params, conds);
+  const { rows } = await query(
+    `SELECT x.id, x.transfer_number, x.amount, x.note, x.created_at,
+            f.code AS from_code, f.name AS from_name, t.code AS to_code, t.name AS to_name
+       FROM treasury_transfers x
+       JOIN treasuries f ON f.id = x.from_treasury_id
+       JOIN treasuries t ON t.id = x.to_treasury_id
+      ${conds.length ? "WHERE " + conds.join(" AND ") : ""}
+      ORDER BY x.created_at DESC LIMIT 500`,
+    params
+  );
+  res.json(rows);
+}));
+
 // ====================================================================
 // المندوبون: تسوية النقدية، العهدة، المحفظة
 // ====================================================================
