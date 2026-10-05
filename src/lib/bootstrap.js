@@ -533,6 +533,35 @@ async function normalizeTestProducts(client) {
 
 /* ------------------------------ نقطة الدخول ------------------------------ */
 
+
+/* ---- إصلاح: قسم غذائي مكرر (القسم القديم اسمه "غدائية" بخطأ إملائي ولم يُطابَق) ---- */
+async function mergeFoodDuplicate(client) {
+  const dupe = (await client.query(`SELECT id, image_url FROM sections WHERE parent_id IS NULL AND slug = 'food' LIMIT 1`)).rows[0];
+  if (!dupe) return { skipped: "لا يوجد قسم food" };
+  const old = (await client.query(
+    `SELECT id, image_url FROM sections
+      WHERE parent_id IS NULL AND id <> $1 AND (name LIKE '%غدائ%' OR name LIKE '%غذائ%' OR name LIKE '%تموين%')
+      ORDER BY created_at LIMIT 1`, [dupe.id])).rows[0];
+  if (!old) return { skipped: "لا يوجد قسم غذائي قديم للدمج" };
+  const busy = await client.query(
+    `SELECT
+       (SELECT count(*) FROM products WHERE section_id = $1 OR section_id IN (SELECT id FROM sections WHERE parent_id = $1)) AS p,
+       (SELECT count(*) FROM customer_sections WHERE section_id = $1) AS c,
+       (SELECT count(*) FROM supplier_sections WHERE section_id = $1) AS s`, [dupe.id]);
+  const b = busy.rows[0];
+  if (Number(b.p) || Number(b.c) || Number(b.s)) return { skipped: "القسم المكرر مستخدم — لم يُدمج" };
+  await client.query(`UPDATE sections SET parent_id = $1 WHERE parent_id = $2`, [old.id, dupe.id]);
+  await client.query(
+    `DELETE FROM banner_sections WHERE section_id = $2
+        AND banner_id IN (SELECT banner_id FROM banner_sections WHERE section_id = $1)`, [old.id, dupe.id]);
+  await client.query(`UPDATE banner_sections SET section_id = $1 WHERE section_id = $2`, [old.id, dupe.id]);
+  await client.query(
+    `UPDATE sections SET name = 'مواد غذائية', image_url = COALESCE(NULLIF(image_url, ''), $2) WHERE id = $1`,
+    [old.id, dupe.image_url]);
+  await client.query(`DELETE FROM sections WHERE id = $1`, [dupe.id]);
+  return { merged: true };
+}
+
 export async function runBootstrap() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
@@ -545,5 +574,7 @@ export async function runBootstrap() {
   await runJob("seed_sections_v1", seedSections);
   await runJob("seed_banners_v1", seedBanners);
   await runJob("normalize_test_products_v1", normalizeTestProducts);
+  await runJob("merge_food_duplicate_v1", mergeFoodDuplicate);
+  await runJob("normalize_test_products_v2", normalizeTestProducts);
   log("اكتملت");
 }
