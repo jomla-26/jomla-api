@@ -21,6 +21,7 @@ import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
 import { bannerRouter } from "./routes/banners.js";
 import { agentRouter } from "./routes/agent.js";
+import { runBootstrap } from "./lib/bootstrap.js";
 import { dispatchManagerVoucherAlerts, dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
@@ -109,6 +110,15 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`منظومة جملة — الواجهة البرمجية تعمل على المنفذ ${PORT}`);
 });
+
+// تهيئة البيانات الأولية (أقسام/بانرات/تنظيف أصناف تجريبية): غير حاجبة ولا توقّع السيرفر أبدًا
+setTimeout(() => {
+  try {
+    runBootstrap().catch((e) => console.error("[bootstrap]", e?.message || e));
+  } catch (e) {
+    console.error("[bootstrap]", e?.message || e);
+  }
+}, 3000);
 
 const whatsappTimer = setInterval(() => {
   dispatchWhatsappQueue().catch((e) => console.error("[WhatsApp]", e.message));
