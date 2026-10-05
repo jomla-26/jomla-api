@@ -444,7 +444,7 @@ function stockFromId(id) {
   return 80 + (h % 521);
 }
 
-async function normalizeTestProducts(client) {
+async function normalizeTestProducts(client, opts = {}) {
   const sup = await getColumns(client, "suppliers");
   const prod = await getColumns(client, "products");
   const sm = await getColumns(client, "stock_movements");
@@ -522,8 +522,17 @@ async function normalizeTestProducts(client) {
     if (rule) {
       const parent = map.get(rule.key);
       const subId = subIds.get(`${rule.key}|${norm(rule.sub)}`);
-      if (parent && subId && (enabled.has(`${p.supplier_id}|${parent.id}`) || String(p.section_id) === String(parent.id)) && String(p.section_id) !== subId) {
+      if (parent && subId && String(p.section_id) !== subId &&
+          (opts.relocate || enabled.has(`${p.supplier_id}|${parent.id}`) || String(p.section_id) === String(parent.id))) {
         await client.query(`UPDATE products SET section_id = $2 WHERE id = $1`, [p.id, subId]);
+        if (opts.relocate && !enabled.has(`${p.supplier_id}|${parent.id}`)) {
+          // نفعّل القسم الرئيسي للمورد التجريبي حتى يبقى صنفه ظاهرًا ومسموحًا
+          await client.query(
+            `INSERT INTO supplier_sections (supplier_id, section_id, enabled) VALUES ($1, $2, true)
+               ON CONFLICT (supplier_id, section_id) DO UPDATE SET enabled = true`,
+            [p.supplier_id, parent.id]);
+          enabled.add(`${p.supplier_id}|${parent.id}`);
+        }
         moved++;
       }
     }
@@ -579,5 +588,6 @@ export async function runBootstrap() {
   await runJob("normalize_test_products_v2", normalizeTestProducts);
   await runJob("normalize_test_products_v3", normalizeTestProducts);
   await runJob("normalize_test_products_v4", normalizeTestProducts);
+  await runJob("relocate_test_products_v1", (c) => normalizeTestProducts(c, { relocate: true }));
   log("اكتملت");
 }
