@@ -715,7 +715,7 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
     const { rows: items } = await query(
       `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit,
               unit_price, qty_requested, qty_confirmed, availability, line_total
-         FROM order_items WHERE order_id = $1 ORDER BY created_at`, [orderId]
+         FROM order_items WHERE order_id = $1 ORDER BY product_name, id`, [orderId]
     );
     const { rows: history } = await query(
       `SELECT from_status, to_status, changed_at
@@ -745,7 +745,7 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
     const { rows: items } = await query(
       `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit, supplier_sku,
               unit_price, qty_requested, qty_confirmed, availability, line_total
-         FROM order_items WHERE order_supplier_id = $1 ORDER BY created_at`, [mine.id]
+         FROM order_items WHERE order_supplier_id = $1 ORDER BY product_name, id`, [mine.id]
     );
     const { rows: history } = await query(
       `SELECT from_status, to_status, changed_at
@@ -784,7 +784,7 @@ orderRouter.get("/:id", asyncRoute(async (req, res) => {
     const { rows: items } = await query(
       `SELECT id, order_supplier_id, product_id, variant_id, variant_label, product_name, unit,
               unit_price, qty_requested, qty_confirmed, availability, line_total
-         FROM order_items WHERE order_id = $1 ORDER BY created_at`, [orderId]
+         FROM order_items WHERE order_id = $1 ORDER BY product_name, id`, [orderId]
     );
     const { rows: history } = await query(
       `SELECT from_status, to_status, changed_at
