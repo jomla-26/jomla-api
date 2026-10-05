@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute } from "../lib/helpers.js";
+import { parseRange, addRange, addDateColRange, andClause } from "../lib/dateRange.js";
 import { authenticate, requirePermission } from "../middleware/auth.js";
 
 export const assetsRouter = Router();
@@ -66,8 +67,10 @@ assetsRouter.post("/:id/runs", asyncRoute(async (req, res) => {
 }));
 
 assetsRouter.get("/:id/runs", asyncRoute(async (req, res) => {
+  const params = [req.params.id];
+  const conds = addRange("started_at", parseRange(req.query), params, []);
   const { rows } = await query(
-    `SELECT * FROM asset_runs WHERE asset_id = $1 ORDER BY started_at DESC LIMIT 200`, [req.params.id]
+    `SELECT * FROM asset_runs WHERE asset_id = $1${andClause(conds)} ORDER BY started_at DESC LIMIT 200`, params
   );
   res.json(rows);
 }));
@@ -103,8 +106,10 @@ assetsRouter.post("/:id/trips", asyncRoute(async (req, res) => {
 }));
 
 assetsRouter.get("/:id/trips", asyncRoute(async (req, res) => {
+  const params = [req.params.id];
+  const conds = addDateColRange("trip_date", parseRange(req.query), params, []);
   const { rows } = await query(
-    `SELECT * FROM asset_trips WHERE asset_id = $1 ORDER BY trip_date DESC LIMIT 200`, [req.params.id]
+    `SELECT * FROM asset_trips WHERE asset_id = $1${andClause(conds)} ORDER BY trip_date DESC LIMIT 200`, params
   );
   res.json(rows);
 }));

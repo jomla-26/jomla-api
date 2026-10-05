@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit, resubmitForApproval } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber } from "../lib/helpers.js";
+import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 import { authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
 import { notifyFavoriteRestock, queueNotification } from "../lib/notify.js";
 
@@ -897,7 +898,14 @@ catalogRouter.patch("/products/:id/approval", requirePermission("catalog.approve
 catalogRouter.get("/products/me/report", requireActorType("supplier"), asyncRoute(async (req, res) => {
   const period = z.enum(["today", "week", "month"]).default("week").parse(req.query.period);
   const days = period === "today" ? 1 : period === "week" ? 7 : 30;
+  // from/to (إن وُجد أي منهما) يتجاوز period: الفترة بالأيام الشاملة بتوقيت طرابلس على تاريخ التسليم
+  const range = parseRange(req.query);
+  const useRange = !!(range.from || range.to);
   const sinceSql = `(date_trunc('day', now() AT TIME ZONE 'Africa/Tripoli') - (($2::INT - 1) * INTERVAL '1 day')) AT TIME ZONE 'Africa/Tripoli'`;
+  const rParams = [req.actor.id];
+  const rConds = useRange ? addRange("o.delivered_at", range, rParams, []) : [];
+  const timeCond = useRange ? andClause(rConds) : `\n        AND o.delivered_at >= ${sinceSql}`;
+  const timeParams = useRange ? rParams : [req.actor.id, days];
 
   // العمولة تُحسب على أساس صافي كل فاتورة (order_suppliers.subtotal × نسبتها الفعلية،
   // اللي ممكن تكون نسبة استثنائية لهذه الفاتورة بس، مش بالضرورة نسبة المورد الأساسية)
@@ -910,9 +918,8 @@ catalogRouter.get("/products/me/report", requireActorType("supplier"), asyncRout
        JOIN orders o ON o.id = os.order_id
       WHERE os.supplier_id = $1
         AND os.status <> 'cancelled'
-        AND o.status IN ('delivered','closed')
-        AND o.delivered_at >= ${sinceSql}`,
-    [req.actor.id, days]
+        AND o.status IN ('delivered','closed')${timeCond}`,
+    timeParams
   );
 
   const topProducts = await query(
@@ -923,12 +930,11 @@ catalogRouter.get("/products/me/report", requireActorType("supplier"), asyncRout
        JOIN orders o           ON o.id  = oi.order_id
       WHERE os.supplier_id = $1
         AND os.status <> 'cancelled'
-        AND o.status IN ('delivered','closed')
-        AND o.delivered_at >= ${sinceSql}
+        AND o.status IN ('delivered','closed')${timeCond}
       GROUP BY oi.product_id, oi.product_name
       ORDER BY total DESC
       LIMIT 10`,
-    [req.actor.id, days]
+    timeParams
   );
 
   const totalSales = Number(totals.rows[0].total_sales);
@@ -1261,11 +1267,13 @@ catalogRouter.get("/products/:id/stock-movements", asyncRoute(async (req, res, n
     throw new ApiError(403, "لا يمكنك الاطلاع على صنف لا يخصك");
   }
 
+  const params = [req.params.id];
+  const conds = addRange("sm.created_at", parseRange(req.query), params, []);
   const { rows } = await query(
     `SELECT sm.*, v.label AS variant_label FROM stock_movements sm
        LEFT JOIN product_variants v ON v.id = sm.variant_id
-      WHERE sm.product_id = $1 ORDER BY sm.created_at DESC`,
-    [req.params.id]
+      WHERE sm.product_id = $1${andClause(conds)} ORDER BY sm.created_at DESC`,
+    params
   );
   res.json(rows);
 }));
@@ -1835,16 +1843,18 @@ catalogRouter.get("/stock-vouchers", asyncRoute(async (req, res) => {
     });
   }
 
+  const params = [ownerFilter, voucherType || null];
+  const conds = addRange("sv.created_at", parseRange(req.query), params, []);
   const { rows } = await query(
     `SELECT sv.*, s.business_name AS supplier_name,
             (SELECT COUNT(*) FROM stock_movements sm WHERE sm.voucher_id = sv.id) AS items_count
        FROM stock_vouchers sv
        JOIN suppliers s ON s.id = sv.supplier_id
       WHERE ($1::UUID IS NULL OR sv.supplier_id = $1)
-        AND ($2::TEXT IS NULL OR sv.voucher_type = $2)
+        AND ($2::TEXT IS NULL OR sv.voucher_type = $2)${andClause(conds)}
       ORDER BY sv.created_at DESC
       LIMIT 200`,
-    [ownerFilter, voucherType || null]
+    params
   );
   res.json(rows);
 }));
@@ -1877,16 +1887,18 @@ catalogRouter.get("/stock-vouchers/:id", asyncRoute(async (req, res) => {
 // سجل حركة المخزون (إضافة/سحب) لكل أصناف مورد معين — لعرضها من لوحة الإدارة
 catalogRouter.get("/stock-movements", requirePermission("reports.view"), asyncRoute(async (req, res) => {
   const { supplierId, search } = req.query;
+  const params = [supplierId || null, search || null];
+  const conds = addRange("sm.created_at", parseRange(req.query), params, []);
   const { rows } = await query(
     `SELECT sm.*, p.name AS product_name, p.unit, p.supplier_sku, s.business_name AS supplier_name
        FROM stock_movements sm
        JOIN products p  ON p.id = sm.product_id
        JOIN suppliers s ON s.id = p.supplier_id
       WHERE ($1::UUID IS NULL OR p.supplier_id = $1)
-        AND ($2::TEXT IS NULL OR p.name ILIKE '%'||$2||'%' OR sm.reason ILIKE '%'||$2||'%')
+        AND ($2::TEXT IS NULL OR p.name ILIKE '%'||$2||'%' OR sm.reason ILIKE '%'||$2||'%')${andClause(conds)}
       ORDER BY sm.created_at DESC
       LIMIT 300`,
-    [supplierId || null, search || null]
+    params
   );
   res.json(rows);
 }));
@@ -1903,12 +1915,15 @@ catalogRouter.get("/products/:id/movement", requirePermission("reports.view"), a
   );
   if (!info.rows.length) throw new ApiError(404, "الصنف غير موجود");
 
+  // نوع sold_on غير مؤكد (date أو timestamptz) فنحوّله إلى timestamptz قبل التحويل ليوم طرابلس
+  const mParams = [req.params.id];
+  const mConds = addRange("sold_on::timestamptz", parseRange(req.query), mParams, []);
   const movement = await query(
     `SELECT order_number, sold_on, qty, unit_price, line_total, gross_margin
        FROM v_item_movement
-      WHERE product_id = $1
+      WHERE product_id = $1${andClause(mConds)}
       ORDER BY sold_on DESC`,
-    [req.params.id]
+    mParams
   );
 
   res.json({ product: info.rows[0], movement: movement.rows });

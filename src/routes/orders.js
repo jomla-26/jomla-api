@@ -9,6 +9,7 @@ import {
   authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
 } from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
+import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 
 export const orderRouter = Router();
 orderRouter.use(authenticate);
@@ -616,22 +617,27 @@ orderRouter.post("/admin-create", requirePermission("orders.review"), asyncRoute
 orderRouter.get("/", asyncRoute(async (req, res) => {
   const status = typeof req.query.status === "string" && req.query.status.length < 40 ? req.query.status : null;
   const { limit, offset } = parsePaging(req.query);
+  const range = parseRange(req.query);
   const a = req.actor;
 
   if (a.type === "customer") {
+    const params = [a.id, status, limit, offset];
+    const conds = addRange("o.created_at", range, params, []);
     const { rows } = await query(
       `SELECT ${CUSTOMER_ORDER_COLS},
               (SELECT COUNT(*) FROM order_suppliers WHERE order_id = o.id) AS supplier_count
          FROM orders o
-        WHERE o.customer_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)
+        WHERE o.customer_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)${andClause(conds)}
         ORDER BY o.created_at DESC
         LIMIT $3 OFFSET $4`,
-      [a.id, status, limit, offset]
+      params
     );
     return res.json(rows);
   }
 
   if (a.type === "supplier") {
+    const params = [a.id, status, limit, offset];
+    const conds = addRange("o.created_at", range, params, []);
     const { rows } = await query(
       `SELECT os.id AS order_supplier_id, os.status, os.subtotal, os.supplier_note,
               o.id AS order_id, o.order_number, o.fulfillment, o.created_at, c.business_name AS customer_name
@@ -640,10 +646,10 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
          JOIN customers c ON c.id = o.customer_id
         WHERE os.supplier_id = $1
           AND o.status NOT IN ('draft','under_review')
-          AND ($2::TEXT IS NULL OR os.status = $2)
+          AND ($2::TEXT IS NULL OR os.status = $2)${andClause(conds)}
         ORDER BY o.created_at DESC
         LIMIT $3 OFFSET $4`,
-      [a.id, status, limit, offset]
+      params
     );
     return res.json(rows);
   }
@@ -651,13 +657,15 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
   if (a.type !== "employee") throw new ApiError(403, "لا تملك صلاحية الوصول لهذه الشاشة");
 
   if (a.role === "driver") {
+    const params = [a.id, status, limit, offset];
+    const conds = addRange("o.created_at", range, params, []);
     const { rows } = await query(
       `SELECT ${DRIVER_ORDER_COLS}, c.business_name AS customer_name, c.phone AS customer_phone, c.address
          FROM orders o JOIN customers c ON c.id = o.customer_id
-        WHERE o.driver_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)
+        WHERE o.driver_id = $1 AND ($2::TEXT IS NULL OR o.status = $2)${andClause(conds)}
         ORDER BY o.created_at DESC
         LIMIT $3 OFFSET $4`,
-      [a.id, status, limit, offset]
+      params
     );
     return res.json(rows);
   }
@@ -667,16 +675,18 @@ orderRouter.get("/", asyncRoute(async (req, res) => {
   }
   // موظف مقيّد بأقسام يشوف بس الطلبيات اللي كل أصنافها ضمن نطاقه (فلترة داخل الاستعلام نفسه)
   const scope = await getEmployeeSectionScope(a.id);
+  const params = [status, scope ? [...scope] : null, limit, offset];
+  const conds = addRange("o.created_at", range, params, []);
   const { rows } = await query(
     `SELECT o.*, c.business_name AS customer_name
        FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE ($1::TEXT IS NULL OR o.status = $1)
         AND ($2::UUID[] IS NULL OR NOT EXISTS (
               SELECT 1 FROM order_items oi JOIN products p ON p.id = oi.product_id
-               WHERE oi.order_id = o.id AND NOT (p.section_id = ANY($2::UUID[]))))
+               WHERE oi.order_id = o.id AND NOT (p.section_id = ANY($2::UUID[]))))${andClause(conds)}
       ORDER BY o.created_at DESC
       LIMIT $3 OFFSET $4`,
-    [status, scope ? [...scope] : null, limit, offset]
+    params
   );
   res.json(rows);
 }));

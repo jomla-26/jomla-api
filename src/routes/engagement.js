@@ -4,6 +4,7 @@ import { query, pool, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireAnyPermission } from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
+import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 
 export const engagementRouter = Router();
 engagementRouter.use(authenticate);
@@ -176,15 +177,17 @@ engagementRouter.post("/feedback", asyncRoute(async (req, res) => {
 
 engagementRouter.get("/feedback", requirePermission("orders.review"), asyncRoute(async (req, res) => {
   const { status } = req.query;
+  const params = [status || null];
+  const conds = addRange("f.created_at", parseRange(req.query), params, []);
   const { rows } = await query(
     `SELECT f.*, o.order_number, c.business_name AS customer_name, s.business_name AS supplier_name
        FROM order_feedback f
        JOIN orders o     ON o.id = f.order_id
        JOIN customers c  ON c.id = f.customer_id
        LEFT JOIN suppliers s ON s.id = f.supplier_id
-      WHERE ($1::TEXT IS NULL OR f.resolution_status = $1)
+      WHERE ($1::TEXT IS NULL OR f.resolution_status = $1)${andClause(conds)}
       ORDER BY f.created_at DESC`,
-    [status || null]
+    params
   );
   res.json(rows);
 }));
@@ -349,6 +352,8 @@ engagementRouter.post("/returns", requirePermission("orders.returns"), asyncRout
 
 engagementRouter.get("/returns", requirePermission("orders.returns"), asyncRoute(async (req, res) => {
   const { status } = req.query;
+  const params = [status || null];
+  const conds = addRange("r.created_at", parseRange(req.query), params, []);
   const { rows } = await query(
     `SELECT r.*, o.order_number, c.business_name AS customer_name, s.business_name AS supplier_name,
             (SELECT SUM(line_total) FROM return_items WHERE return_id = r.id) AS total
@@ -356,9 +361,9 @@ engagementRouter.get("/returns", requirePermission("orders.returns"), asyncRoute
        JOIN orders o     ON o.id = r.order_id
        JOIN customers c  ON c.id = r.customer_id
        LEFT JOIN suppliers s ON s.id = r.supplier_id
-      WHERE ($1::TEXT IS NULL OR r.status = $1)
+      WHERE ($1::TEXT IS NULL OR r.status = $1)${andClause(conds)}
       ORDER BY r.created_at DESC`,
-    [status || null]
+    params
   );
   res.json(rows);
 }));

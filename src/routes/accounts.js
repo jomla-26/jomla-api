@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, normalizePhone } from "../lib/helpers.js";
+import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 import {
   authenticate, requirePermission, getEmployeeSectionScope, assertSectionScope,
   stripSecrets, invalidateAuthCache, employeeHasPermission,
@@ -97,15 +98,18 @@ accountsRouter.use(authenticate);
 accountsRouter.get("/audit/logs", requirePermission("accounts.approve"), asyncRoute(async (req, res) => {
   const { entityType, search, actorId, entityId } = req.query;
   const pg = pageParams(req, 200, 500);
+  const range = parseRange(req.query);
+  const params = [entityType || null, search || null, pg.limit, actorId || null, entityId || null, pg.offset];
+  const conds = addRange("created_at", range, params, []);
   const { rows } = await query(
     `SELECT * FROM audit_log
       WHERE ($1::TEXT IS NULL OR entity_type = $1)
         AND ($2::TEXT IS NULL OR actor_name ILIKE '%'||$2||'%' OR entity_label ILIKE '%'||$2||'%' OR action ILIKE '%'||$2||'%')
         AND ($4::UUID IS NULL OR actor_id = $4)
-        AND ($5::UUID IS NULL OR entity_id = $5)
+        AND ($5::UUID IS NULL OR entity_id = $5)${andClause(conds)}
       ORDER BY created_at DESC
       LIMIT $3 OFFSET $6`,
-    [entityType || null, search || null, pg.limit, actorId || null, entityId || null, pg.offset]
+    params
   );
   res.json(rows);
 }));

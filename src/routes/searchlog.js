@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { query } from "../lib/db.js";
 import { asyncRoute } from "../lib/helpers.js";
+import { parseRange, addRange, hasRange } from "../lib/dateRange.js";
 import { authenticate, requireActorType, requirePermission } from "../middleware/auth.js";
 import { ensureCartsAndSearchTables } from "../lib/bootstrap.js";
 
@@ -70,9 +71,14 @@ searchLogRouter.get("/admin", requirePermission("catalog.manage"), asyncRoute(as
   const { days, onlyEmpty, q } = adminQuerySchema.parse({
     days: req.query.days ?? 30, onlyEmpty: req.query.onlyEmpty ?? "0", q: req.query.q ?? "",
   });
+  const range = parseRange(req.query);
   await ensure();
   const qNorm = norm(q);
-  const params = [days];
+  // from/to (إن وُجد أي منهما) يتجاوز days: بدون $1 للأيام، والفترة بأيام طرابلس الشاملة
+  const useRange = hasRange(range);
+  const params = useRange ? [] : [days];
+  const rangeConds = useRange ? addRange("created_at", range, params, []) : [];
+  const timeFilter = useRange ? rangeConds.join(" AND ") : "created_at >= now() - ($1::int * interval '1 day')";
   let qFilter = "";
   if (qNorm) {
     // escape لـ LIKE
@@ -83,7 +89,7 @@ searchLogRouter.get("/admin", requirePermission("catalog.manage"), asyncRoute(as
     WITH base AS (
       SELECT customer_id, query, normalized, results_count, created_at
         FROM search_logs
-       WHERE created_at >= now() - ($1::int * interval '1 day') ${qFilter}
+       WHERE ${timeFilter} ${qFilter}
     ),
     latest AS (
       SELECT DISTINCT ON (normalized) normalized, query AS sample, results_count AS last_results

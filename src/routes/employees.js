@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, normalizePhone } from "../lib/helpers.js";
+import { parseRange } from "../lib/dateRange.js";
 import {
   authenticate, requirePermission, requireAnyPermission,
   getEffectivePermissionCodes, getEmployeeSectionScope,
@@ -426,7 +427,7 @@ employeeRouter.post("/:id/attendance", requirePermission("employees.manage"), as
 }));
 
 employeeRouter.get("/:id/attendance", requirePermission("employees.manage"), asyncRoute(async (req, res) => {
-  const { from, to } = req.query;
+  const { from, to } = parseRange(req.query);
   const pg = pageParams(req, 400);
   const { rows } = await query(
     `SELECT * FROM attendance

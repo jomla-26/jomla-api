@@ -4,6 +4,7 @@ import { query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber, resolveTreasuryCode } from "../lib/helpers.js";
 import { authenticate, requirePermission, requireActorType } from "../middleware/auth.js";
 import { queueNotification, notifyStaffInApp } from "../lib/notify.js";
+import { parseRange, addRange, addDateColRange, andClause, buildLedger } from "../lib/dateRange.js";
 
 export const financeRouter = Router();
 financeRouter.use(authenticate);
@@ -429,16 +430,20 @@ financeRouter.post("/vouchers/:id/decide", requirePermission("finance.vouchers")
 financeRouter.get("/vouchers", requirePermission("finance.vouchers"), asyncRoute(async (req, res) => {
   const { treasuryCode, method, search } = req.query;
   const { limit, offset } = pageParams(req);
+  const range = parseRange(req.query);
+  const params = [treasuryCode || null, method || null, search || null, limit, offset];
+  const conds = [];
+  addRange("v.created_at", range, params, conds);
   const { rows } = await query(
     `SELECT v.*, t.code AS treasury_code, t.name AS treasury_name
        FROM vouchers v JOIN treasuries t ON t.id = v.treasury_id
       WHERE ($1::TEXT IS NULL OR t.code = $1)
         AND ($2::TEXT IS NULL OR v.method = $2)
         AND ($3::TEXT IS NULL OR v.party_name ILIKE '%'||$3||'%'
-             OR v.voucher_number ILIKE '%'||$3||'%')
+             OR v.voucher_number ILIKE '%'||$3||'%')${andClause(conds)}
       ORDER BY v.created_at DESC, v.id
       LIMIT $4 OFFSET $5`,
-    [treasuryCode || null, method || null, search || null, limit, offset]
+    params
   );
   res.json(rows);
 }));
@@ -730,6 +735,7 @@ financeRouter.get("/drivers/:id/wallet", asyncRoute(async (req, res) => {
 financeRouter.get("/drivers/:id/wallet/transactions", asyncRoute(async (req, res) => {
   assertUuid(req.params.id);
   await assertCanReadFinance(req, { ownerType: "employee", ownerId: req.params.id });
+  const range = parseRange(req.query);
   const { rows } = await query(
     `SELECT * FROM (
        SELECT v.created_at AS entry_date, 'عهدة نقدية مستلمة من الإدارة' AS label,
@@ -762,12 +768,8 @@ financeRouter.get("/drivers/:id/wallet/transactions", asyncRoute(async (req, res
      ) x ORDER BY entry_date`,
     [req.params.id]
   );
-  let balanceC = 0;
-  const withBalance = rows.map((r) => {
-    balanceC += toCents(r.in_amount) - toCents(r.out_amount);
-    return { ...r, balance: fromCents(balanceC) };
-  });
-  res.json(withBalance);
+  // الصفوف كلها تُجلب (كما كان) ثم تُقص بالفترة، والصف الافتتاحي يحمل رصيد ما قبل from
+  res.json(buildLedger(rows, range, "in-out"));
 }));
 
 // المندوب يدفع لمورد نقدًا من عهدته الشخصية (يصرف من رصيده هو، مو من خزينة الشركة مباشرة)
@@ -962,15 +964,12 @@ financeRouter.post("/salaries", requirePermission("finance.salaries"), asyncRout
 financeRouter.get("/ledger/customer/:id", asyncRoute(async (req, res) => {
   assertUuid(req.params.id);
   await assertCanReadFinance(req, { ownerType: "customer", ownerId: req.params.id });
+  const range = parseRange(req.query);
   const { rows } = await query(
     `SELECT * FROM ( SELECT o.customer_id, o.created_at AS entry_date, 'فاتورة ' || o.order_number AS label, o.order_number AS reference, NULL::text AS voucher_number, o.grand_total AS debit, 0 AS credit FROM orders o WHERE o.customer_id = $1 AND o.status NOT IN ('draft','under_review','cancelled','postponed') UNION ALL SELECT v.party_id AS customer_id, v.created_at AS entry_date, CASE WHEN v.voucher_type = 'payment' THEN 'صرف نقدي للعميل (استرجاع)' ELSE 'إيصال قبض' END AS label, COALESCE(o2.order_number, '') AS reference, v.voucher_number, CASE WHEN v.voucher_type = 'payment' THEN v.amount ELSE 0 END AS debit, CASE WHEN v.voucher_type = 'payment' THEN 0 ELSE v.amount END AS credit FROM vouchers v LEFT JOIN orders o2 ON o2.id = v.order_id WHERE v.party_type = 'customer' AND v.party_id = $1 AND v.approval_status = 'approved' AND v.voucher_type IN ('receipt','payment') UNION ALL SELECT r.customer_id, r.created_at AS entry_date, 'إشعار دائن - إرجاع ' || r.return_number AS label, o3.order_number AS reference, r.return_number AS voucher_number, 0 AS debit, r.refund_amount AS credit FROM returns r JOIN orders o3 ON o3.id = r.order_id WHERE r.customer_id = $1 AND r.status = 'refunded' AND r.refund_method IN ('credit_note','cash') AND r.refund_amount > 0 ) x ORDER BY entry_date`,
     [req.params.id]
   );
-  let balanceC = 0;
-  res.json(rows.map((r) => {
-    balanceC += toCents(r.debit) - toCents(r.credit);
-    return { ...r, balance: fromCents(balanceC) };
-  }));
+  res.json(buildLedger(rows, range, "debit-credit", { customer_id: req.params.id }));
 }));
 
 // رصيد كل عميل مجمّعًا من كشف حسابه الكامل (وليس من إجمالي الطلبيات فقط) —
@@ -1037,15 +1036,12 @@ financeRouter.get("/balances/suppliers", requirePermission("reports.view"), asyn
 financeRouter.get("/ledger/supplier/:id", asyncRoute(async (req, res) => {
   assertUuid(req.params.id);
   await assertCanReadFinance(req, { ownerType: "supplier", ownerId: req.params.id });
+  const range = parseRange(req.query);
   const { rows } = await query(
     `SELECT supplier_id, entry_date, label, reference, voucher_number, debit, credit FROM v_supplier_ledger WHERE supplier_id = $1 ORDER BY entry_date`,
     [req.params.id]
   );
-  let balanceC = 0;
-  res.json(rows.map((r) => {
-    balanceC += toCents(r.credit) - toCents(r.debit);
-    return { ...r, balance: fromCents(balanceC) };
-  }));
+  res.json(buildLedger(rows, range, "credit-debit", { supplier_id: req.params.id }));
 }));
 
 // جلب بيانات إيصال قبض/صرف واحد يخص المورد أو العميل نفسه — تُستخدم لبناء صفحة
@@ -1064,11 +1060,15 @@ financeRouter.get("/vouchers/me/:id", requireActorType("supplier", "customer"), 
 // شاشة "سنداتي" بتطبيق المورد أو تطبيق العميل
 financeRouter.get("/vouchers/mine", requireActorType("supplier", "customer"), asyncRoute(async (req, res) => {
   const { limit, offset } = pageParams(req);
+  const range = parseRange(req.query);
+  const params = [req.actor.type, req.actor.id, limit, offset];
+  const conds = [];
+  addRange("created_at", range, params, conds);
   const { rows } = await query(
     `SELECT * FROM vouchers
-      WHERE party_type = $1 AND party_id = $2 AND approval_status = 'approved'
+      WHERE party_type = $1 AND party_id = $2 AND approval_status = 'approved'${andClause(conds)}
       ORDER BY created_at DESC, id LIMIT $3 OFFSET $4`,
-    [req.actor.type, req.actor.id, limit, offset]
+    params
   );
   res.json(rows);
 }));
@@ -1126,7 +1126,8 @@ financeRouter.post("/expenses", requirePermission("finance.expenses"), asyncRout
 }));
 
 financeRouter.get("/expenses", requirePermission("finance.expenses"), asyncRoute(async (req, res) => {
-  const { category, search, from, to } = req.query;
+  const { category, search } = req.query;
+  const { from, to } = parseRange(req.query);
   const { rows } = await query(
     `SELECT e.*, t.code AS treasury_code, t.name AS treasury_name
        FROM expenses e JOIN treasuries t ON t.id = e.treasury_id
@@ -1141,10 +1142,16 @@ financeRouter.get("/expenses", requirePermission("finance.expenses"), asyncRoute
   res.json(rows);
 }));
 
-financeRouter.get("/expenses/summary", requirePermission("finance.expenses"), asyncRoute(async (_req, res) => {
+financeRouter.get("/expenses/summary", requirePermission("finance.expenses"), asyncRoute(async (req, res) => {
+  const range = parseRange(req.query);
+  const params = [];
+  const conds = [];
+  addDateColRange("expense_date", range, params, conds);
   const { rows } = await query(
     `SELECT category, COUNT(*)::INT AS count, SUM(amount) AS total
-       FROM expenses GROUP BY category ORDER BY total DESC`
+       FROM expenses${conds.length ? " WHERE " + conds.join(" AND ") : ""}
+      GROUP BY category ORDER BY total DESC`,
+    params
   );
   res.json(rows.map((r) => ({ ...r, categoryLabel: EXPENSE_CATEGORIES[r.category] })));
 }));
