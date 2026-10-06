@@ -6,7 +6,7 @@ import {
   ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode,
 } from "../lib/helpers.js";
 import {
-  authenticate, requirePermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
+  authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
 } from "../middleware/auth.js";
 import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
 import { parseRange, addRange, andClause } from "../lib/dateRange.js";
@@ -1368,6 +1368,10 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), requireOrde
     status: z.string().max(40), note: z.string().max(500).optional(),
   }).parse(req.body);
 
+  // الإلغاء والتأجيل لازم يكون له سبب، يتسجل في سجل الطلبية
+  if (["cancelled", "postponed"].includes(status) && !(note && note.trim().length >= 3)) {
+    throw new ApiError(400, "اكتب سبب الإلغاء أو التأجيل (3 أحرف على الأقل)");
+  }
   // الإلغاء والتأجيل بنفس صلاحية /reject
   if (["cancelled", "postponed"].includes(status) && !(await employeeHasAny(req.actor.id, ["orders.cancel"]))) {
     throw new ApiError(403, "لا تملك صلاحية إلغاء أو تأجيل الطلبيات");
@@ -1383,6 +1387,17 @@ orderRouter.patch("/:id/status", requirePermission("orders.review"), requireOrde
   });
 
   res.json(result);
+}));
+
+// ملاحظة حرة من موظف في سجل الطلبية (تظهر باسمه ووقتها، بدون تغيير الحالة)
+orderRouter.post("/:id/notes", requireAnyPermission("orders.review", "orders.cancel", "orders.assign_driver", "orders.returns"), requireOrderScope, asyncRoute(async (req, res) => {
+  const { note } = z.object({ note: z.string().trim().min(1).max(500) }).parse(req.body);
+  await withTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT id, status FROM orders WHERE id = $1`, [req.params.id]);
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    await recordStatus(client, { orderId: rows[0].id, from: rows[0].status, to: rows[0].status, actor: req.actor, note });
+  });
+  res.status(201).json({ ok: true });
 }));
 
 // أهلية السائق: موظف نشط بدور "مندوب"
