@@ -17,8 +17,16 @@ const OTP_MAX_ATTEMPTS = 5; // بعدها يُحرق الرمز ويلزم طل�
 // مشتركة ما تقفل كل المستخدمين. وفوقها سقف أوسع حسب IP وحده ضد من يجرب أرقام كثيرة.
 const phoneIpKey = (req) => `${req.ip}|${normalizePhone(req.body?.phone) || "-"}`;
 const ipKey = (req) => String(req.ip);
+// وضع التجربة المؤقت: أرقام التجربة (TEST_OTP_PHONES) فقط تُعفى من سقف الدخول عشان نقدر نجرب ضغط
+// عدد كبير من الحسابات من جهاز واحد. أي رقم ثاني يبقى عليه السقف العادي. يتعطل بمسح TEST_SKIP_OTP.
+const skipForTestPhones = (req) => {
+  try {
+    if (process.env.TEST_SKIP_OTP !== "1") return false;
+    return Boolean(testOtpFor(normalizePhone(req.body?.phone)));
+  } catch { return false; }
+};
 const makeLimiter = (windowMs, max, keyGenerator) => rateLimit({
-  windowMs, max, keyGenerator,
+  windowMs, max, keyGenerator, skip: skipForTestPhones,
   standardHeaders: true, legacyHeaders: false,
   message: { error: "محاولات كثيرة، يرجى المحاولة بعد قليل" },
 });
