@@ -1461,6 +1461,7 @@ async function assignDriverTx(client, order, driverId, actor, { note, ip, audit 
   });
   // إشعار داخل التطبيق للمندوب (بدون واتساب): طلبية جديدة مسندة له، وللمندوب السابق لو سُحبت منه.
   // ثانوي: لو فشل لأي سبب (SAVEPOINT) ما يمنعش الإسناد نفسه.
+  let noticeError = null;
   await client.query("SAVEPOINT driver_notice");
   try {
     await createInAppNotification(client, {
@@ -1479,7 +1480,9 @@ async function assignDriverTx(client, order, driverId, actor, { note, ip, audit 
   } catch (e) {
     await client.query("ROLLBACK TO SAVEPOINT driver_notice");
     console.error("[NOTIFY] driver notice failed:", e?.message, e?.constraint || "");
+    noticeError = `${e?.message || e}${e?.constraint ? " [" + e.constraint + "]" : ""}`;
   }
+  if (noticeError) return { ...updated, driverNoticeError: noticeError };
   return updated;
 }
 
