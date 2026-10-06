@@ -216,7 +216,15 @@ async function recalcOrderTotals(client, orderId, { refreshFee = true } = {}) {
 
   const grand = round2(itemsSubtotal + fee);
   const paid = Number(o.paid_amount) || 0;
-  const paymentStatus = paid > 0 && paid >= grand ? "paid" : paid > 0 ? "partially_paid" : "unpaid";
+  // قيد قاعدة الإنتاج على payment_status يقبل فقط:
+  // pending / under_review / approved / rejected / partially_paid / paid / deferred (ما فيه "unpaid").
+  // لو ما فيه مدفوع: نحافظ على حالة سير العمل الحالية (مراجعة الحوالة، الآجل...)، ونرجع "pending"
+  // بس لو كانت الحالة السابقة "مدفوع/مدفوع جزئيًا" (مثلًا بعد تعديل أو إرجاع).
+  const NO_PAYMENT_STATES = ["pending", "under_review", "approved", "rejected", "deferred"];
+  const idleStatus = NO_PAYMENT_STATES.includes(o.payment_status)
+    ? o.payment_status
+    : (o.payment_method === "deferred" ? "deferred" : "pending");
+  const paymentStatus = paid > 0 && paid >= grand ? "paid" : paid > 0 ? "partially_paid" : idleStatus;
   await client.query(
     `UPDATE orders SET items_subtotal = $2, delivery_fee = $3, grand_total = $4, payment_status = $5 WHERE id = $1`,
     [orderId, itemsSubtotal, fee, grand, paymentStatus]
