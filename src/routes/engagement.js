@@ -131,6 +131,104 @@ engagementRouter.post("/orders/:orderId/messages", asyncRoute(async (req, res) =
   res.status(201).json(rows[0]);
 }));
 
+/* ===================================================================
+   شكاوي المندوبين (تكت على الطلبية): المندوب يفتح شكوى على طلبيته (الطلبية ما توصلتش، العميل ما يردش...)
+   وتظهر للإدارة في قسم خاص بها داخل سجل الطلبية، وتقدر تقفلها بملاحظة.
+   الجدول: order_driver_complaints (يُنشأ بسكريبت SQL مرّة وحدة — انظر db/order_driver_complaints.sql)
+=================================================================== */
+
+const DRIVER_COMPLAINT_KINDS = ["not_delivered", "customer_unreachable", "wrong_address", "customer_refused", "supplier_issue", "other"];
+
+const isDriver = (actor) => actor.type === "employee" && actor.role === "driver";
+
+// جدول الشكاوي غير موجود بعد (لم يُشغَّل سكريبت الإنشاء): نرجّع رسالة واضحة بدل خطأ عام
+function missingTableGuard(e) {
+  if (e?.code === "42P01") throw new ApiError(503, "ميزة شكاوي المندوب لم تُفعَّل بعد (جدول الشكاوي غير موجود في قاعدة البيانات)");
+  throw e;
+}
+
+engagementRouter.post("/orders/:orderId/driver-complaints", asyncRoute(async (req, res) => {
+  if (!isDriver(req.actor)) throw new ApiError(403, "هذا الإجراء مخصص للمناديب");
+  const body = z.object({
+    kind: z.enum(DRIVER_COMPLAINT_KINDS),
+    note: z.string().trim().max(1000, "الملاحظة طويلة جدًا — الحد الأقصى 1000 حرف").optional(),
+  }).parse(req.body);
+  if (body.kind === "other" && (!body.note || body.note.length < 3)) {
+    throw new ApiError(400, "اكتب تفاصيل الشكوى");
+  }
+
+  const { rows: [order] } = await query(
+    `SELECT id, order_number, driver_id FROM orders WHERE id = $1`, [req.params.orderId]
+  );
+  if (!order) throw new ApiError(404, "الطلبية غير موجودة");
+  if (order.driver_id !== req.actor.id) throw new ApiError(403, "هذه الطلبية ليست مسندة لك");
+
+  let row;
+  try {
+    ({ rows: [row] } = await query(
+      `INSERT INTO order_driver_complaints (order_id, driver_id, kind, note)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [order.id, req.actor.id, body.kind, body.note || null]
+    ));
+  } catch (e) { missingTableGuard(e); }
+
+  // التنبيه ثانوي: فشله ما يمنع تسجيل الشكوى
+  try {
+    await notifyStaffWithPermission(pool, {
+      permissionCode: "orders.review", templateCode: "message.staff_received",
+      orderId: order.id,
+      vars: { order_number: order.order_number, sender: `المندوب ${req.actor.name || ""}`.trim() },
+    });
+  } catch (e) {
+    console.error("[DRIVER_COMPLAINT_NOTIFY]", e);
+  }
+
+  res.status(201).json(row);
+}));
+
+engagementRouter.get("/orders/:orderId/driver-complaints", asyncRoute(async (req, res) => {
+  const { rows: [order] } = await query(`SELECT id, driver_id FROM orders WHERE id = $1`, [req.params.orderId]);
+  if (!order) throw new ApiError(404, "الطلبية غير موجودة");
+  if (isDriver(req.actor)) {
+    if (order.driver_id !== req.actor.id) throw new ApiError(403, "هذه الطلبية ليست مسندة لك");
+  } else if (req.actor.type === "employee") {
+    await assertEmployeeOrdersAccess(req);
+  } else {
+    throw new ApiError(403, "لا تملك صلاحية الاطلاع على شكاوي المندوب");
+  }
+  try {
+    const { rows } = await query(
+      `SELECT c.*, e.name AS driver_name
+         FROM order_driver_complaints c
+         LEFT JOIN employees e ON e.id = c.driver_id
+        WHERE c.order_id = $1
+        ORDER BY c.created_at DESC`,
+      [order.id]
+    );
+    res.json(rows);
+  } catch (e) {
+    if (e?.code === "42P01") return res.json([]); // الميزة لم تُفعَّل بعد → قائمة فاضية بدل خطأ
+    throw e;
+  }
+}));
+
+engagementRouter.patch("/driver-complaints/:id/close", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = z.object({
+    note: z.string().trim().max(1000, "الملاحظة طويلة جدًا — الحد الأقصى 1000 حرف").optional(),
+  }).parse(req.body ?? {});
+  let row;
+  try {
+    ({ rows: [row] } = await query(
+      `UPDATE order_driver_complaints
+          SET status = 'closed', admin_note = $2, closed_by = $3, closed_at = now()
+        WHERE id = $1 AND status = 'open' RETURNING *`,
+      [req.params.id, body.note || null, req.actor.id]
+    ));
+  } catch (e) { missingTableGuard(e); }
+  if (!row) throw new ApiError(404, "الشكوى غير موجودة أو مقفلة مسبقًا");
+  res.json(row);
+}));
+
 const feedbackSchema = z.object({
   orderId: z.string().uuid(),
   rating: z.number().int().min(1).max(5).optional(),
