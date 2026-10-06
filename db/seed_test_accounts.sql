@@ -6,8 +6,15 @@
 --   مناديب:   0900300001 .. 0900300010
 --   مسؤولي طلبيات: 0900400001 .. 0900400003 | محاسب: 0900500001 | كتالوج: 0900600001 | مدير: 0900700001
 DO $$
-DECLARE i int; j int; sid uuid; cid uuid; roots uuid[]; allsecs uuid[]; sec uuid; root uuid;
+DECLARE i int; j int; r_drv uuid; r_ord uuid; r_acc uuid; r_cat uuid; r_gm uuid; sid uuid; cid uuid; roots uuid[]; allsecs uuid[]; sec uuid; root uuid;
 BEGIN
+  -- أدوار الموظفين: نبحث بالكود أو بالاسم، ولو ما لقينا دور نتخطّى ذاك الموظف (ولا نوقف الباقي)
+  SELECT id INTO r_drv FROM roles WHERE code='driver' OR name ILIKE '%مندوب%' ORDER BY (code='driver') DESC LIMIT 1;
+  SELECT id INTO r_ord FROM roles WHERE code IN ('order_manager','orders_manager','orders') OR name ILIKE '%طلبي%' ORDER BY (code='order_manager') DESC LIMIT 1;
+  SELECT id INTO r_acc FROM roles WHERE code='accountant' OR name ILIKE '%محاسب%' LIMIT 1;
+  SELECT id INTO r_cat FROM roles WHERE code IN ('catalog_manager','catalog') OR name ILIKE '%كتالوج%' LIMIT 1;
+  SELECT id INTO r_gm  FROM roles WHERE code='general_manager' OR name ILIKE '%مدير عام%' LIMIT 1;
+  RAISE NOTICE 'الأدوار: مندوب=% طلبيات=% محاسب=% كتالوج=% مدير=%', r_drv, r_ord, r_acc, r_cat, r_gm;
   SELECT array_agg(id) INTO roots   FROM sections WHERE parent_id IS NULL AND is_active;
   SELECT array_agg(id) INTO allsecs FROM sections WHERE is_active;
   IF roots IS NULL THEN RAISE EXCEPTION 'ما فيش أقسام فعّالة — أنشئ قسم واحد على الأقل أولًا'; END IF;
@@ -33,19 +40,19 @@ BEGIN
   END LOOP;
 
   FOR i IN 1..10 LOOP
-    IF NOT EXISTS (SELECT 1 FROM employees WHERE phone = '09003'||lpad(i::text,5,'0')) THEN
-      INSERT INTO employees(name, phone, role_id, is_active) VALUES ('تجربة • مندوب '||i, '09003'||lpad(i::text,5,'0'), (SELECT id FROM roles WHERE code='driver'), true);
+    IF r_drv IS NOT NULL AND NOT EXISTS (SELECT 1 FROM employees WHERE phone = '09003'||lpad(i::text,5,'0')) THEN
+      INSERT INTO employees(name, phone, role_id, is_active) VALUES ('تجربة • مندوب '||i, '09003'||lpad(i::text,5,'0'), r_drv, true);
     END IF;
   END LOOP;
   FOR i IN 1..3 LOOP
-    IF NOT EXISTS (SELECT 1 FROM employees WHERE phone = '09004'||lpad(i::text,5,'0')) THEN
-      INSERT INTO employees(name, phone, role_id, is_active) VALUES ('تجربة • مسؤول طلبيات '||i, '09004'||lpad(i::text,5,'0'), (SELECT id FROM roles WHERE code='order_manager'), true);
+    IF r_ord IS NOT NULL AND NOT EXISTS (SELECT 1 FROM employees WHERE phone = '09004'||lpad(i::text,5,'0')) THEN
+      INSERT INTO employees(name, phone, role_id, is_active) VALUES ('تجربة • مسؤول طلبيات '||i, '09004'||lpad(i::text,5,'0'), r_ord, true);
     END IF;
   END LOOP;
   INSERT INTO employees(name, phone, role_id, is_active)
-  SELECT v.n, v.p, (SELECT id FROM roles WHERE code = v.c), true
-    FROM (VALUES ('تجربة • محاسب','0900500001','accountant'),('تجربة • مسؤول كتالوج','0900600001','catalog_manager'),('تجربة • مدير','0900700001','general_manager')) v(n,p,c)
-   WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.phone = v.p);
+  SELECT v.n, v.p, v.r, true
+    FROM (VALUES ('تجربة • محاسب','0900500001',r_acc),('تجربة • مسؤول كتالوج','0900600001',r_cat),('تجربة • مدير','0900700001',r_gm)) v(n,p,r)
+   WHERE v.r IS NOT NULL AND NOT EXISTS (SELECT 1 FROM employees e WHERE e.phone = v.p);
 END $$;
 
 -- القائمة الجاهزة للصق في Railway ← TEST_OTP_PHONES (كل أرقام التجربة)
