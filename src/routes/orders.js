@@ -34,7 +34,7 @@ const TERMINAL = ["delivered", "closed", "cancelled"];
 const PART_UNCONFIRMED = ["pending", "sent"];
 // صلاحيات تسمح لموظف بالاطلاع على الطلبيات (المندوب له مسار منفصل: طلبياته فقط)
 const STAFF_VIEW_PERMS = [
-  "orders.review", "orders.cancel", "orders.assign_driver", "orders.returns",
+  "orders.review", "orders.cancel", "orders.assign_driver", "orders.reassign_driver", "orders.returns",
   "finance.vouchers", "reports.view",
 ];
 // طرق دفع يستلم فيها المورد المبلغ نقدًا عند تسليم الاستلام الشخصي
@@ -1954,7 +1954,7 @@ orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver")
 // سحب الطلبية من مندوب (ظرف طارئ مثلًا) وإسنادها لمندوب آخر — متاح وهي "مسندة" أو "في الطريق"،
 // بشرط ما يكون المندوب الأول استلم فلوس من العميل (cod_collected). ترجع الحالة "مسندة"
 // والمندوب الجديد هو اللي يضغط "بدء التوصيل".
-orderRouter.post("/:id/reassign-driver", requirePermission("orders.assign_driver"), requireOrderScope, asyncRoute(async (req, res) => {
+orderRouter.post("/:id/reassign-driver", requirePermission("orders.reassign_driver"), requireOrderScope, asyncRoute(async (req, res) => {
   const { driverId, reason } = z.object({
     driverId: z.string().uuid(),
     reason: z.string().trim().max(500).optional(),
