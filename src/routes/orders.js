@@ -1892,7 +1892,7 @@ const resolveBodySchema = z.object({
 
 /* نواة حل النقص — تُستعمل من الموظف (بموافقة شفهية) ومن العميل نفسه (من تطبيقه) */
 async function resolveShortageCore({ shortageId, body, actor, ip, byCustomer = false }) {
-  const actorId = byCustomer ? null : actor.id; // أعمدة "resolved_by" / حركة المخزون مرتبطة بالموظفين فقط
+  const actorId = actor.id; // عند موافقة العميل نمرّر معرّف الموظف اللي اقترح الحل (أعمدة المنفّذ في القاعدة مرتبطة بالموظفين)
   // نعرف الطلبية أولًا لنطبّق نطاق الأقسام ونقفلها قبل سجل النقص (ترتيب موحّد للأقفال)
   const { rows: [pre] } = await query(
     `SELECT oi.order_id FROM order_shortages sh JOIN order_items oi ON oi.id = sh.order_item_id WHERE sh.id = $1`,
@@ -2207,7 +2207,7 @@ orderRouter.post("/shortages/:id/respond", requireActorType("customer"), asyncRo
     substituteProductId: sh.proposed_substitute_product_id ?? undefined,
     substituteVariantId: sh.proposed_substitute_variant_id ?? undefined,
   });
-  const result = await resolveShortageCore({ shortageId: sh.id, body, actor: { id: null, type: "customer", name: "العميل" }, ip: req.ip, byCustomer: true });
+  const result = await resolveShortageCore({ shortageId: sh.id, body, actor: { id: sh.proposed_by, type: "employee", name: "العميل (من تطبيقه)" }, ip: req.ip, byCustomer: true });
   await query(`UPDATE order_shortages SET customer_response = 'accepted', customer_responded_at = now() WHERE id = $1`, [sh.id]);
   res.json({ ok: true, accepted: true, result });
 }));
