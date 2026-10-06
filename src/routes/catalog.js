@@ -1939,13 +1939,19 @@ catalogRouter.get("/products/:id/movement", requirePermission("reports.view"), a
 
 catalogRouter.get("/suppliers", asyncRoute(async (req, res) => {
   if (req.actor.type === "customer") {
+    // نفس شروط عرض الأصناف للعميل: صنف فعّال ومعتمد، مورد معتمد، قسم الصنف الرئيسي مفعّل للعميل وللمورد.
+    // section_id = القسم الرئيسي (للتجميع)، product_section_id = القسم الفعلي للصنف (الفرعي لو فيه)
     const { rows } = await query(
-      `SELECT DISTINCT s.id, s.business_name AS name, sec.id AS section_id, sec.name AS section_name
+      `SELECT DISTINCT s.id, s.business_name AS name,
+              COALESCE(sec.parent_id, sec.id) AS section_id,
+              sec.id AS product_section_id, sec.name AS section_name
          FROM suppliers s
-         JOIN products p        ON p.supplier_id = s.id AND p.is_active
-         JOIN sections sec      ON sec.id = p.section_id
-         JOIN customer_sections cs ON cs.section_id = sec.id
+         JOIN products p        ON p.supplier_id = s.id AND p.is_active AND p.approval_status = 'approved'
+         JOIN sections sec      ON sec.id = p.section_id AND sec.is_active
+         JOIN customer_sections cs ON cs.section_id = COALESCE(sec.parent_id, sec.id)
                                   AND cs.customer_id = $1 AND cs.enabled
+         JOIN supplier_sections ss ON ss.supplier_id = s.id
+                                  AND ss.section_id = COALESCE(sec.parent_id, sec.id) AND ss.enabled
         WHERE s.status = 'approved'
         ORDER BY s.business_name`,
       [req.actor.id]
