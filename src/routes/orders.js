@@ -1459,18 +1459,26 @@ async function assignDriverTx(client, order, driverId, actor, { note, ip, audit 
     recipientId: order.customer_id, orderId: order.id,
     vars: { order_number: order.order_number },
   });
-  // إشعار داخل التطبيق للمندوب (بدون واتساب): طلبية جديدة مسندة له، وللمندوب السابق لو سُحبت منه
-  await createInAppNotification(client, {
-    recipientType: "employee", recipientId: driverId, orderId: order.id,
-    title: "طلبية جديدة مسندة إليك",
-    body: `تم إسناد الطلبية ${order.order_number} إليك — افتح تطبيقك واضغط «بدء التوصيل» لما تطلع بها.`,
-  });
-  if (order.driver_id && order.driver_id !== driverId) {
+  // إشعار داخل التطبيق للمندوب (بدون واتساب): طلبية جديدة مسندة له، وللمندوب السابق لو سُحبت منه.
+  // ثانوي: لو فشل لأي سبب (SAVEPOINT) ما يمنعش الإسناد نفسه.
+  await client.query("SAVEPOINT driver_notice");
+  try {
     await createInAppNotification(client, {
-      recipientType: "employee", recipientId: order.driver_id, orderId: order.id,
-      title: "سُحبت منك طلبية",
-      body: `تم سحب الطلبية ${order.order_number} منك وإسنادها لمندوب آخر.`,
+      recipientType: "employee", recipientId: driverId, orderId: order.id,
+      title: "طلبية جديدة مسندة إليك",
+      body: `تم إسناد الطلبية ${order.order_number} إليك — افتح تطبيقك واضغط «بدء التوصيل» لما تطلع بها.`,
     });
+    if (order.driver_id && order.driver_id !== driverId) {
+      await createInAppNotification(client, {
+        recipientType: "employee", recipientId: order.driver_id, orderId: order.id,
+        title: "سُحبت منك طلبية",
+        body: `تم سحب الطلبية ${order.order_number} منك وإسنادها لمندوب آخر.`,
+      });
+    }
+    await client.query("RELEASE SAVEPOINT driver_notice");
+  } catch (e) {
+    await client.query("ROLLBACK TO SAVEPOINT driver_notice");
+    console.error("[NOTIFY] driver notice failed:", e?.message, e?.constraint || "");
   }
   return updated;
 }
