@@ -408,7 +408,7 @@ async function prepareLines(client, customerId, rawLines) {
 
     const label = variant ? `${p.name} — ${variant.label}` : p.name;
     assertQtyForUnit(l.qty, p.unit, label);
-    await assertCustomerSection(customerId, p.section_id);
+    await assertCustomerSection(customerId, p.section_id, client);
 
     const price = Number(await resolvePrice(client, {
       productId: p.id, customerId, qty: l.qty, variantId: l.variantId || undefined,
@@ -1897,10 +1897,18 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
     const missing = Number(shortage.qty_missing);
     const supplierIds = part ? [part.supplier_id] : [];
     const auditAction = `shortage.resolved_${body.resolution}`;
-    const histNote = (text) => recordStatus(client, {
-      orderId: order.id, orderSupplierId: part?.id ?? null, from: order.status, to: order.status, actor: req.actor,
+    const histNote = async (text) => {
+      // لو كان هذا آخر صنف عند المورد فجزءه انحذف (removeEmptyParts) — ما نربط السجل بجزء غير موجود
+      let partId = part?.id ?? null;
+      if (partId) {
+        const { rows: still } = await client.query(`SELECT 1 FROM order_suppliers WHERE id = $1`, [partId]);
+        if (!still.length) partId = null;
+      }
+      return recordStatus(client, {
+      orderId: order.id, orderSupplierId: partId, from: order.status, to: order.status, actor: req.actor,
       note: `حل نقص «${item.product_name}» — ${text} (بموافقة العميل)`,
-    });
+      });
+    };
     const audit = (after) => writeAudit(client, {
       actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
       action: auditAction, entityType: "order_shortage", entityId: shortage.id,

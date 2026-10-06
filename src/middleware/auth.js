@@ -174,8 +174,10 @@ export function stripSecrets(row) {
 
 // لو القسم المطلوب قسم فرعي (له parent_id)، التفعيل يتحقق منه على مستوى القسم الرئيسي
 // (تفعيل القسم الرئيسي للعميل يفعّل كل تصنيفاته الفرعية تلقائيًا)
-export async function assertCustomerSection(customerId, sectionId) {
-  const { rows } = await query(
+export async function assertCustomerSection(customerId, sectionId, runner = null) {
+  // runner: لو الاستدعاء داخل معاملة (transaction) نمرّر نفس الـclient — وإلا نستهلك اتصالًا ثانيًا من البول
+  // وعند ضغط الطلبات (10+ بنفس الوقت) كل الاتصالات تنحبس ويتوقف السيرفر كله
+  const { rows } = await (runner ? runner.query.bind(runner) : query)(
     `SELECT 1
        FROM sections s
        JOIN customer_sections cs ON cs.section_id = COALESCE(s.parent_id, s.id)
