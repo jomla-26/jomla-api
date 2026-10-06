@@ -59,6 +59,16 @@ export async function ensureSchema() {
     try { await pool.query(sql); }
     catch (e) { console.error("[schema]", e.message, "|", sql.slice(0, 60).replace(/\s+/g, " ")); }
   }
+  // صلاحية جديدة: عرض سجل أخطاء السيرفر (تنعطى تلقائيًا لمن عنده إدارة الموظفين)
+  try {
+    await pool.query(`INSERT INTO permissions (code, description) VALUES ('system.errors','عرض سجل أخطاء النظام') ON CONFLICT (code) DO NOTHING`);
+    await pool.query(
+      `INSERT INTO role_permissions (role_id, permission_id)
+       SELECT rp.role_id, (SELECT id FROM permissions WHERE code='system.errors')
+         FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id AND p.code = 'employees.manage'
+       ON CONFLICT DO NOTHING`
+    );
+  } catch (e) { console.error("[schema-perm]", e.message); }
   // المدير العام يملك كل الصلاحيات دائمًا، حتى الجديدة اللي تنضاف لاحقًا (تتزامن عند كل تشغيل)
   try {
     await pool.query(
@@ -107,7 +117,7 @@ export async function logServerError({ req = null, err, status = 500 }) {
     if (Date.now() - lastAlertAt > 5 * 60 * 1000) {
       lastAlertAt = Date.now();
       await notifyStaffInApp(pool, {
-        permissionCode: "employees.manage",
+        permissionCode: "system.errors",
         title: "⚠️ خطأ جديد في السيرفر",
         body: `${method ?? ""} ${path} — ${message.slice(0, 120)}`,
       });
@@ -124,7 +134,7 @@ export async function logServerError({ req = null, err, status = 500 }) {
  * ------------------------------------------------------------------ */
 export const systemRouter = express.Router();
 systemRouter.use(authenticate);
-systemRouter.use(requirePermission("employees.manage"));
+systemRouter.use(requirePermission("system.errors"));
 
 systemRouter.get("/errors", asyncRoute(async (req, res) => {
   const showResolved = req.query.resolved === "1";
