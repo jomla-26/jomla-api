@@ -1951,6 +1951,34 @@ orderRouter.post("/:id/assign-driver", requirePermission("orders.assign_driver")
   res.json(result);
 }));
 
+// سحب الطلبية من مندوب (ظرف طارئ مثلًا) وإسنادها لمندوب آخر — متاح وهي "مسندة" أو "في الطريق"،
+// بشرط ما يكون المندوب الأول استلم فلوس من العميل (cod_collected). ترجع الحالة "مسندة"
+// والمندوب الجديد هو اللي يضغط "بدء التوصيل".
+orderRouter.post("/:id/reassign-driver", requirePermission("orders.assign_driver"), requireOrderScope, asyncRoute(async (req, res) => {
+  const { driverId, reason } = z.object({
+    driverId: z.string().uuid(),
+    reason: z.string().trim().max(500).optional(),
+  }).parse(req.body);
+
+  const result = await withTransaction(async (client) => {
+    await assertActiveDriver(client, driverId);
+    const { rows } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!rows.length) throw new ApiError(404, "الطلبية غير موجودة");
+    const order = rows[0];
+    if (!["assigned_to_driver", "out_for_delivery"].includes(order.status) || !order.driver_id) {
+      throw new ApiError(409, "الطلبية مش عند مندوب حاليًا");
+    }
+    if (order.driver_id === driverId) throw new ApiError(409, "الطلبية أصلاً عند نفس المندوب");
+    if (Number(order.cod_collected || 0) > 0) {
+      throw new ApiError(409, "المندوب الحالي استلم مبلغ من العميل — سوّي الحساب معاه أولًا");
+    }
+    const note = "سحب من مندوب وإعادة إسناد لمندوب آخر" + (reason ? " — السبب: " + reason : "");
+    return assignDriverTx(client, order, driverId, req.actor, { ip: req.ip, note });
+  });
+
+  res.json(result);
+}));
+
 // المندوب يضغط هذا الزر لما يطلع فعليًا من المخزن بالطلبية — هنا بس تتحول الحالة
 // إلى "في الطريق" فعليًا، بعد ما كانت مجرد "مسندة إليه"
 orderRouter.post("/:id/start-delivery", requireActorType("employee"), asyncRoute(async (req, res) => {
