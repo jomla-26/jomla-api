@@ -541,15 +541,12 @@ async function createOrderCore(client, { customerId, body, actor, byAdmin, ip })
     `INSERT INTO orders
        (order_number, customer_id, status, fulfillment, payment_method,
         items_subtotal, delivery_fee, grand_total,
-        delivery_zone_id, vehicle_type_id, vehicles_count)
-     VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10)
+        delivery_zone_id, vehicle_type_id, vehicles_count, client_key)
+     VALUES ($1,$2,'under_review',$3,$4,$5,$6,$7,$8,$9,$10,$11)
      RETURNING *`,
     [orderNumber, customerId, body.fulfillment, body.paymentMethod,
-     itemsSubtotal, deliveryFee, grandTotal, zoneId, vehicleTypeId, vehiclesCount]
+     itemsSubtotal, deliveryFee, grandTotal, zoneId, vehicleTypeId, vehiclesCount, body.clientKey ?? null]
   );
-  if (body.clientKey) {
-    await client.query(`UPDATE orders SET client_key = $2 WHERE id = $1`, [created.id, body.clientKey]);
-  }
 
   for (const supplierId of supplierIds) {
     const mine = enriched.filter((i) => i.supplier_id === supplierId);
@@ -559,16 +556,22 @@ async function createOrderCore(client, { customerId, body, actor, byAdmin, ip })
        VALUES ($1,$2,$3,$4,$5) RETURNING id`,
       [created.id, supplierId, subtotal, body.supplierNotes?.[supplierId] ?? null, rateMap[supplierId] ?? 0]
     );
-    for (const i of mine) {
-      await client.query(
-        `INSERT INTO order_items
-           (order_id, order_supplier_id, product_id, product_name, unit,
-            unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [created.id, os.id, i.productId, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.lineTotal,
-         i.supplier_sku, i.variantId, i.variantLabel]
-      );
-    }
+    // إدخال كل أصناف المورد بجملة واحدة (أقل رحلات للقاعدة = قفل رقم الفاتورة يتحرر أسرع تحت الضغط)
+    const cols = 12;
+    const vals = [];
+    const params = [];
+    mine.forEach((i, k) => {
+      vals.push(`(${Array.from({ length: cols }, (_, c) => `$${k * cols + c + 1}`).join(",")})`);
+      params.push(created.id, os.id, i.productId, i.name, i.unit, i.price, i.purchase_cost, i.qty, i.lineTotal,
+        i.supplier_sku, i.variantId, i.variantLabel);
+    });
+    await client.query(
+      `INSERT INTO order_items
+         (order_id, order_supplier_id, product_id, product_name, unit,
+          unit_price, purchase_cost, qty_requested, line_total, supplier_sku, variant_id, variant_label)
+       VALUES ${vals.join(",")}`,
+      params
+    );
   }
 
   await recordStatus(client, {
@@ -580,15 +583,14 @@ async function createOrderCore(client, { customerId, body, actor, byAdmin, ip })
     action: byAdmin ? "order.created_by_admin" : "order.submitted",
     entityType: "order", entityId: created.id, entityLabel: orderNumber, after: created, ip,
   });
-  if (!byAdmin) {
-    await notifyStaffWithPermission(client, {
-      permissionCode: "orders.review", templateCode: "order.new_pending_review",
-      orderId: created.id,
-      vars: { order_number: orderNumber, customer_name: actor.name, total: grandTotal.toFixed(2) },
-    });
-  }
+  // تنبيه الموظفين يتم بعد اكتمال الحفظ (خارج المعاملة) عشان ما يبقّيش قفل رقم الفاتورة مشغول — وفشله ما يلغيش الطلبية
+  const staffNotice = byAdmin ? null : {
+    permissionCode: "orders.review", templateCode: "order.new_pending_review",
+    orderId: created.id,
+    vars: { order_number: orderNumber, customer_name: actor.name, total: grandTotal.toFixed(2) },
+  };
 
-  return { order: created, supplierCount: supplierIds.length, duplicate: false };
+  return { order: created, supplierCount: supplierIds.length, duplicate: false, staffNotice };
 }
 
 orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) => {
@@ -596,6 +598,10 @@ orderRouter.post("/", requireActorType("customer"), asyncRoute(async (req, res) 
   const r = await withTransaction((client) => createOrderCore(client, {
     customerId: req.actor.id, body, actor: req.actor, byAdmin: false, ip: req.ip,
   }));
+  if (r.staffNotice) {
+    try { await notifyStaffWithPermission({ query }, r.staffNotice); }
+    catch (e) { console.error("[NOTIFY] staff new-order notice failed:", e?.message); }
+  }
   res.status(r.duplicate ? 200 : 201)
     .json(customerOrderView({ ...r.order, supplierCount: r.supplierCount, duplicate: r.duplicate }));
 }));
