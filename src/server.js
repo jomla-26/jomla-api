@@ -46,8 +46,10 @@ const ALLOWED_ORIGINS = new Set(envOrigins.length ? envOrigins : DEFAULT_ORIGINS
 // نقبل أيضًا أي عنوان تطبيقات جملة على Vercel (jomla-*.vercel.app) حتى لو تغيّر الاسم أو كان نسخة معاينة.
 // المصادقة بالتوكن في الهيدر (وليس كوكيز)، فالموقع الغريب ما يقدر يقرأ توكن مستخدم من موقع آخر.
 const JOMLA_VERCEL = /^https:\/\/jomla[a-z0-9-]*\.vercel\.app$/i;
+// دومين جملة الرسمي: jomla-ly.com وكل النطاقات الفرعية (admin / supplier / driver / www ...).
+const JOMLA_DOMAIN = /^https:\/\/([a-z0-9-]+\.)?jomla-ly\.com$/i;
 app.use(cors({
-  origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.has(origin) || JOMLA_VERCEL.test(origin)),
+  origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.has(origin) || JOMLA_VERCEL.test(origin) || JOMLA_DOMAIN.test(origin)),
   credentials: true,
 }));
 app.use(express.json({ limit: "2mb" }) /* الاستيراد الجماعي للأصناف يحتاج هذا الحجم */);
