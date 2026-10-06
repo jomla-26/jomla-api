@@ -161,6 +161,10 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     console.log("[WHATSAPP] المتغيرات غير موجودة — تم تجاوز الإرسال");
   }
 
+  // وضع "دخول مباشر" المؤقت: لو TEST_SKIP_OTP=1 ورقم التجربة في TEST_OTP_PHONES، التطبيق يدخل فورًا بدون كتابة الرمز
+  if (fixedTestOtp && process.env.TEST_SKIP_OTP === "1") {
+    return res.json({ sent: true, skipOtp: true, otp: fixedTestOtp, message: "دخول مباشر (وضع تجربة)" });
+  }
   res.json({ sent: true, message: "تم إرسال رمز التحقق" });
 }));
 
