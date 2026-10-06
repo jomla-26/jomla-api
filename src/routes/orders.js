@@ -2048,11 +2048,13 @@ async function resolveShortageCore({ shortageId, body, actor, ip, byCustomer = f
       const { rows: [subItem] } = await client.query(
         `INSERT INTO order_items
            (order_id, order_supplier_id, product_id, product_name, unit, unit_price, purchase_cost,
-            qty_requested, qty_confirmed, availability, line_total, supplier_sku, variant_id, variant_label)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+            qty_requested, qty_confirmed, line_total, supplier_sku, variant_id, variant_label)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
         [order.id, targetPartId, line.productId, line.name, line.unit, line.price, line.purchase_cost,
-         line.qty, sameSupplier ? line.qty : null, sameSupplier ? "full" : null, line.lineTotal, line.supplier_sku, line.variantId, line.variantLabel]
+         line.qty, sameSupplier ? line.qty : null, line.lineTotal, line.supplier_sku, line.variantId, line.variantLabel]
       );
+      // (عمود availability له قيمة افتراضية في القاعدة، نحدده فقط لو الصنف مؤكّد)
+      if (sameSupplier) await client.query(`UPDATE order_items SET availability = 'full' WHERE id = $1`, [subItem.id]);
       let updated = null;
       if (confirmed > 0) {
         // الصنف الأصلي يبقى بالكمية المتوفرة فقط، والناقص يتغطى بالبديل
@@ -2842,13 +2844,14 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), requireOrderS
     const { rows: [item] } = await client.query(
       `INSERT INTO order_items
          (order_id, order_supplier_id, product_id, product_name, unit,
-          unit_price, purchase_cost, qty_requested, qty_confirmed, availability, line_total, supplier_sku,
+          unit_price, purchase_cost, qty_requested, qty_confirmed, line_total, supplier_sku,
           variant_id, variant_label)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [order.id, orderSupplierId, line.productId, line.name, line.unit, line.price, line.purchase_cost, line.qty,
-       partConfirmed ? line.qty : null, partConfirmed ? "full" : null, line.lineTotal, line.supplier_sku,
+       partConfirmed ? line.qty : null, line.lineTotal, line.supplier_sku,
        line.variantId, line.variantLabel]
     );
+    if (partConfirmed) await client.query(`UPDATE order_items SET availability = 'full' WHERE id = $1`, [item.id]);
 
     await recalcOrderTotals(client, order.id);
 
