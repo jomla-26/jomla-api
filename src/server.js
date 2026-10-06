@@ -87,7 +87,7 @@ app.use("/api/system", systemRouter);
 
 app.use((_req, res) => res.status(404).json({ error: "المسار غير موجود" }));
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   // أخطاء قاعدة البيانات "المترجمة" لرسالة عامة: نسجّل السبب الحقيقي في اللوغ عشان نقدر نشخّصها
   if (["22P02", "22007", "22003", "23514", "23503", "23505"].includes(err?.code)) {
     console.error(`[DB-ERROR] ${_req.method} ${_req.path} code=${err.code} table=${err.table || "-"} column=${err.column || "-"} constraint=${err.constraint || "-"} msg=${err.message} detail=${err.detail || "-"}`);
