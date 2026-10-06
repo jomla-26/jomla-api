@@ -1987,7 +1987,9 @@ orderRouter.post("/:id/reassign-driver", requirePermission("orders.reassign_driv
     if (Number(order.cod_collected || 0) > 0) {
       throw new ApiError(409, "المندوب الحالي استلم مبلغ من العميل — سوّي الحساب معاه أولًا");
     }
-    const note = "سحب من مندوب وإعادة إسناد لمندوب آخر" + (reason ? " — السبب: " + reason : "");
+    const { rows: names } = await client.query(`SELECT id, name FROM employees WHERE id = ANY($1::uuid[])`, [[order.driver_id, driverId]]);
+    const nm = (id) => names.find((r) => r.id === id)?.name || "—";
+    const note = `سحب من المندوب ${nm(order.driver_id)} وإسناد للمندوب ${nm(driverId)}` + (reason ? " — السبب: " + reason : "");
     return assignDriverTx(client, order, driverId, req.actor, { ip: req.ip, note });
   });
 
