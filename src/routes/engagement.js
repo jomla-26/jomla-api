@@ -156,6 +156,9 @@ engagementRouter.post("/orders/:orderId/driver-complaints", asyncRoute(async (re
   if (body.kind === "other" && (!body.note || body.note.length < 3)) {
     throw new ApiError(400, "اكتب تفاصيل الشكوى");
   }
+  if (body.kind === "customer_refused" && !body.note) {
+    throw new ApiError(400, "اختر سبب رفض العميل للاستلام");
+  }
 
   const { rows: [order] } = await query(
     `SELECT id, order_number, driver_id FROM orders WHERE id = $1`, [req.params.orderId]
