@@ -8,7 +8,7 @@ import {
 import {
   authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
 } from "../middleware/auth.js";
-import { queueNotification, notifyStaffWithPermission } from "../lib/notify.js";
+import { queueNotification, notifyStaffWithPermission, createInAppNotification } from "../lib/notify.js";
 import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 
 export const orderRouter = Router();
@@ -1453,6 +1453,19 @@ async function assignDriverTx(client, order, driverId, actor, { note, ip, audit 
     recipientId: order.customer_id, orderId: order.id,
     vars: { order_number: order.order_number },
   });
+  // إشعار داخل التطبيق للمندوب (بدون واتساب): طلبية جديدة مسندة له، وللمندوب السابق لو سُحبت منه
+  await createInAppNotification(client, {
+    recipientType: "employee", recipientId: driverId, orderId: order.id,
+    title: "طلبية جديدة مسندة إليك",
+    body: `تم إسناد الطلبية ${order.order_number} إليك — افتح تطبيقك واضغط «بدء التوصيل» لما تطلع بها.`,
+  });
+  if (order.driver_id && order.driver_id !== driverId) {
+    await createInAppNotification(client, {
+      recipientType: "employee", recipientId: order.driver_id, orderId: order.id,
+      title: "سُحبت منك طلبية",
+      body: `تم سحب الطلبية ${order.order_number} منك وإسنادها لمندوب آخر.`,
+    });
+  }
   return updated;
 }
 
