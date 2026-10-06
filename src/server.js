@@ -121,7 +121,9 @@ app.use((err, _req, res, _next) => {
 
   console.error("[ERROR]", err);
   logServerError({ req, err, status: 500 });
-  res.status(500).json({ error: "حدث خطأ غير متوقع، يرجى المحاولة لاحقًا" });
+  // في وضع التجربة فقط (TEST_SKIP_OTP=1) نرجّع سبب الخطأ التقني لتسهيل الفحص — يختفي تلقائيًا بحذف متغيرات التجربة قبل الإطلاق
+  const detail = process.env.TEST_SKIP_OTP === "1" ? { detail: String(err?.message || err).slice(0, 300) } : {};
+  res.status(500).json({ error: "حدث خطأ غير متوقع، يرجى المحاولة لاحقًا", ...detail });
 });
 
 const PORT = process.env.PORT || 3000;
