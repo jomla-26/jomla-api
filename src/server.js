@@ -117,6 +117,13 @@ app.use((err, _req, res, _next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// المدير العام يملك كل الصلاحيات دائمًا، حتى الجديدة اللي تنضاف لاحقًا
+pool.query(
+  `INSERT INTO role_permissions (role_id, permission_id)
+   SELECT r.id, p.id FROM roles r CROSS JOIN permissions p WHERE r.code = 'general_manager'
+   ON CONFLICT DO NOTHING`
+).catch((e) => console.error("[startup] general_manager permission sync failed:", e.message));
+
 const server = app.listen(PORT, () => {
   console.log(`منظومة جملة — الواجهة البرمجية تعمل على المنفذ ${PORT}`);
 });
