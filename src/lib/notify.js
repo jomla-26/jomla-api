@@ -5,7 +5,7 @@ function render(template, vars = {}) {
 }
 
 export async function queueNotification(client, {
-  templateCode, recipientType, recipientId, orderId = null, sectionId = null, vars = {},
+  templateCode, recipientType, recipientId, orderId = null, sectionId = null, vars = {}, whatsapp = true,
 }) {
   const { rows } = await client.query(
     `SELECT title, body_template, send_whatsapp FROM notification_templates WHERE code = $1`,
@@ -21,7 +21,7 @@ export async function queueNotification(client, {
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
     [templateCode, recipientType, recipientId, tpl.title,
      render(tpl.body_template, vars), orderId, sectionId,
-     tpl.send_whatsapp ? "queued" : null]
+     tpl.send_whatsapp && whatsapp ? "queued" : null]
   );
 }
 

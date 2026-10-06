@@ -3,12 +3,12 @@ import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import {
   restoreOrderStock, adjustStock, stockReasons, round2, round3,
-  ApiError, asyncRoute, nextDocNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode,
+  ApiError, asyncRoute, nextDocNumber, nextOrderNumber, resolvePrice, calcDeliveryFee, resolveTreasuryCode,
 } from "../lib/helpers.js";
 import {
   authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection, getEmployeeSectionScope,
 } from "../middleware/auth.js";
-import { queueNotification, notifyStaffWithPermission, createInAppNotification } from "../lib/notify.js";
+import { queueNotification, notifyStaffWithPermission, notifyStaffInApp, createInAppNotification } from "../lib/notify.js";
 import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 
 export const orderRouter = Router();
@@ -533,9 +533,7 @@ async function createOrderCore(client, { customerId, body, actor, byAdmin, ip })
   // 5) الآجل: مفعّل للعميل وضمن السقف (نفس منطق الاعتماد)
   if (body.paymentMethod === "deferred") await assertCreditAllowed(client, customerId, grandTotal);
 
-  const orderNumber = await nextDocNumber(client, {
-    table: "orders", column: "order_number", prefix: "JOMLA", start: 3000,
-  });
+  const orderNumber = await nextOrderNumber(client);
 
   const { rows: [created] } = await client.query(
     `INSERT INTO orders
@@ -1006,7 +1004,7 @@ async function approveInTx(client, order, actor, { depositDueAtDelivery, deferre
   await queueNotification(client, {
     templateCode: "order.status", recipientType: "customer",
     recipientId: order.customer_id, orderId: order.id,
-    vars: { order_number: order.order_number, status: "مرسلة إلى المورد" },
+    vars: { order_number: order.order_number, status: "مرسلة إلى المورد" }, whatsapp: false,
   });
   const { rows: suppliers } = await client.query(
     `SELECT DISTINCT supplier_id FROM order_suppliers WHERE order_id = $1 AND status <> 'cancelled'`, [order.id]
@@ -1415,7 +1413,7 @@ async function assertActiveDriver(client, driverId) {
   if (!rows.length) throw new ApiError(400, "المندوب المختار غير موجود أو غير نشط");
 }
 
-const ASSIGNABLE_STATUSES = ["sent_to_supplier", "supplier_preparing", "shortage", "ready", "ready_for_delivery", "assigned_to_driver"];
+const ASSIGNABLE_STATUSES = ["sent_to_supplier", "supplier_preparing", "shortage", "ready_for_delivery", "assigned_to_driver"];
 
 // يرجع نص سبب الرفض أو null لو الطلبية قابلة للإسناد لمندوب
 async function checkAssignable(client, order) {
@@ -1885,26 +1883,23 @@ async function settleOrderShortageStatus(client, orderId, actor) {
 
 const qtyText = (n, unit) => `${Number(n)}${unit ? " " + unit : ""}`;
 
-orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), asyncRoute(async (req, res) => {
-  const body = z.object({
-    resolution: z.enum(["reduce_qty", "cancel_item", "accept_substitute", "wait"]),
-    substituteProductId: z.string().uuid().optional(),
-    substituteVariantId: z.string().uuid().optional(),
-    customerApproved: z.boolean(),
-  }).parse(req.body);
+const resolveBodySchema = z.object({
+  resolution: z.enum(["reduce_qty", "cancel_item", "accept_substitute", "wait"]),
+  substituteProductId: z.string().uuid().optional(),
+  substituteVariantId: z.string().uuid().optional(),
+  customerApproved: z.boolean(),
+});
 
-  if (!body.customerApproved) throw new ApiError(400, "يلزم تأكيد موافقة الزبون أولًا");
-  if (body.resolution === "accept_substitute" && !body.substituteProductId) {
-    throw new ApiError(400, "اختر الصنف البديل أولًا");
-  }
-
+/* نواة حل النقص — تُستعمل من الموظف (بموافقة شفهية) ومن العميل نفسه (من تطبيقه) */
+async function resolveShortageCore({ shortageId, body, actor, ip, byCustomer = false }) {
+  const actorId = byCustomer ? null : actor.id; // أعمدة "resolved_by" / حركة المخزون مرتبطة بالموظفين فقط
   // نعرف الطلبية أولًا لنطبّق نطاق الأقسام ونقفلها قبل سجل النقص (ترتيب موحّد للأقفال)
   const { rows: [pre] } = await query(
     `SELECT oi.order_id FROM order_shortages sh JOIN order_items oi ON oi.id = sh.order_item_id WHERE sh.id = $1`,
-    [req.params.id]
+    [shortageId]
   );
   if (!pre) throw new ApiError(404, "سجل النقص غير موجود");
-  if (!(await orderInEmployeeScope(req.actor.id, pre.order_id))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
+  if (!byCustomer && !(await orderInEmployeeScope(actor.id, pre.order_id))) throw new ApiError(403, OUT_OF_SCOPE_MSG);
 
   const result = await withTransaction(async (client) => {
     const { rows: [order] } = await client.query(`SELECT * FROM orders WHERE id = $1 FOR UPDATE`, [pre.order_id]);
@@ -1915,7 +1910,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       `SELECT sh.*, oi.order_id, oi.order_supplier_id FROM order_shortages sh
          JOIN order_items oi ON oi.id = sh.order_item_id
         WHERE sh.id = $1 FOR UPDATE OF sh`,
-      [req.params.id]
+      [shortageId]
     );
     if (!rows.length) throw new ApiError(404, "سجل النقص غير موجود");
     const shortage = rows[0];
@@ -1935,14 +1930,14 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
         if (!still.length) partId = null;
       }
       return recordStatus(client, {
-      orderId: order.id, orderSupplierId: partId, from: order.status, to: order.status, actor: req.actor,
-      note: `حل نقص «${item.product_name}» — ${text} (بموافقة العميل)`,
+      orderId: order.id, orderSupplierId: partId, from: order.status, to: order.status, actor: actor,
+      note: `حل نقص «${item.product_name}» — ${text} (${byCustomer ? "وافق العميل من تطبيقه" : "بموافقة العميل"})`,
       });
     };
     const audit = (after) => writeAudit(client, {
-      actorType: "employee", actorId: req.actor.id, actorName: req.actor.name,
+      actorType: byCustomer ? "customer" : "employee", actorId: actor.id, actorName: actor.name,
       action: auditAction, entityType: "order_shortage", entityId: shortage.id,
-      entityLabel: `${order.order_number} — ${item.product_name}`, before: shortage, after, ip: req.ip,
+      entityLabel: `${order.order_number} — ${item.product_name}`, before: shortage, after, ip: ip,
     });
 
     /* ---------- إلغاء الصنف: يشيله من الفاتورة فورًا ويرجّع كميته المؤكدة للمخزون ---------- */
@@ -1950,7 +1945,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       if (confirmed > 0) {
         await adjustStock(client, {
           productId: item.product_id, variantId: item.variant_id, delta: confirmed,
-          reason: stockReasons(order.order_number).editBack, actorId: req.actor.id,
+          reason: stockReasons(order.order_number).editBack, actorId: actorId,
         });
       }
       await client.query(`DELETE FROM order_shortages WHERE order_item_id = $1`, [item.id]);
@@ -1965,7 +1960,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
           supplierIds, order, templateCode: "order.part_items_changed",
           change: `أُلغي الصنف ${item.product_name} بسبب النقص`,
         });
-        await settleOrderShortageStatus(client, order.id, req.actor);
+        await settleOrderShortageStatus(client, order.id, actor);
       } else {
         const allSuppliers = await activeSupplierIds(client, order.id);
         await notifySuppliers(client, {
@@ -1978,10 +1973,10 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
           `UPDATE order_suppliers SET status = 'cancelled' WHERE order_id = $1 AND status NOT IN ('picked_up','closed','cancelled')`, [order.id]
         );
         await recordStatus(client, {
-          orderId: order.id, from: order.status, to: "cancelled", actor: req.actor,
+          orderId: order.id, from: order.status, to: "cancelled", actor: actor,
           note: "تم إلغاء كل أصناف الطلبية بسبب النقص",
         });
-        await restoreOrderStock(client, order.id, req.actor.id);
+        await restoreOrderStock(client, order.id, actorId);
       }
       await audit(null);
       return { orderId: order.id, resolution: "cancel_item", itemRemoved: true, orderCancelled: left.n === 0 };
@@ -1998,7 +1993,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       const { rows: [updated] } = await client.query(
         `UPDATE order_shortages SET resolution = 'reduce_qty', customer_approved = TRUE, admin_approved = TRUE,
                 resolved_by = $2, resolved_at = now() WHERE id = $1 RETURNING *`,
-        [shortage.id, req.actor.id]
+        [shortage.id, actorId]
       );
       await recalcOrderTotals(client, order.id);
       await settlePartShortageStatus(client, shortage.order_supplier_id);
@@ -2007,7 +2002,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
         supplierIds, order, templateCode: "order.part_items_changed",
         change: `تم تقليل كمية ${item.product_name} من ${Number(item.qty_requested)} إلى ${confirmed} (حسب المتوفر عندك)`,
       });
-      await settleOrderShortageStatus(client, order.id, req.actor);
+      await settleOrderShortageStatus(client, order.id, actor);
       await audit(updated);
       return updated;
     }
@@ -2021,20 +2016,42 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       const [line] = await prepareLines(client, order.customer_id, [
         { productId: body.substituteProductId, qty: missing, variantId: body.substituteVariantId },
       ]);
-      if (line.supplier_id !== part.supplier_id) {
-        throw new ApiError(400, "البديل لازم يكون من نفس المورد — اختر صنفًا من أصناف هذا المورد");
+      const sameSupplier = line.supplier_id === part.supplier_id;
+      let targetPartId = part.id;
+      let newSupplierNotified = false;
+      if (!sameSupplier) {
+        // بديل من مورد آخر: ينضاف لجزء ذاك المورد (ينشأ جزء جديد لو ما عنده)، وهو يؤكد توفره بنفسه
+        const { rows: [other] } = await client.query(
+          `SELECT * FROM order_suppliers WHERE order_id = $1 AND supplier_id = $2 AND status <> 'cancelled' FOR UPDATE`,
+          [order.id, line.supplier_id]
+        );
+        if (other && !["pending", "sent"].includes(other.status)) {
+          throw new ApiError(409, "هذا المورد رد على جزئه من الطلبية بالفعل — اختر بديلًا من مورد آخر أو من نفس المورد");
+        }
+        if (other) targetPartId = other.id;
+        else {
+          const { rows: [rate] } = await client.query(`SELECT commission_rate_percent FROM suppliers WHERE id = $1`, [line.supplier_id]);
+          const { rows: [np] } = await client.query(
+            `INSERT INTO order_suppliers (order_id, supplier_id, subtotal, commission_rate, status)
+             VALUES ($1,$2,0,$3,'sent') RETURNING id`,
+            [order.id, line.supplier_id, rate?.commission_rate_percent ?? 0]
+          );
+          targetPartId = np.id;
+        }
+        newSupplierNotified = true;
+      } else {
+        await adjustStock(client, {
+          productId: line.productId, variantId: line.variantId, delta: -line.qty,
+          reason: stockReasons(order.order_number).sale, actorId,
+        });
       }
-      await adjustStock(client, {
-        productId: line.productId, variantId: line.variantId, delta: -line.qty,
-        reason: stockReasons(order.order_number).sale, actorId: req.actor.id,
-      });
       const { rows: [subItem] } = await client.query(
         `INSERT INTO order_items
            (order_id, order_supplier_id, product_id, product_name, unit, unit_price, purchase_cost,
             qty_requested, qty_confirmed, availability, line_total, supplier_sku, variant_id, variant_label)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'full',$9,$10,$11,$12) RETURNING *`,
-        [order.id, part.id, line.productId, line.name, line.unit, line.price, line.purchase_cost,
-         line.qty, line.lineTotal, line.supplier_sku, line.variantId, line.variantLabel]
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+        [order.id, targetPartId, line.productId, line.name, line.unit, line.price, line.purchase_cost,
+         line.qty, sameSupplier ? line.qty : null, sameSupplier ? "full" : null, line.lineTotal, line.supplier_sku, line.variantId, line.variantLabel]
       );
       let updated = null;
       if (confirmed > 0) {
@@ -2044,7 +2061,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
           `UPDATE order_shortages SET resolution = 'accept_substitute', substitute_product_id = $2,
                   customer_approved = TRUE, admin_approved = TRUE, resolved_by = $3, resolved_at = now()
             WHERE id = $1 RETURNING *`,
-          [shortage.id, line.productId, req.actor.id]
+          [shortage.id, line.productId, actorId]
         ));
       } else {
         // الصنف الأصلي صفر: ما يبقى له معنى بالفاتورة — يُستبدل بالبديل بالكامل
@@ -2054,11 +2071,21 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       await recalcOrderTotals(client, order.id);
       await settlePartShortageStatus(client, shortage.order_supplier_id);
       await histNote(`قبول بديل: ${line.name} × ${qtyText(line.qty, line.unit)} بسعر ${Number(line.price)} للوحدة`);
-      await notifySuppliers(client, {
-        supplierIds, order, templateCode: "order.part_items_changed",
-        change: `أُضيف الصنف البديل ${line.name} بكمية ${qtyText(line.qty, line.unit)} بدل الناقص من ${item.product_name} — جهّزه مع الطلبية`,
-      });
-      await settleOrderShortageStatus(client, order.id, req.actor);
+      if (newSupplierNotified) {
+        await notifySuppliers(client, {
+          supplierIds: [line.supplier_id], order, templateCode: "order.new_for_supplier",
+        });
+        await notifySuppliers(client, {
+          supplierIds, order, templateCode: "order.part_items_changed",
+          change: `تم استبدال الناقص من ${item.product_name} بصنف من مورد آخر — ما عليك شي`,
+        });
+      } else {
+        await notifySuppliers(client, {
+          supplierIds, order, templateCode: "order.part_items_changed",
+          change: `أُضيف الصنف البديل ${line.name} بكمية ${qtyText(line.qty, line.unit)} بدل الناقص من ${item.product_name} — جهّزه مع الطلبية`,
+        });
+      }
+      await settleOrderShortageStatus(client, order.id, actor);
       await audit(subItem);
       return { ...(updated ?? {}), substituteItem: subItem, orderId: order.id };
     }
@@ -2069,7 +2096,7 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
       `UPDATE order_shortages SET resolution = 'wait', substitute_product_id = NULL,
               customer_approved = TRUE, admin_approved = TRUE, resolved_by = $2
         WHERE id = $1 RETURNING *`,
-      [shortage.id, req.actor.id]
+      [shortage.id, actorId]
     );
     await histNote(`الانتظار لين يتوفر الصنف (الناقص ${qtyText(missing, item.unit)})`);
     await notifySuppliers(client, {
@@ -2079,8 +2106,110 @@ orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), a
     await audit(updated);
     return updated;
   });
+  return result;
+}
 
+orderRouter.post("/shortages/:id/resolve", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = resolveBodySchema.parse(req.body);
+  if (!body.customerApproved) throw new ApiError(400, "يلزم تأكيد موافقة الزبون أولًا");
+  if (body.resolution === "accept_substitute" && !body.substituteProductId) {
+    throw new ApiError(400, "اختر الصنف البديل أولًا");
+  }
+  const result = await resolveShortageCore({ shortageId: req.params.id, body, actor: req.actor, ip: req.ip });
   res.json(result);
+}));
+
+// الإدارة تقترح حلًا للنقص ← العميل يوافق أو يرفض من تطبيقه
+const proposeBodySchema = z.object({
+  resolution: z.enum(["reduce_qty", "cancel_item", "accept_substitute", "wait"]),
+  substituteProductId: z.string().uuid().optional().nullable(),
+  substituteVariantId: z.string().uuid().optional().nullable(),
+});
+const RES_TEXT = {
+  reduce_qty: "إكمال الطلبية بالكمية المتوفرة فقط",
+  cancel_item: "إلغاء الصنف من الطلبية",
+  accept_substitute: "استبداله بصنف بديل",
+  wait: "الانتظار لين يتوفر الصنف",
+};
+
+orderRouter.post("/shortages/:id/propose", requirePermission("orders.review"), asyncRoute(async (req, res) => {
+  const body = proposeBodySchema.parse(req.body);
+  if (body.resolution === "accept_substitute" && !body.substituteProductId) throw new ApiError(400, "اختر الصنف البديل أولًا");
+  const out = await withTransaction(async (client) => {
+    const { rows: [sh] } = await client.query(
+      `SELECT sh.*, oi.product_name, oi.order_id FROM order_shortages sh
+         JOIN order_items oi ON oi.id = sh.order_item_id WHERE sh.id = $1 FOR UPDATE OF sh`, [req.params.id]);
+    if (!sh) throw new ApiError(404, "النقص غير موجود");
+    if (sh.resolved_at) throw new ApiError(409, "هذا النقص اتحل بالفعل");
+    const { rows: [order] } = await client.query(`SELECT id, order_number, customer_id FROM orders WHERE id = $1`, [sh.order_id]);
+    let subName = "";
+    if (body.resolution === "accept_substitute") {
+      const { rows: [p] } = await client.query(`SELECT name FROM products WHERE id = $1`, [body.substituteProductId]);
+      if (!p) throw new ApiError(400, "الصنف البديل غير موجود");
+      subName = p.name;
+    }
+    await client.query(
+      `UPDATE order_shortages SET proposed_resolution = $2, proposed_substitute_product_id = $3,
+              proposed_substitute_variant_id = $4, proposed_by = $5, proposed_at = now(),
+              customer_response = NULL, customer_responded_at = NULL WHERE id = $1`,
+      [sh.id, body.resolution, body.substituteProductId ?? null, body.substituteVariantId ?? null, req.actor.id]
+    );
+    await createInAppNotification(client, {
+      recipientType: "customer", recipientId: order.customer_id, orderId: order.id,
+      title: `طلبيتك ${order.order_number}: ننتظر موافقتك`,
+      body: `الصنف "${sh.product_name}" ما توفرش بالكامل. الاقتراح: ${RES_TEXT[body.resolution]}${subName ? ` (${subName})` : ""}. افتح الطلبية ووافق أو ارفض.`,
+    });
+    return { ok: true, shortageId: sh.id };
+  });
+  res.json(out);
+}));
+
+orderRouter.get("/:id/shortage-proposals", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `SELECT sh.id, sh.proposed_resolution, sh.proposed_at, sh.customer_response,
+            oi.product_name, oi.unit, oi.qty_requested, oi.qty_confirmed,
+            (SELECT name FROM products WHERE id = sh.proposed_substitute_product_id) AS substitute_name
+       FROM order_shortages sh
+       JOIN order_items oi ON oi.id = sh.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+      WHERE o.id = $1 AND o.customer_id = $2 AND sh.resolved_at IS NULL AND sh.proposed_resolution IS NOT NULL
+      ORDER BY sh.proposed_at`,
+    [req.params.id, req.actor.id]
+  );
+  res.json(rows.map((r) => ({ ...r, proposed_text: RES_TEXT[r.proposed_resolution] })));
+}));
+
+orderRouter.post("/shortages/:id/respond", requireActorType("customer"), asyncRoute(async (req, res) => {
+  const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
+  const { rows: [sh] } = await query(
+    `SELECT sh.*, o.customer_id, o.order_number, o.id AS oid FROM order_shortages sh
+       JOIN order_items oi ON oi.id = sh.order_item_id JOIN orders o ON o.id = oi.order_id WHERE sh.id = $1`,
+    [req.params.id]
+  );
+  if (!sh || sh.customer_id !== req.actor.id) throw new ApiError(404, "النقص غير موجود");
+  if (sh.resolved_at) throw new ApiError(409, "هذا النقص اتحل بالفعل");
+  if (!sh.proposed_resolution) throw new ApiError(409, "ما فيش اقتراح من الإدارة بعد");
+  if (!accept) {
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE order_shortages SET customer_response = 'rejected', customer_responded_at = now(),
+                proposed_resolution = NULL WHERE id = $1`, [sh.id]);
+      await notifyStaffInApp(client, {
+        permissionCode: "orders.review", orderId: sh.oid,
+        title: `العميل رفض اقتراح النقص — ${sh.order_number}`,
+        body: "رفض العميل الحل المقترح. تواصل معه أو اقترح حلًا آخر.",
+      });
+    });
+    return res.json({ ok: true, accepted: false });
+  }
+  const body = resolveBodySchema.parse({
+    resolution: sh.proposed_resolution, customerApproved: true,
+    substituteProductId: sh.proposed_substitute_product_id ?? undefined,
+    substituteVariantId: sh.proposed_substitute_variant_id ?? undefined,
+  });
+  const result = await resolveShortageCore({ shortageId: sh.id, body, actor: { id: null, type: "customer", name: "العميل" }, ip: req.ip, byCustomer: true });
+  await query(`UPDATE order_shortages SET customer_response = 'accepted', customer_responded_at = now() WHERE id = $1`, [sh.id]);
+  res.json({ ok: true, accepted: true, result });
 }));
 
 // الصنف اللي كان في وضع "الانتظار" توفّر (كله أو جزء منه): تأكيد الكمية الواصلة
@@ -2688,7 +2817,7 @@ orderRouter.post("/:id/items", requirePermission("orders.review"), requireOrderS
       );
       orderSupplierId = createdOs[0].id;
       // مورد جديد لسا ما أكّد: لو الطلبية كانت "جاهزة" نرجعها لمرحلة الإرسال للمورد عشان تنتظره
-      if (["ready", "ready_for_delivery", "ready_for_pickup"].includes(order.status)) {
+      if (["ready_for_delivery", "ready_for_pickup"].includes(order.status)) {
         await client.query(`UPDATE orders SET status = 'sent_to_supplier' WHERE id = $1`, [order.id]);
         await recordStatus(client, {
           orderId: order.id, from: order.status, to: "sent_to_supplier", actor: req.actor,

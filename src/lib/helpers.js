@@ -22,6 +22,20 @@ export async function nextDocNumber(client, { table, column, prefix, start = 100
   return `${prefix}-${Number(rows[0].last) + 1}`;
 }
 
+// رقم الطلبية من تسلسل قاعدة البيانات (بدون قفل يخلي الطلبات تنتظر بعضها). لو التسلسل غير موجود يرجع للطريقة القديمة.
+// ملاحظة: قد تظهر قفزات في الأرقام لو فشلت طلبية بعد أخذ رقمها — هذا طبيعي.
+export async function nextOrderNumber(client) {
+  try {
+    await client.query("SAVEPOINT order_seq");
+    const { rows } = await client.query(`SELECT nextval('order_number_seq') AS n`);
+    await client.query("RELEASE SAVEPOINT order_seq");
+    return `JOMLA-${rows[0].n}`;
+  } catch {
+    await client.query("ROLLBACK TO SAVEPOINT order_seq");
+    return nextDocNumber(client, { table: "orders", column: "order_number", prefix: "JOMLA", start: 3000 });
+  }
+}
+
 // رمز تحقق من 4 خانات — مولّد عشوائي آمن (crypto) بدل Math.random
 export function generateOtp() {
   return String(crypto.randomInt(0, 10000)).padStart(4, "0");

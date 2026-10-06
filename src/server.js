@@ -24,6 +24,7 @@ import { agentRouter } from "./routes/agent.js";
 import { cartRouter } from "./routes/carts.js";
 import { searchLogRouter } from "./routes/searchlog.js";
 import { runBootstrap } from "./lib/bootstrap.js";
+import { ensureSchema, logServerError, systemRouter } from "./lib/system.js";
 import { dispatchManagerVoucherAlerts, dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
@@ -82,6 +83,7 @@ app.use("/api/banners", bannerRouter);
 app.use("/api/agent", agentRouter);
 app.use("/api/carts", cartRouter);
 app.use("/api/search-log", searchLogRouter);
+app.use("/api/system", systemRouter);
 
 app.use((_req, res) => res.status(404).json({ error: "المسار غير موجود" }));
 
@@ -101,6 +103,7 @@ app.use((err, _req, res, _next) => {
   }
   if (/timeout exceeded when trying to connect|Connection terminated/i.test(String(err?.message || ""))) {
     console.error("[DB-BUSY]", req.method, req.path, err?.message);
+    logServerError({ req, err, status: 503 });
     return res.status(503).json({ error: "السيرفر مشغول حاليًا، أعد المحاولة بعد لحظات" });
   }
   if (err?.code === "23505") {
@@ -117,6 +120,7 @@ app.use((err, _req, res, _next) => {
   }
 
   console.error("[ERROR]", err);
+  logServerError({ req, err, status: 500 });
   res.status(500).json({ error: "حدث خطأ غير متوقع، يرجى المحاولة لاحقًا" });
 });
 
@@ -127,6 +131,8 @@ pool.query(
    SELECT r.id, p.id FROM roles r CROSS JOIN permissions p WHERE r.code = 'general_manager'
    ON CONFLICT DO NOTHING`
 ).catch((e) => console.error("[startup] general_manager permission sync failed:", e.message));
+
+ensureSchema().catch((e) => console.error("[schema]", e?.message || e));
 
 const server = app.listen(PORT, () => {
   console.log(`منظومة جملة — الواجهة البرمجية تعمل على المنفذ ${PORT}`);
@@ -165,8 +171,8 @@ const monthlyReportTimer = setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ما نخليش خطأ غير متوقع يوقّع السيرفر كله — نسجّله ونكمل
-process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
-process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
+process.on("unhandledRejection", (err) => { console.error("[unhandledRejection]", err); logServerError({ err, status: 500 }); });
+process.on("uncaughtException", (err) => { console.error("[uncaughtException]", err); logServerError({ err, status: 500 }); });
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
