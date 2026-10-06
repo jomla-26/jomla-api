@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit, resubmitForApproval } from "../lib/db.js";
 import { ApiError, asyncRoute, nextDocNumber } from "../lib/helpers.js";
+import { searchTokens, sqlNorm } from "../lib/searchTokens.js";
 import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 import { authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
 import { notifyFavoriteRestock, queueNotification } from "../lib/notify.js";
@@ -251,8 +252,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
 
     // السعر يُحسب بنفس منطق resolvePrice (كمية 1) لكن باستعلام واحد بدل استعلام لكل صنف:
     // أولوية لقاعدة العميل نفسه ثم الأعلى حدًّا أدنى للكمية، وإلا السعر الأساسي
-    const { rows } = await query(
-      `SELECT p.id, p.name, p.unit, p.image_url,
+    const sqlCustomer = `SELECT p.id, p.name, p.unit, p.image_url,
               CASE WHEN pv.variants IS NOT NULL THEN NULL
                    ELSE COALESCE(pr.price, p.base_price) END AS price,
               p.stock_qty,
@@ -298,10 +298,16 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
                    AND ss.enabled
               )
           AND ($2::UUID IS NULL OR p.supplier_id = $2)
-          AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%')
-        ORDER BY p.name`,
-      [sectionId, supplierId || null, search || null, req.actor.id]
-    );
+          AND ($3::TEXT[] IS NULL OR NOT EXISTS (
+                SELECT 1 FROM unnest($3::TEXT[]) AS tk(t)
+                 WHERE position(tk.t in ${sqlNorm("p.name")}) = 0))
+        ORDER BY p.name`;
+    const tokens = searchTokens(search);
+    let { rows } = await query(sqlCustomer, [sectionId, supplierId || null, tokens, req.actor.id]);
+    // لو ما فيه نتيجة: نجرّب بحث أوسع (أول 3 حروف من كل كلمة) لتغطية أخطاء الكتابة
+    if (!rows.length && tokens && tokens.some((t) => t.length >= 3)) {
+      ({ rows } = await query(sqlCustomer, [sectionId, supplierId || null, searchTokens(search, true), req.actor.id]));
+    }
     return res.json(rows);
   }
 
@@ -312,8 +318,7 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
   const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
   const ownerFilter = req.actor.type === "supplier" ? req.actor.id : supplierId || null;
-  const { rows } = await query(
-    `SELECT p.*, s.business_name AS supplier_name, sec.name AS section_name,
+  const sqlStaff = `SELECT p.*, s.business_name AS supplier_name, sec.name AS section_name,
             CASE WHEN p.availability = 'suspended' THEN 'suspended'
                  WHEN pv.total IS NULL THEN p.availability
                  WHEN pv.total <= 0 THEN 'out'
@@ -336,14 +341,17 @@ catalogRouter.get("/products", asyncRoute(async (req, res) => {
            ) pv ON true
       WHERE ($1::UUID IS NULL OR p.supplier_id = $1)
         AND ($2::UUID IS NULL OR p.section_id = $2 OR sec.parent_id = $2)
-        AND ($3::TEXT IS NULL OR p.name ILIKE '%' || $3 || '%'
-             OR p.supplier_sku ILIKE '%' || $3 || '%'
-             OR s.business_name ILIKE '%' || $3 || '%')
+        AND ($3::TEXT[] IS NULL OR NOT EXISTS (
+              SELECT 1 FROM unnest($3::TEXT[]) AS tk(t)
+               WHERE position(tk.t in ${sqlNorm("(p.name || ' ' || COALESCE(p.supplier_sku,'') || ' ' || s.business_name)")}) = 0))
         AND ($4::TEXT IS NULL OR p.approval_status = $4)
       ORDER BY p.name, p.id
-      LIMIT $5 OFFSET $6`,
-    [ownerFilter, sectionId || null, search || null, approvalStatus || null, limit, offset]
-  );
+      LIMIT $5 OFFSET $6`;
+  const staffTokens = searchTokens(search);
+  let { rows } = await query(sqlStaff, [ownerFilter, sectionId || null, staffTokens, approvalStatus || null, limit, offset]);
+  if (!rows.length && staffTokens && staffTokens.some((t) => t.length >= 3)) {
+    ({ rows } = await query(sqlStaff, [ownerFilter, sectionId || null, searchTokens(search, true), approvalStatus || null, limit, offset]));
+  }
 
   // سعر التكلفة للموظف يظهر فقط لمن عنده صلاحية pricing.cost (المورد يشوف تكلفة أصنافه هو)
   if (req.actor.type === "employee" && !(await hasPermission(req, "pricing.cost"))) {
