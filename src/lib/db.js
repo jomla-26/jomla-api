@@ -6,7 +6,9 @@ export const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   max: Number(process.env.DB_POOL_MAX) || 10,
   idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 5_000,
+  // وقت الانتظار في الطابور للحصول على اتصال: 5 ثواني كانت تسبب أخطاء 500 لما يطلب عدة عملاء بنفس اللحظة
+  // (الطلبات تتسلسل على رقم الفاتورة). 30 ثانية = الطلب ينتظر دوره بدل ما يفشل.
+  connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS) || 30_000,
 });
 
 // بدون هذا المستمع، أي خطأ على اتصال خامل (قطع مفاجئ من قاعدة البيانات) يوقف السيرفر كله

@@ -99,6 +99,10 @@ app.use((err, _req, res, _next) => {
   if (err instanceof ApiError) {
     return res.status(err.status).json({ error: err.message, code: err.code });
   }
+  if (/timeout exceeded when trying to connect|Connection terminated/i.test(String(err?.message || ""))) {
+    console.error("[DB-BUSY]", req.method, req.path, err?.message);
+    return res.status(503).json({ error: "السيرفر مشغول حاليًا، أعد المحاولة بعد لحظات" });
+  }
   if (err?.code === "23505") {
     return res.status(409).json({ error: "هذا السجل موجود مسبقًا" });
   }
