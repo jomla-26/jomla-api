@@ -156,7 +156,7 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     console.log(`[AUTH] رقم تجربة (${normalized}): كود ثابت، بدون إرسال واتساب`);
   } else if (smsConfigured()) {
     // رسالة نصية (SMS) هي الطريقة الأساسية لو مضبوطة؛ لو فشلت وواتساب مضبوط نجرب واتساب كاحتياط
-    const msg = `رمز التحقق الخاص بك في جملة: ${otp}\nصالح لمدة 5 دقائق. لا تشاركه مع أي شخص.`;
+    const msg = `رمز جملة: ${otp} (صالح 5 دقائق)`; // قصير عشان يكون جزء واحد (70 حرف عربي) = أرخص
     sendSms(normalized, msg).catch((err) => {
       console.error("[SMS] فشل الإرسال:", err.message);
       if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
