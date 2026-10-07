@@ -5,8 +5,9 @@ import { ApiError } from "../lib/helpers.js";
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("JWT_SECRET غير معرّف في متغيرات البيئة");
 
-export function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "12h" });
+// long = جلسة مفتوحة (المدير العام وشريكه): ما تنتهي إلا بتسجيل الخروج أو "خروج من كل الأجهزة"
+export function signToken(payload, { long = false } = {}) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: long ? "3650d" : "12h" });
 }
 
 /* ---------------------------------------------------------------------------
@@ -30,20 +31,20 @@ export function invalidateAuthCache(actorType, id) {
 async function loadActorState(type, id) {
   if (type === "employee") {
     const { rows } = await query(
-      `SELECT e.name, e.is_active, r.code AS role
+      `SELECT e.name, e.is_active, e.token_version, r.code AS role
          FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1`,
       [id]
     );
     if (!rows.length) return { ok: false, status: 401, message: MSG_GONE };
     if (!rows[0].is_active) return { ok: false, status: 403, message: MSG_SUSPENDED, code: "ACCOUNT_BLOCKED" };
-    return { ok: true, name: rows[0].name, role: rows[0].role };
+    return { ok: true, name: rows[0].name, role: rows[0].role, tv: rows[0].token_version };
   }
   if (type === "customer" || type === "supplier") {
     const table = type === "customer" ? "customers" : "suppliers";
-    const { rows } = await query(`SELECT business_name AS name, status FROM ${table} WHERE id = $1`, [id]);
+    const { rows } = await query(`SELECT business_name AS name, status, token_version FROM ${table} WHERE id = $1`, [id]);
     if (!rows.length) return { ok: false, status: 401, message: MSG_GONE };
     const st = rows[0].status;
-    if (st === "approved") return { ok: true, name: rows[0].name, role: null };
+    if (st === "approved") return { ok: true, name: rows[0].name, role: null, tv: rows[0].token_version };
     if (st === "pending") return { ok: false, status: 403, message: MSG_PENDING, code: "ACCOUNT_BLOCKED" };
     if (st === "deleted") return { ok: false, status: 401, message: MSG_GONE };
     return { ok: false, status: 403, message: MSG_SUSPENDED, code: "ACCOUNT_BLOCKED" }; // suspended / rejected
@@ -76,6 +77,8 @@ export async function authenticate(req, _res, next) {
     }
     const st = hit.state;
     if (!st.ok) return next(new ApiError(st.status, st.message, st.code ?? null));
+    // "خروج من كل الأجهزة" يرفع token_version فتبطل التوكنات القديمة
+    if ((decoded.v ?? 0) !== (st.tv ?? 0)) return next(new ApiError(401, "الجلسة منتهية، يرجى تسجيل الدخول من جديد"));
 
     req.actor = {
       type: decoded.type,

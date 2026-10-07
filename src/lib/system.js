@@ -11,6 +11,32 @@ import { notifyStaffInApp } from "./notify.js";
 const STEPS = [
   // سجل ترحيلات "مرة واحدة"
   `CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  // دخول بكلمة المرور: أعمدة على الجداول الثلاثة (كلمة مشفّرة، عدّاد محاولات، قفل مؤقت، رمز دخول مؤقت، رمز استرجاع، نسخة جلسة)
+  ...["customers", "suppliers", "employees"].flatMap((t) => [
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS password_hash TEXT`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS password_set_at TIMESTAMPTZ`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS failed_logins INT NOT NULL DEFAULT 0`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS temp_code_hash TEXT`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS temp_code_expires_at TIMESTAMPTZ`,
+    `ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 0`,
+  ]),
+  `ALTER TABLE employees ADD COLUMN IF NOT EXISTS recovery_hash TEXT`,
+  `ALTER TABLE employees ADD COLUMN IF NOT EXISTS long_session BOOLEAN NOT NULL DEFAULT FALSE`,
+  // طلبات "نسيت كلمة المرور" (مراجعة الإدارة)
+  `CREATE TABLE IF NOT EXISTS access_requests (
+     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     account_type TEXT NOT NULL,
+     account_id   UUID,
+     phone        TEXT NOT NULL,
+     account_name TEXT,
+     reason       TEXT,
+     status       TEXT NOT NULL DEFAULT 'open',
+     handled_by   UUID,
+     handled_at   TIMESTAMPTZ,
+     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS access_requests_status_idx ON access_requests (status, created_at DESC)`,
   // إشعارات داخل التطبيق بدون قالب
   `ALTER TABLE notifications ALTER COLUMN template_code DROP NOT NULL`,
   // سجل أخطاء السيرفر
@@ -97,6 +123,18 @@ export async function ensureSchema() {
     }
     await pool.query(`UPDATE permissions SET description = 'إدارة الأصناف والمخزون' WHERE code = 'catalog.manage'`);
   } catch (e) { console.error("[schema-perm2]", e.message); }
+  // صلاحية إصدار رموز الدخول المؤقتة (لمن نسي كلمة المرور): المدير العام فقط افتراضيًا (يتزامن تحت)، وتنعطى لغيره من شاشة الصلاحيات
+  try {
+    await pool.query(`INSERT INTO permissions (code, description) VALUES ('accounts.issue_code','إصدار رمز دخول مؤقت لحساب نسي كلمة مروره') ON CONFLICT (code) DO NOTHING`);
+  } catch (e) { console.error("[schema-perm3]", e.message); }
+  // جلسة مفتوحة (بدون انتهاء 12 ساعة) للمدير العام وشريكه
+  try {
+    await pool.query(
+      `UPDATE employees SET long_session = TRUE
+        WHERE NOT long_session AND (phone IN ('0913363363','0910911991')
+           OR role_id IN (SELECT id FROM roles WHERE code = 'general_manager' OR name IN ('المدير العام','مدير عام')))`
+    );
+  } catch (e) { console.error("[schema-long-session]", e.message); }
   // المدير العام يملك كل الصلاحيات دائمًا، حتى الجديدة اللي تنضاف لاحقًا (تتزامن عند كل تشغيل)
   try {
     await pool.query(

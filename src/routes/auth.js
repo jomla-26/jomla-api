@@ -5,7 +5,8 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
-import { signToken, authenticate } from "../middleware/auth.js";
+import { signToken, authenticate, requirePermission, invalidateAuthCache } from "../middleware/auth.js";
+import { notifyStaffInApp } from "../lib/notify.js";
 
 export const authRouter = Router();
 
@@ -190,6 +191,24 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
   res.json({ sent: true, message: "تم إرسال رمز التحقق" });
 }));
 
+// يُنشئ جلسة (توكن) لحساب تم التحقق منه. المدير العام وشريكه (long_session) جلستهم مفتوحة بدون انتهاء 12 ساعة.
+async function issueSession(accountType, user) {
+  const cfg = TABLES[accountType];
+  let role = null;
+  let long = false;
+  if (accountType === "employee") {
+    const r = await query(
+      `SELECT r.code, e.long_session FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1`,
+      [user.id]
+    );
+    role = r.rows[0]?.code || null;
+    long = Boolean(r.rows[0]?.long_session);
+  }
+  const { rows: tv } = await query(`SELECT token_version FROM ${cfg.table} WHERE id = $1`, [user.id]);
+  const token = signToken({ sub: user.id, type: accountType, name: user.name, role, v: tv[0]?.token_version ?? 0 }, { long });
+  return { token, actor: { id: user.id, type: accountType, name: user.name, role } };
+}
+
 const verifySchema = requestSchema.extend({ otp: z.string().length(4) });
 
 authRouter.post("/otp/verify", ...otpVerifyLimiters, asyncRoute(async (req, res) => {
@@ -267,21 +286,16 @@ authRouter.post("/otp/verify", ...otpVerifyLimiters, asyncRoute(async (req, res)
   });
   if (!consumed) throw new ApiError(401, INVALID);
 
-  let role = null;
-  if (accountType === "employee") {
-    const r = await query(
-      `SELECT r.code FROM employees e JOIN roles r ON r.id = e.role_id WHERE e.id = $1`,
-      [user.id]
-    );
-    role = r.rows[0]?.code || null;
-  }
-
-  const token = signToken({ sub: user.id, type: accountType, name: user.name, role });
-  res.json({ token, actor: { id: user.id, type: accountType, name: user.name, role } });
+  res.json(await issueSession(accountType, user));
 }));
 
-authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
+authRouter.get("/me", authenticate, asyncRoute(async (req, res0) => {
   if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
+  // هل لازم يحط كلمة مرور؟ (أول دخول بالرمز، أو بعد رمز دخول مؤقت من الإدارة). أرقام التجربة (وضع التجربة المؤقت) معفاة.
+  const pr = await query(`SELECT phone, password_set_at FROM ${TABLES[req.actor.type].table} WHERE id = $1`, [req.actor.id]);
+  const hasPassword = Boolean(pr.rows[0]?.password_set_at);
+  const exempt = process.env.TEST_SKIP_OTP === "1" && Boolean(testOtpFor(pr.rows[0]?.phone));
+  const res = { json: (o) => res0.json({ ...o, hasPassword, needsPassword: !hasPassword && !exempt }) };
 
   if (req.actor.type === "supplier") {
     const { rows } = await query(
@@ -354,4 +368,280 @@ authRouter.get("/me", authenticate, asyncRoute(async (req, res) => {
   }
 
   res.json({ actor: req.actor });
+}));
+
+/* ====================================================================== *
+ * الدخول بكلمة المرور (الطريقة الأساسية) — الـ SMS يُستخدم أول مرة فقط
+ * نسيت كلمة المرور = طلب مراجعة للإدارة، والمدير يصدر رمز دخول مؤقت من شاشة الحسابات
+ * ====================================================================== */
+const PW_MAX_FAILS = 5;
+const PW_LOCK_MINUTES = 15;
+const BAD_LOGIN = "رقم الهاتف أو كلمة المرور غير صحيحة";
+const pwLimiters = [makeLimiter(15 * 60 * 1000, 12, phoneIpKey), makeLimiter(15 * 60 * 1000, 150, ipKey)];
+const strictLimiters = [makeLimiter(15 * 60 * 1000, 6, phoneIpKey), makeLimiter(15 * 60 * 1000, 40, ipKey)];
+
+const passwordSchema = z.string().min(6, "كلمة المرور 6 أحرف على الأقل").max(100);
+const loginBase = z.object({ accountType: z.enum(["employee", "customer", "supplier"]), phone: z.string().min(9).max(20) });
+
+// رمز استرجاع للمدير العام وشريكه: 12 حرف/رقم مقروءة (بدون حروف ملتبسة)، يظهر مرة واحدة فقط
+const RC_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function makeRecoveryCode() {
+  let c = "";
+  for (let i = 0; i < 12; i++) c += RC_ALPHABET[crypto.randomInt(0, RC_ALPHABET.length)];
+  return `${c.slice(0, 4)}-${c.slice(4, 8)}-${c.slice(8, 12)}`;
+}
+const cleanRecovery = (x) => String(x || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+async function findLoginUser(accountType, phone) {
+  const cfg = TABLES[accountType];
+  const statusCol = accountType === "employee" ? "is_active" : "status";
+  const { rows } = await query(
+    `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status, password_hash,
+            temp_code_hash, temp_code_expires_at, failed_logins, locked_until
+       FROM ${cfg.table} WHERE phone = $1 LIMIT 1`,
+    [normalizePhone(phone)]
+  );
+  return rows[0] || null;
+}
+
+function assertUsable(accountType, user) {
+  const blocked = accountType === "employee" ? user.account_status === false : user.account_status === "suspended";
+  if (blocked) throw new ApiError(403, "تم إيقاف هذا الحساب، يرجى التواصل مع الدعم الفني");
+  const approved = accountType === "employee" ? user.account_status === true : user.account_status === "approved";
+  if (!approved) throw new ApiError(403, "حسابك لم يُعتمد بعد — بانتظار موافقة الإدارة");
+}
+
+function assertNotLocked(user) {
+  if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    const mins = Math.ceil((new Date(user.locked_until) - Date.now()) / 60000);
+    throw new ApiError(429, `تم إيقاف الدخول مؤقتًا بسبب محاولات خاطئة، حاول بعد ${mins} دقيقة`);
+  }
+}
+
+// يسجّل محاولة فاشلة؛ بعد 5 يقفل الحساب 15 دقيقة
+async function registerFail(accountType, user, req, action) {
+  const cfg = TABLES[accountType];
+  const { rows } = await query(
+    `UPDATE ${cfg.table}
+        SET failed_logins = failed_logins + 1,
+            locked_until = CASE WHEN failed_logins + 1 >= $2 THEN now() + ($3 || ' minutes')::interval ELSE locked_until END
+      WHERE id = $1 RETURNING failed_logins`,
+    [user.id, PW_MAX_FAILS, String(PW_LOCK_MINUTES)]
+  );
+  if ((rows[0]?.failed_logins ?? 0) >= PW_MAX_FAILS) {
+    await query(`UPDATE ${cfg.table} SET failed_logins = 0 WHERE id = $1`, [user.id]);
+  }
+  await auditAuthFailure(action, accountType, user, req);
+}
+
+async function finishPasswordLogin(accountType, user, req) {
+  const cfg = TABLES[accountType];
+  await query(
+    `UPDATE ${cfg.table} SET failed_logins = 0, locked_until = NULL ${accountType === "employee" ? ", last_login_at = now()" : ""} WHERE id = $1`,
+    [user.id]
+  );
+  await writeAudit(pool, {
+    actorType: accountType, actorId: user.id, actorName: user.name, action: "auth.login",
+    entityType: accountType, entityId: user.id, entityLabel: user.name, ip: req.ip,
+  });
+  return issueSession(accountType, user);
+}
+
+authRouter.post("/password/login", ...pwLimiters, asyncRoute(async (req, res) => {
+  const { accountType, phone } = loginBase.parse(req.body);
+  const password = z.string().min(1).max(100).parse(req.body?.password);
+  const user = await findLoginUser(accountType, phone);
+  if (!user) throw new ApiError(401, BAD_LOGIN);
+  assertUsable(accountType, user);
+  assertNotLocked(user);
+  if (!user.password_hash) {
+    throw new ApiError(400, "هذا الحساب ما عندوش كلمة مرور بعد — ادخل أول مرة برمز التحقق (SMS) وبعدها تحط كلمة مرورك", "NO_PASSWORD");
+  }
+  if (!(await verifyOtp(password, user.password_hash))) {
+    await registerFail(accountType, user, req, "auth.password_failed");
+    throw new ApiError(401, BAD_LOGIN);
+  }
+  res.json(await finishPasswordLogin(accountType, user, req));
+}));
+
+// رمز دخول مؤقت أصدره المدير: يدخل به ثم يُجبَر على وضع كلمة مرور جديدة
+authRouter.post("/password/login-code", ...strictLimiters, asyncRoute(async (req, res) => {
+  const { accountType, phone } = loginBase.parse(req.body);
+  const code = z.string().regex(/^\d{6}$/).parse(String(req.body?.code || "").replace(/\s/g, ""));
+  const user = await findLoginUser(accountType, phone);
+  const BAD = "رمز الدخول غير صحيح أو منتهي";
+  if (!user) throw new ApiError(401, BAD);
+  assertUsable(accountType, user);
+  assertNotLocked(user);
+  if (!user.temp_code_hash || !user.temp_code_expires_at || new Date(user.temp_code_expires_at) < new Date()) {
+    throw new ApiError(401, BAD);
+  }
+  if (!(await verifyOtp(code, user.temp_code_hash))) {
+    await registerFail(accountType, user, req, "auth.code_failed");
+    throw new ApiError(401, BAD);
+  }
+  const cfg = TABLES[accountType];
+  // استهلاك ذرّي: الرمز يُستعمل مرة واحدة، ويُمسح الباسورد القديم لتظهر شاشة "حط كلمة مرور جديدة"
+  const upd = await query(
+    `UPDATE ${cfg.table} SET temp_code_hash = NULL, temp_code_expires_at = NULL, password_hash = NULL, password_set_at = NULL
+      WHERE id = $1 AND temp_code_hash = $2`,
+    [user.id, user.temp_code_hash]
+  );
+  if (!upd.rowCount) throw new ApiError(401, BAD);
+  res.json(await finishPasswordLogin(accountType, user, req));
+}));
+
+// وضع/تغيير كلمة المرور (يحتاج جلسة). لو عنده كلمة حالية لازم يكتبها.
+authRouter.post("/password/set", authenticate, ...pwLimiters, asyncRoute(async (req, res) => {
+  if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
+  const newPassword = passwordSchema.parse(req.body?.newPassword);
+  const cfg = TABLES[req.actor.type];
+  const { rows } = await query(
+    `SELECT password_hash FROM ${cfg.table} WHERE id = $1`, [req.actor.id]
+  );
+  if (!rows.length) throw new ApiError(404, "الحساب غير موجود");
+  if (rows[0].password_hash) {
+    const cur = String(req.body?.currentPassword || "");
+    if (!cur || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(401, "كلمة المرور الحالية غير صحيحة");
+  }
+  const hash = await hashOtp(newPassword);
+  await query(
+    `UPDATE ${cfg.table} SET password_hash = $2, password_set_at = now(), failed_logins = 0, locked_until = NULL WHERE id = $1`,
+    [req.actor.id, hash]
+  );
+  await writeAudit(pool, {
+    actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name, action: "auth.password_set",
+    entityType: req.actor.type, entityId: req.actor.id, entityLabel: req.actor.name, ip: req.ip,
+  });
+  // رمز الاسترجاع: للمدير العام وشريكه (جلسة مفتوحة) فقط، ويُعطى مرة واحدة لما ما يكون عنده رمز
+  let recoveryCode = null;
+  if (req.actor.type === "employee") {
+    const e = await query(`SELECT long_session, recovery_hash FROM employees WHERE id = $1`, [req.actor.id]);
+    if (e.rows[0]?.long_session && !e.rows[0]?.recovery_hash) {
+      recoveryCode = makeRecoveryCode();
+      await query(`UPDATE employees SET recovery_hash = $2 WHERE id = $1`, [req.actor.id, await hashOtp(cleanRecovery(recoveryCode))]);
+    }
+  }
+  res.json({ ok: true, recoveryCode });
+}));
+
+// إعادة إنشاء رمز الاسترجاع (يحتاج كلمة المرور الحالية) — للمدير العام وشريكه
+authRouter.post("/password/new-recovery-code", authenticate, ...pwLimiters, asyncRoute(async (req, res) => {
+  if (req.actor?.type !== "employee") throw new ApiError(403, "غير متاح");
+  const { rows } = await query(`SELECT long_session, password_hash FROM employees WHERE id = $1`, [req.actor.id]);
+  if (!rows[0]?.long_session) throw new ApiError(403, "غير متاح لهذا الحساب");
+  const cur = String(req.body?.currentPassword || "");
+  if (!rows[0].password_hash || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(401, "كلمة المرور الحالية غير صحيحة");
+  const recoveryCode = makeRecoveryCode();
+  await query(`UPDATE employees SET recovery_hash = $2 WHERE id = $1`, [req.actor.id, await hashOtp(cleanRecovery(recoveryCode))]);
+  res.json({ recoveryCode });
+}));
+
+// نسيت كلمة المرور بدون رمز استرجاع: المدير العام وشريكه فقط، برقم + رمز الاسترجاع المحفوظ عندهم
+authRouter.post("/password/recover", ...strictLimiters, asyncRoute(async (req, res) => {
+  const phone = z.string().min(9).max(20).parse(req.body?.phone);
+  const newPassword = passwordSchema.parse(req.body?.newPassword);
+  const code = cleanRecovery(req.body?.recoveryCode);
+  const BAD = "رمز الاسترجاع غير صحيح";
+  const { rows } = await query(
+    `SELECT id, name, is_active, recovery_hash, long_session, locked_until FROM employees WHERE phone = $1 LIMIT 1`,
+    [normalizePhone(phone)]
+  );
+  const e = rows[0];
+  if (!e || !e.long_session || !e.recovery_hash || !e.is_active) throw new ApiError(401, BAD);
+  assertNotLocked(e);
+  if (code.length !== 12 || !(await verifyOtp(code, e.recovery_hash))) {
+    await registerFail("employee", { id: e.id, name: e.name }, req, "auth.recovery_failed");
+    throw new ApiError(401, BAD);
+  }
+  const newRecovery = makeRecoveryCode();
+  await query(
+    `UPDATE employees SET password_hash = $2, password_set_at = now(), recovery_hash = $3, failed_logins = 0, locked_until = NULL WHERE id = $1`,
+    [e.id, await hashOtp(newPassword), await hashOtp(cleanRecovery(newRecovery))]
+  );
+  const session = await finishPasswordLogin("employee", { id: e.id, name: e.name }, req);
+  res.json({ ...session, recoveryCode: newRecovery });
+}));
+
+// خروج من كل الأجهزة: يبطل كل التوكنات القديمة لهذا الحساب
+authRouter.post("/password/logout-all", authenticate, asyncRoute(async (req, res) => {
+  if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
+  await query(`UPDATE ${TABLES[req.actor.type].table} SET token_version = token_version + 1 WHERE id = $1`, [req.actor.id]);
+  invalidateAuthCache(req.actor.type, req.actor.id);
+  res.json({ ok: true });
+}));
+
+// "نسيت كلمة المرور": طلب مراجعة يوصل الإدارة مع السبب. الرد عام دايمًا (ما نكشفش هل الرقم مسجل)
+authRouter.post("/password/forgot", ...strictLimiters, asyncRoute(async (req, res) => {
+  const { accountType, phone } = loginBase.parse(req.body);
+  const reason = z.string().trim().min(3, "اكتب سبب الطلب").max(500).parse(req.body?.reason);
+  const cfg = TABLES[accountType];
+  const normalized = normalizePhone(phone);
+  const { rows } = await query(`SELECT id, ${cfg.nameCol} AS name FROM ${cfg.table} WHERE phone = $1 LIMIT 1`, [normalized]);
+  if (rows.length) {
+    const dup = await query(
+      `SELECT 1 FROM access_requests WHERE account_type = $1 AND account_id = $2 AND status = 'open' AND created_at > now() - interval '10 minutes'`,
+      [accountType, rows[0].id]
+    );
+    if (!dup.rows.length) {
+      await query(
+        `INSERT INTO access_requests (account_type, account_id, phone, account_name, reason) VALUES ($1,$2,$3,$4,$5)`,
+        [accountType, rows[0].id, normalized, rows[0].name, reason]
+      );
+      try {
+        await notifyStaffInApp(pool, {
+          permissionCode: "accounts.issue_code",
+          title: "طلب مراجعة: نسيان كلمة المرور",
+          body: `${rows[0].name} (${normalized}): ${reason}`,
+        });
+      } catch (e) { console.error("[forgot notify]", e.message); }
+    }
+  }
+  res.json({ ok: true, message: "تم إرسال طلبك للإدارة، وسيتم التواصل معك بعد المراجعة" });
+}));
+
+/* ---- للإدارة: عرض الطلبات وإصدار رمز دخول مؤقت ---- */
+authRouter.get("/password/requests", authenticate, requirePermission("accounts.issue_code"), asyncRoute(async (req, res) => {
+  const status = req.query.status === "all" ? null : "open";
+  const { rows } = await query(
+    `SELECT id, account_type, account_id, phone, account_name, reason, status, created_at, handled_at
+       FROM access_requests ${status ? "WHERE status = 'open'" : ""} ORDER BY created_at DESC LIMIT 100`
+  );
+  res.json({ requests: rows });
+}));
+
+authRouter.post("/password/requests/:id/dismiss", authenticate, requirePermission("accounts.issue_code"), asyncRoute(async (req, res) => {
+  await query(`UPDATE access_requests SET status = 'dismissed', handled_by = $2, handled_at = now() WHERE id = $1 AND status = 'open'`, [req.params.id, req.actor.id]);
+  res.json({ ok: true });
+}));
+
+authRouter.post("/password/issue-code", authenticate, requirePermission("accounts.issue_code"), asyncRoute(async (req, res) => {
+  const accountType = z.enum(["employee", "customer", "supplier"]).parse(req.body?.accountType);
+  const accountId = z.string().uuid().parse(req.body?.accountId);
+  const requestId = req.body?.requestId ? z.string().uuid().parse(req.body.requestId) : null;
+  const cfg = TABLES[accountType];
+  const { rows } = await query(`SELECT id, ${cfg.nameCol} AS name, phone FROM ${cfg.table} WHERE id = $1`, [accountId]);
+  if (!rows.length) throw new ApiError(404, "الحساب غير موجود");
+  // حسابات المدير العام وشريكه: ما يصدر لها رمز إلا مدير عام (جلسة مفتوحة)
+  if (accountType === "employee") {
+    const t = await query(`SELECT long_session FROM employees WHERE id = $1`, [accountId]);
+    if (t.rows[0]?.long_session) {
+      const me = await query(`SELECT long_session FROM employees WHERE id = $1`, [req.actor.id]);
+      if (!me.rows[0]?.long_session) throw new ApiError(403, "إصدار رمز لحساب مدير عام يكون من مدير عام فقط");
+    }
+  }
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const expires = new Date(Date.now() + 24 * 3600 * 1000);
+  await query(
+    `UPDATE ${cfg.table} SET temp_code_hash = $2, temp_code_expires_at = $3, failed_logins = 0, locked_until = NULL WHERE id = $1`,
+    [accountId, await hashOtp(code), expires]
+  );
+  if (requestId) {
+    await query(`UPDATE access_requests SET status = 'done', handled_by = $2, handled_at = now() WHERE id = $1`, [requestId, req.actor.id]);
+  }
+  await writeAudit(pool, {
+    actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name, action: "auth.issue_code",
+    entityType: accountType, entityId: accountId, entityLabel: rows[0].name, ip: req.ip,
+  });
+  res.json({ code, expiresAt: expires, name: rows[0].name, phone: rows[0].phone });
 }));
