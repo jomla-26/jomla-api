@@ -157,7 +157,7 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     console.log(`[AUTH] رقم تجربة (${normalized}): كود ثابت، بدون إرسال واتساب`);
   } else if (smsConfigured()) {
     // رسالة نصية (SMS) هي الطريقة الأساسية لو مضبوطة؛ لو فشلت وواتساب مضبوط نجرب واتساب كاحتياط
-    const msg = `رمز جملة: ${otp} (صالح 5 دقائق)`; // قصير عشان يكون جزء واحد (70 حرف عربي) = أرخص
+    const msg = `رمز جملة: ${otp}`; // أقصر نص ممكن: جزء واحد (70 حرف عربي) = أرخص
     sendSms(normalized, msg).catch((err) => {
       console.error("[SMS] فشل الإرسال:", err.message);
       if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
@@ -502,7 +502,7 @@ authRouter.post("/password/set", authenticate, ...pwLimiters, asyncRoute(async (
   if (!rows.length) throw new ApiError(404, "الحساب غير موجود");
   if (rows[0].password_hash) {
     const cur = String(req.body?.currentPassword || "");
-    if (!cur || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(401, "كلمة المرور الحالية غير صحيحة");
+    if (!cur || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(400, "كلمة المرور الحالية غير صحيحة");
   }
   const hash = await hashOtp(newPassword);
   await query(
@@ -531,7 +531,7 @@ authRouter.post("/password/new-recovery-code", authenticate, ...pwLimiters, asyn
   const { rows } = await query(`SELECT long_session, password_hash FROM employees WHERE id = $1`, [req.actor.id]);
   if (!rows[0]?.long_session) throw new ApiError(403, "غير متاح لهذا الحساب");
   const cur = String(req.body?.currentPassword || "");
-  if (!rows[0].password_hash || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(401, "كلمة المرور الحالية غير صحيحة");
+  if (!rows[0].password_hash || !(await verifyOtp(cur, rows[0].password_hash))) throw new ApiError(400, "كلمة المرور الحالية غير صحيحة");
   const recoveryCode = makeRecoveryCode();
   await query(`UPDATE employees SET recovery_hash = $2 WHERE id = $1`, [req.actor.id, await hashOtp(cleanRecovery(recoveryCode))]);
   res.json({ recoveryCode });
