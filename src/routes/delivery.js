@@ -22,7 +22,7 @@ deliveryRouter.get("/zones", asyncRoute(async (_req, res) => {
   res.json(rows);
 }));
 
-deliveryRouter.post("/zones", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.post("/zones", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({ name: z.string().trim().min(2).max(120), baseFee: z.number().nonnegative().max(1_000_000) }).parse(req.body);
   const zone = await withTransaction(async (client) => {
     const { rows } = await client.query(
@@ -39,7 +39,7 @@ await writeAudit(client, {
   res.status(201).json(zone);
 }));
 
-deliveryRouter.patch("/zones/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.patch("/zones/:id", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     name: z.string().trim().min(2).max(120).optional(), baseFee: z.number().nonnegative().max(1_000_000).optional(), isActive: z.boolean().optional(),
   }).parse(req.body);
@@ -59,7 +59,7 @@ deliveryRouter.get("/vehicle-types", asyncRoute(async (_req, res) => {
   res.json(rows);
 }));
 
-deliveryRouter.post("/vehicle-types", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.post("/vehicle-types", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     name: z.string().trim().min(2).max(120), maxWeightKg: z.number().positive().optional(),
     maxVolumeM3: z.number().positive().optional(), tripCost: z.number().nonnegative(),
@@ -75,7 +75,7 @@ deliveryRouter.post("/vehicle-types", requirePermission("catalog.manage"), async
 }));
 
 // تعديل نوع سيارة موجود (التكلفة، سعر الكيلومتر، الاسم، الحدود) أو إيقافه/تفعيله
-deliveryRouter.patch("/vehicle-types/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.patch("/vehicle-types/:id", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     name: z.string().trim().min(2).max(120).optional(),
     maxWeightKg: z.number().positive().optional(),
@@ -113,7 +113,7 @@ deliveryRouter.get("/rates", asyncRoute(async (_req, res) => {
   res.json(rows);
 }));
 
-deliveryRouter.post("/rates", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.post("/rates", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     zoneId: z.string().uuid(), vehicleTypeId: z.string().uuid(), fee: z.number().nonnegative(),
   }).parse(req.body);
@@ -132,7 +132,7 @@ deliveryRouter.get("/settings", asyncRoute(async (_req, res) => {
   res.json(rows[0] ?? { extra_pickup_point_fee: 0 });
 }));
 
-deliveryRouter.patch("/settings", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+deliveryRouter.patch("/settings", requirePermission("delivery.manage"), asyncRoute(async (req, res) => {
   const body = z.object({
     extraPickupPointFee: z.number().nonnegative().optional(),
     freeKm: z.number().nonnegative().optional(),

@@ -65,7 +65,7 @@ async function fetchBannersWithSections(db, onlyId = null) {
 }
 
 // عرض كامل لكل البانرات (نشطة وغير نشطة) — لشاشة الإدارة، مع الأقسام المستهدفة
-bannerRouter.get("/admin", requirePermission("catalog.manage"), asyncRoute(async (_req, res) => {
+bannerRouter.get("/admin", requirePermission("banners.manage"), asyncRoute(async (_req, res) => {
   await ensureBannerSections();
   res.json(await fetchBannersWithSections({ query }));
 }));
@@ -99,7 +99,7 @@ const bannerSchema = z.object({
   sectionIds: z.array(z.string().uuid()).max(100).optional(),
 });
 
-bannerRouter.post("/", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+bannerRouter.post("/", requirePermission("banners.manage"), asyncRoute(async (req, res) => {
   const body = bannerSchema.parse(req.body);
   await ensureBannerSections();
 
@@ -127,7 +127,7 @@ bannerRouter.post("/", requirePermission("catalog.manage"), asyncRoute(async (re
 
 const updateSchema = bannerSchema.partial().extend({ isActive: z.boolean().optional() });
 
-bannerRouter.patch("/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+bannerRouter.patch("/:id", requirePermission("banners.manage"), asyncRoute(async (req, res) => {
   const body = updateSchema.parse(req.body);
   if (Object.keys(body).length === 0) throw new ApiError(400, "لا توجد بيانات للتعديل");
   await ensureBannerSections();
@@ -165,7 +165,7 @@ bannerRouter.patch("/:id", requirePermission("catalog.manage"), asyncRoute(async
   res.json(result);
 }));
 
-bannerRouter.delete("/:id", requirePermission("catalog.manage"), asyncRoute(async (req, res) => {
+bannerRouter.delete("/:id", requirePermission("banners.manage"), asyncRoute(async (req, res) => {
   const result = await withTransaction(async (client) => {
     const before = await client.query(`SELECT * FROM promo_banners WHERE id = $1 FOR UPDATE`, [req.params.id]);
     if (!before.rows.length) throw new ApiError(404, "البانر غير موجود");

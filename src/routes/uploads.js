@@ -45,7 +45,7 @@ async function assertCanUploadImages(req, res) {
   if (req.actor.type === "supplier") return;
   if (req.actor.type !== "employee") throw new ApiError(403, "رفع الصور غير متاح لهذا الحساب");
   await runMiddleware(
-    requireAnyPermission("catalog.manage", "accounts.sections", "accounts.approve", "assets.manage"), req, res
+    requireAnyPermission("catalog.manage", "banners.manage", "delivery.manage", "accounts.sections", "accounts.approve", "assets.manage"), req, res
   );
 }
 

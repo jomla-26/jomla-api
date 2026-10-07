@@ -69,6 +69,26 @@ export async function ensureSchema() {
        ON CONFLICT DO NOTHING`
     );
   } catch (e) { console.error("[schema-perm]", e.message); }
+  // تقسيم صلاحية «إدارة الأصناف والتوصيل والبانرات»: صلاحيتان جديدتان تنعطيان لكل دور كان يملك catalog.manage (ما يتغير شي على أحد)
+  try {
+    await pool.query(`INSERT INTO permissions (code, description) VALUES
+      ('delivery.manage','إدارة مناطق التوصيل وأنواع السيارات والأسعار'),
+      ('banners.manage','إدارة البانرات الترويجية') ON CONFLICT (code) DO NOTHING`);
+    for (const code of ["delivery.manage", "banners.manage"]) {
+      await pool.query(
+        `INSERT INTO role_permissions (role_id, permission_id)
+         SELECT rp.role_id, (SELECT id FROM permissions WHERE code = $1)
+           FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id AND p.code = 'catalog.manage'
+         ON CONFLICT DO NOTHING`, [code]);
+      // الاستثناءات الفردية (منح/سحب) على catalog.manage تنتقل للصلاحية الجديدة مرة واحدة
+      await pool.query(
+        `INSERT INTO employee_permission_overrides (employee_id, permission_id, granted)
+         SELECT o.employee_id, (SELECT id FROM permissions WHERE code = $1), o.granted
+           FROM employee_permission_overrides o JOIN permissions p ON p.id = o.permission_id AND p.code = 'catalog.manage'
+         ON CONFLICT DO NOTHING`, [code]);
+    }
+    await pool.query(`UPDATE permissions SET description = 'إدارة الأصناف والمخزون' WHERE code = 'catalog.manage'`);
+  } catch (e) { console.error("[schema-perm2]", e.message); }
   // المدير العام يملك كل الصلاحيات دائمًا، حتى الجديدة اللي تنضاف لاحقًا (تتزامن عند كل تشغيل)
   try {
     await pool.query(
