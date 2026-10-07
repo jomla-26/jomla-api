@@ -5,8 +5,8 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
-import { signToken, authenticate, requirePermission, invalidateAuthCache } from "../middleware/auth.js";
-import { notifyStaffInApp } from "../lib/notify.js";
+import { signToken, authenticate, requirePermission, invalidateAuthCache, invalidateSessionCache } from "../middleware/auth.js";
+import { notifyStaffInApp, notifyManagementInApp, createInAppNotification } from "../lib/notify.js";
 
 export const authRouter = Router();
 
@@ -198,7 +198,38 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
 }));
 
 // يُنشئ جلسة (توكن) لحساب تم التحقق منه. المدير العام وشريكه (long_session) جلستهم مفتوحة بدون انتهاء 12 ساعة.
-async function issueSession(accountType, user) {
+function deviceFromUA(ua = "") {
+  const os = /iPhone|iPad|iOS/i.test(ua) ? "آيفون/آيباد" : /Android/i.test(ua) ? "أندرويد"
+    : /Windows/i.test(ua) ? "ويندوز" : /Mac OS|Macintosh/i.test(ua) ? "ماك" : /Linux/i.test(ua) ? "لينكس" : "جهاز";
+  const br = /EdgA?\/|Edg\//.test(ua) ? "Edge" : /OPR\/|Opera/i.test(ua) ? "Opera" : /Firefox|FxiOS/i.test(ua) ? "Firefox"
+    : /CriOS|Chrome/i.test(ua) ? "Chrome" : /Safari/i.test(ua) ? "Safari" : "متصفح";
+  return `${os} · ${br}`;
+}
+
+// يسجّل الجهاز، وإذا كان جهاز جديد على حساب له دخول سابق ينبّه صاحب الحساب (والإدارة لو موظف)
+async function registerSession(accountType, user, req) {
+  const sid = crypto.randomUUID();
+  const ua = String(req?.headers?.["user-agent"] || "").slice(0, 400);
+  const uaHash = crypto.createHash("sha256").update(ua).digest("hex").slice(0, 24);
+  const label = deviceFromUA(ua);
+  const ip = req?.ip || null;
+  const { rows: prev } = await query(
+    `SELECT count(*)::int AS total, count(*) FILTER (WHERE ua_hash = $3)::int AS same
+       FROM auth_sessions WHERE account_type = $1 AND account_id = $2`, [accountType, user.id, uaHash]);
+  await query(
+    `INSERT INTO auth_sessions (id, account_type, account_id, device_label, ua_hash, ip) VALUES ($1,$2,$3,$4,$5,$6)`,
+    [sid, accountType, user.id, label, uaHash, ip]);
+  if (prev[0].total > 0 && prev[0].same === 0) {
+    const body = `${user.name} دخل من جهاز جديد: ${label}. لو مش أنت: افتح "كلمة المرور والأمان" واخرج من هذا الجهاز.`;
+    try {
+      if (accountType === "employee") await notifyManagementInApp(`🔔 دخول من جهاز جديد\n${body}`);
+      else await createInAppNotification(pool, { recipientType: accountType, recipientId: user.id, title: "🔔 دخول من جهاز جديد", body });
+    } catch (e) { console.error("[new-device-alert]", e.message); }
+  }
+  return sid;
+}
+
+async function issueSession(accountType, user, req) {
   const cfg = TABLES[accountType];
   let role = null;
   let long = false;
@@ -211,7 +242,8 @@ async function issueSession(accountType, user) {
     long = Boolean(r.rows[0]?.long_session);
   }
   const { rows: tv } = await query(`SELECT token_version FROM ${cfg.table} WHERE id = $1`, [user.id]);
-  const token = signToken({ sub: user.id, type: accountType, name: user.name, role, v: tv[0]?.token_version ?? 0 }, { long });
+  const sid = await registerSession(accountType, user, req);
+  const token = signToken({ sub: user.id, type: accountType, name: user.name, role, v: tv[0]?.token_version ?? 0, sid }, { long });
   return { token, actor: { id: user.id, type: accountType, name: user.name, role } };
 }
 
@@ -292,7 +324,7 @@ authRouter.post("/otp/verify", ...otpVerifyLimiters, asyncRoute(async (req, res)
   });
   if (!consumed) throw new ApiError(401, INVALID);
 
-  res.json(await issueSession(accountType, user));
+  res.json(await issueSession(accountType, user, req));
 }));
 
 authRouter.get("/me", authenticate, asyncRoute(async (req, res0) => {
@@ -450,7 +482,7 @@ async function finishPasswordLogin(accountType, user, req) {
     actorType: accountType, actorId: user.id, actorName: user.name, action: "auth.login",
     entityType: accountType, entityId: user.id, entityLabel: user.name, ip: req.ip,
   });
-  return issueSession(accountType, user);
+  return issueSession(accountType, user, req);
 }
 
 authRouter.post("/password/login", ...pwLimiters, asyncRoute(async (req, res) => {
@@ -573,8 +605,29 @@ authRouter.post("/password/recover", ...strictLimiters, asyncRoute(async (req, r
 authRouter.post("/password/logout-all", authenticate, asyncRoute(async (req, res) => {
   if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
   await query(`UPDATE ${TABLES[req.actor.type].table} SET token_version = token_version + 1 WHERE id = $1`, [req.actor.id]);
+  await query(`UPDATE auth_sessions SET revoked_at = now() WHERE account_type = $1 AND account_id = $2 AND revoked_at IS NULL`, [req.actor.type, req.actor.id]);
   invalidateAuthCache(req.actor.type, req.actor.id);
+  invalidateSessionCache();
   res.json({ ok: true });
+}));
+
+// قائمة أجهزتي (آخر 60 يوم) + إخراج جهاز بعينه
+authRouter.get("/sessions", authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, device_label, ip, created_at, last_seen_at FROM auth_sessions
+      WHERE account_type = $1 AND account_id = $2 AND revoked_at IS NULL AND last_seen_at > now() - interval '60 days'
+      ORDER BY last_seen_at DESC LIMIT 30`, [req.actor.type, req.actor.id]);
+  res.json(rows.map((r) => ({ ...r, current: r.id === req.actor.sid })));
+}));
+
+authRouter.post("/sessions/:id/revoke", authenticate, asyncRoute(async (req, res) => {
+  const id = z.string().uuid().parse(req.params.id);
+  const r = await query(
+    `UPDATE auth_sessions SET revoked_at = now() WHERE id = $1 AND account_type = $2 AND account_id = $3 AND revoked_at IS NULL`,
+    [id, req.actor.type, req.actor.id]);
+  if (!r.rowCount) throw new ApiError(404, "الجهاز غير موجود");
+  invalidateSessionCache(id);
+  res.json({ ok: true, self: id === req.actor.sid });
 }));
 
 // "نسيت كلمة المرور": طلب مراجعة يوصل الإدارة مع السبب. الرد عام دايمًا (ما نكشفش هل الرقم مسجل)

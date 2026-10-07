@@ -37,6 +37,19 @@ const STEPS = [
      created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
    )`,
   `CREATE INDEX IF NOT EXISTS access_requests_status_idx ON access_requests (status, created_at DESC)`,
+  // الأجهزة المسجّلة (كل دخول = جلسة): قائمة الأجهزة + إلغاء جهاز بعينه + تنبيه الجهاز الجديد
+  `CREATE TABLE IF NOT EXISTS auth_sessions (
+     id UUID PRIMARY KEY,
+     account_type TEXT NOT NULL,
+     account_id UUID NOT NULL,
+     device_label TEXT,
+     ua_hash TEXT,
+     ip TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     revoked_at TIMESTAMPTZ
+   )`,
+  `CREATE INDEX IF NOT EXISTS auth_sessions_account_idx ON auth_sessions (account_type, account_id, last_seen_at DESC)`,
   // إشعارات داخل التطبيق بدون قالب
   `ALTER TABLE notifications ALTER COLUMN template_code DROP NOT NULL`,
   // سجل أخطاء السيرفر

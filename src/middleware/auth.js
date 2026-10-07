@@ -52,6 +52,20 @@ async function loadActorState(type, id) {
   return { ok: false, status: 401, message: "الجلسة منتهية، يرجى تسجيل الدخول من جديد" };
 }
 
+// حالة الجلسة (الجهاز): ملغاة أو لا. كاش 30 ثانية، ونحدّث "آخر ظهور" مرة كل دورة كاش.
+const sessCache = new Map();
+export function invalidateSessionCache(sid) { if (sid) sessCache.delete(sid); else sessCache.clear(); }
+async function sessionAlive(sid) {
+  const hit = sessCache.get(sid);
+  if (hit && Date.now() - hit.at < AUTH_CACHE_TTL_MS) return hit.ok;
+  const { rows } = await query(
+    `UPDATE auth_sessions SET last_seen_at = now() WHERE id = $1 AND revoked_at IS NULL RETURNING id`, [sid]);
+  const ok = rows.length > 0;
+  if (sessCache.size > AUTH_CACHE_MAX) sessCache.clear();
+  sessCache.set(sid, { at: Date.now(), ok });
+  return ok;
+}
+
 export async function authenticate(req, _res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -80,7 +94,13 @@ export async function authenticate(req, _res, next) {
     // "خروج من كل الأجهزة" يرفع token_version فتبطل التوكنات القديمة
     if ((decoded.v ?? 0) !== (st.tv ?? 0)) return next(new ApiError(401, "الجلسة منتهية، يرجى تسجيل الدخول من جديد"));
 
+    // توكنات قديمة بدون sid تبقى صالحة؛ الجديدة تُفحص (الجهاز الملغي يطلع فورًا)
+    if (decoded.sid && !(await sessionAlive(decoded.sid))) {
+      return next(new ApiError(401, "تم إخراج هذا الجهاز، سجّل الدخول من جديد"));
+    }
+
     req.actor = {
+      sid: decoded.sid || null,
       type: decoded.type,
       id: decoded.sub,
       name: st.name || decoded.name,
