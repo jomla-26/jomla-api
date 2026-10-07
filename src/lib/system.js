@@ -50,6 +50,21 @@ const STEPS = [
      revoked_at TIMESTAMPTZ
    )`,
   `CREATE INDEX IF NOT EXISTS auth_sessions_account_idx ON auth_sessions (account_type, account_id, last_seen_at DESC)`,
+  // بصمة الوجه / البصمة (WebAuthn): مفتاح عام فقط، المفتاح الخاص ما يخرج من الجهاز
+  `CREATE TABLE IF NOT EXISTS passkeys (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     account_type TEXT NOT NULL,
+     account_id UUID NOT NULL,
+     rp_id TEXT NOT NULL,
+     credential_id TEXT NOT NULL,
+     public_key TEXT NOT NULL,
+     counter BIGINT NOT NULL DEFAULT 0,
+     device_label TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     last_used_at TIMESTAMPTZ,
+     UNIQUE (rp_id, credential_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS passkeys_account_idx ON passkeys (account_type, account_id)`,
   // إشعارات داخل التطبيق بدون قالب
   `ALTER TABLE notifications ALTER COLUMN template_code DROP NOT NULL`,
   // سجل أخطاء السيرفر

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { pool, query, withTransaction, writeAudit } from "../lib/db.js";
 import { ApiError, asyncRoute, hashOtp, verifyOtp, normalizePhone } from "../lib/helpers.js";
 import { signToken, authenticate, requirePermission, invalidateAuthCache, invalidateSessionCache } from "../middleware/auth.js";
+import { makeChallenge, originInfo, verifyRegistration, verifyAssertion } from "../lib/webauthn.js";
 import { notifyStaffInApp, notifyManagementInApp, createInAppNotification } from "../lib/notify.js";
 
 export const authRouter = Router();
@@ -606,8 +607,76 @@ authRouter.post("/password/logout-all", authenticate, asyncRoute(async (req, res
   if (!req.actor) throw new ApiError(401, "يلزم تسجيل الدخول");
   await query(`UPDATE ${TABLES[req.actor.type].table} SET token_version = token_version + 1 WHERE id = $1`, [req.actor.id]);
   await query(`UPDATE auth_sessions SET revoked_at = now() WHERE account_type = $1 AND account_id = $2 AND revoked_at IS NULL`, [req.actor.type, req.actor.id]);
+  await query(`DELETE FROM passkeys WHERE account_type = $1 AND account_id = $2`, [req.actor.type, req.actor.id]); // ضياع جهاز: تُحذف بصمات الدخول أيضًا
   invalidateAuthCache(req.actor.type, req.actor.id);
   invalidateSessionCache();
+  res.json({ ok: true });
+}));
+
+// ---------- بصمة الوجه / البصمة (WebAuthn) ----------
+const passkeyLimiter = makeLimiter(15 * 60 * 1000, 60, ipKey);
+
+authRouter.post("/passkey/register/options", authenticate, passkeyLimiter, asyncRoute(async (req, res) => {
+  const info = originInfo(req);
+  const { rows: ex } = await query(`SELECT credential_id FROM passkeys WHERE account_type=$1 AND account_id=$2 AND rp_id=$3`, [req.actor.type, req.actor.id, info.rpId]);
+  res.json({
+    challenge: makeChallenge("reg", `${req.actor.type}:${req.actor.id}`),
+    rp: { id: info.rpId, name: "جملة" },
+    user: { id: Buffer.from(`${req.actor.type}:${req.actor.id}`).toString("base64url"), name: req.actor.name || "حساب جملة", displayName: req.actor.name || "حساب جملة" },
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: "platform", residentKey: "required", requireResidentKey: true, userVerification: "required" },
+    excludeCredentials: ex.map((r) => ({ type: "public-key", id: r.credential_id })),
+    timeout: 120000, attestation: "none",
+  });
+}));
+
+authRouter.post("/passkey/register/verify", authenticate, passkeyLimiter, asyncRoute(async (req, res) => {
+  const info = originInfo(req);
+  const r = verifyRegistration(req.body, { accountScope: `${req.actor.type}:${req.actor.id}`, info });
+  const label = deviceFromUA(String(req.headers["user-agent"] || ""));
+  await query(
+    `INSERT INTO passkeys (account_type, account_id, rp_id, credential_id, public_key, counter, device_label)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (rp_id, credential_id) DO NOTHING`,
+    [req.actor.type, req.actor.id, info.rpId, r.credentialId, r.publicKey, r.counter, label]);
+  await writeAudit(pool, { actorType: req.actor.type, actorId: req.actor.id, actorName: req.actor.name, action: "auth.passkey_added",
+    entityType: req.actor.type, entityId: req.actor.id, entityLabel: label, ip: req.ip });
+  res.json({ ok: true });
+}));
+
+authRouter.post("/passkey/login/options", passkeyLimiter, asyncRoute(async (req, res) => {
+  const info = originInfo(req);
+  res.json({ challenge: makeChallenge("login"), rpId: info.rpId, userVerification: "required", timeout: 120000 });
+}));
+
+authRouter.post("/passkey/login/verify", passkeyLimiter, asyncRoute(async (req, res) => {
+  const info = originInfo(req);
+  const BAD = "تعذر الدخول ببصمة الوجه، ادخل بكلمة المرور";
+  const id = z.string().min(10).max(1024).parse(req.body?.id);
+  const { rows: [cred] } = await query(`SELECT * FROM passkeys WHERE rp_id = $1 AND credential_id = $2`, [info.rpId, id]);
+  if (!cred) throw new ApiError(401, BAD);
+  const { counter } = verifyAssertion(req.body, cred, { info });
+  const cfg = TABLES[cred.account_type];
+  const statusCol = cred.account_type === "employee" ? "is_active" : "status";
+  const { rows: [user] } = await query(
+    `SELECT id, ${cfg.nameCol} AS name, ${statusCol} AS account_status, locked_until FROM ${cfg.table} WHERE id = $1`, [cred.account_id]);
+  if (!user) throw new ApiError(401, BAD);
+  assertUsable(cred.account_type, user);
+  assertNotLocked(user);
+  await query(`UPDATE passkeys SET counter = $2, last_used_at = now() WHERE id = $1`, [cred.id, counter]);
+  res.json(await finishPasswordLogin(cred.account_type, user, req));
+}));
+
+authRouter.get("/passkeys", authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, device_label, rp_id, created_at, last_used_at FROM passkeys WHERE account_type=$1 AND account_id=$2 ORDER BY created_at DESC LIMIT 20`,
+    [req.actor.type, req.actor.id]);
+  res.json(rows);
+}));
+
+authRouter.post("/passkeys/:id/delete", authenticate, asyncRoute(async (req, res) => {
+  const id = z.string().uuid().parse(req.params.id);
+  const r = await query(`DELETE FROM passkeys WHERE id=$1 AND account_type=$2 AND account_id=$3`, [id, req.actor.type, req.actor.id]);
+  if (!r.rowCount) throw new ApiError(404, "غير موجود");
   res.json({ ok: true });
 }));
 
