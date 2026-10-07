@@ -139,10 +139,9 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
   }
 
   const fixedTestOtp = testOtpFor(normalized);
-  // أثناء التجربة الإرسال مقفول: ما يتولد رمز ولا يتصرف رصيد ولا تنبعت رسالة (أرقام التجربة بالكود الثابت مستثناة)
-  if (!fixedTestOtp && !smsEnabled()) {
-    throw new ApiError(403, "الدخول برمز SMS متوقف حاليًا — اطلب من الإدارة رمز دخول", "SMS_OFF");
-  }
+  // أثناء التجربة الإرسال مقفول (SMS_ENABLED غير مفعّل): الرمز يتولد ويظهر فقط في لوقات Railway
+  // (سطر [OTP] رقم → رمز) والمدير يعطيه لصاحب الرقم. ما يتصل بـ Twilio ولا يتصرف رصيد.
+  const smsOff = !fixedTestOtp && !smsEnabled();
   const otp = fixedTestOtp ?? generateOtp();
   const hash = await hashOtp(otp);
   // رمز جديد = عدّاد محاولات جديد
@@ -153,12 +152,15 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
     [hash, user.id]
   );
 
-  if (!fixedTestOtp && process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
+  if (smsOff) console.log(`[OTP] ${normalized} → ${otp}  (SMS مقفول: أعطِ الرمز لصاحب الرقم)`);
+  else if (!fixedTestOtp && process.env.NODE_ENV !== "production") console.log(`[OTP] ${normalized} → ${otp}`);
 
   // إرسال الرمز عبر واتساب (سيرفس Baileys المستقل) — لا نوقف الطلب لو فشل الإرسال،
   // فقط نسجّل الخطأ، عشان مشكلة مؤقتة بواتساب ما توقفش تسجيل الدخول بالكامل
   if (fixedTestOtp) {
     console.log(`[AUTH] رقم تجربة (${normalized}): كود ثابت، بدون إرسال واتساب`);
+  } else if (smsOff) {
+    // لا إرسال: الرمز في اللوقات فقط
   } else if (smsConfigured()) {
     // رسالة نصية (SMS) هي الطريقة الأساسية لو مضبوطة؛ لو فشلت وواتساب مضبوط نجرب واتساب كاحتياط
     const msg = `رمز جملة: ${otp}`; // أقصر نص ممكن: جزء واحد (70 حرف عربي) = أرخص
@@ -192,7 +194,7 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
   if (fixedTestOtp && process.env.TEST_SKIP_OTP === "1") {
     return res.json({ sent: true, skipOtp: true, otp: fixedTestOtp, message: "دخول مباشر (وضع تجربة)" });
   }
-  res.json({ sent: true, message: "تم إرسال رمز التحقق" });
+  res.json({ sent: true, message: smsOff ? "طلبك وصل للإدارة، وسيعطونك رمز التحقق" : "تم إرسال رمز التحقق" });
 }));
 
 // يُنشئ جلسة (توكن) لحساب تم التحقق منه. المدير العام وشريكه (long_session) جلستهم مفتوحة بدون انتهاء 12 ساعة.
