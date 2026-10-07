@@ -1,3 +1,4 @@
+import { setInitialLoginCode } from "../lib/loginCode.js";
 import { Router } from "express";
 import { z } from "zod";
 import { query, withTransaction, writeAudit } from "../lib/db.js";
@@ -120,6 +121,7 @@ employeeRouter.post("/", requirePermission("employees.manage"), asyncRoute(async
       action: "employee.created", entityType: "employee", entityId: created.id,
       entityLabel: body.name, after: created, ip: req.ip,
     });
+    created.loginCode = await setInitialLoginCode(client, "employees", created.id);
     return created;
   });
 

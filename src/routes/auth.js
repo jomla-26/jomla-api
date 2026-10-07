@@ -455,7 +455,7 @@ authRouter.post("/password/login", ...pwLimiters, asyncRoute(async (req, res) =>
   assertUsable(accountType, user);
   assertNotLocked(user);
   if (!user.password_hash) {
-    throw new ApiError(400, "هذا الحساب ما عندوش كلمة مرور بعد — ادخل أول مرة برمز التحقق (SMS) وبعدها تحط كلمة مرورك", "NO_PASSWORD");
+    throw new ApiError(400, "هذا الحساب ما عندوش كلمة مرور بعد — اطلب من الإدارة رمز دخول (أو ادخل برمز SMS) وبعدها تحط كلمة مرورك", "NO_PASSWORD");
   }
   if (!(await verifyOtp(password, user.password_hash))) {
     await registerFail(accountType, user, req, "auth.password_failed");

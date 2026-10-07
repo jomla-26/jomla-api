@@ -1,3 +1,4 @@
+import { setInitialLoginCode } from "../lib/loginCode.js";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
@@ -368,7 +369,8 @@ accountsRouter.post("/:kind", requirePermission("accounts.approve"), asyncRoute(
       action: `${req.params.kind}.created`, entityType: req.params.kind, entityId: created.id,
       entityLabel: body.businessName, after: stripSecrets(created), ip: req.ip,
     });
-    return { ...stripSecrets(created), sections: await fetchSections(client, cfg, created.id) };
+    const loginCode = await setInitialLoginCode(client, cfg.table, created.id);
+    return { ...stripSecrets(created), sections: await fetchSections(client, cfg, created.id), loginCode };
   });
 
   res.status(201).json(account);
@@ -457,7 +459,10 @@ accountsRouter.post("/:kind/:id/approve", requirePermission("accounts.approve"),
       });
     }
 
-    return { ...stripSecrets(rows[0]), sections: await fetchSections(client, cfg, req.params.id) };
+    // أول اعتماد (الحساب بدون كلمة مرور): نصدر رمز دخول مؤقت تعطيه الإدارة لصاحب الحساب بدل SMS
+    const pw = await client.query(`SELECT password_set_at FROM ${cfg.table} WHERE id = $1`, [req.params.id]);
+    const loginCode = pw.rows[0]?.password_set_at ? null : await setInitialLoginCode(client, cfg.table, req.params.id);
+    return { ...stripSecrets(rows[0]), sections: await fetchSections(client, cfg, req.params.id), loginCode };
   });
 
   invalidateAuthCache(req.params.kind, req.params.id);

@@ -170,6 +170,8 @@ export function stripSecrets(row) {
   const out = {};
   for (const [k, v] of Object.entries(row)) {
     if (k === "otp_hash" || k.startsWith("otp_")) continue;
+    // أسرار الدخول بكلمة المرور ما تطلع أبدًا في أي رد أو سجل تدقيق
+    if (["password_hash", "temp_code_hash", "temp_code_expires_at", "recovery_hash", "failed_logins", "locked_until", "token_version"].includes(k)) continue;
     out[k] = v;
   }
   return out;
