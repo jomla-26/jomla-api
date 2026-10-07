@@ -1,3 +1,4 @@
+import { smsConfigured, sendSms } from "../lib/sms.js";
 import crypto from "node:crypto";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
@@ -153,6 +154,19 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
   // فقط نسجّل الخطأ، عشان مشكلة مؤقتة بواتساب ما توقفش تسجيل الدخول بالكامل
   if (fixedTestOtp) {
     console.log(`[AUTH] رقم تجربة (${normalized}): كود ثابت، بدون إرسال واتساب`);
+  } else if (smsConfigured()) {
+    // رسالة نصية (SMS) هي الطريقة الأساسية لو مضبوطة؛ لو فشلت وواتساب مضبوط نجرب واتساب كاحتياط
+    const msg = `رمز التحقق الخاص بك في جملة: ${otp}\nصالح لمدة 5 دقائق. لا تشاركه مع أي شخص.`;
+    sendSms(normalized, msg).catch((err) => {
+      console.error("[SMS] فشل الإرسال:", err.message);
+      if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
+        fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-secret-key": process.env.WHATSAPP_SECRET_KEY },
+          body: JSON.stringify({ phone: normalized, message: msg }),
+        }).catch(() => {});
+      }
+    });
   } else if (process.env.WHATSAPP_SERVICE_URL && process.env.WHATSAPP_SECRET_KEY) {
     fetch(`${process.env.WHATSAPP_SERVICE_URL}/send`, {
       method: "POST",

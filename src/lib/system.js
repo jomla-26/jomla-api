@@ -39,6 +39,14 @@ const STEPS = [
   `ALTER TABLE order_shortages ADD COLUMN IF NOT EXISTS proposed_at TIMESTAMPTZ`,
   `ALTER TABLE order_shortages ADD COLUMN IF NOT EXISTS customer_response TEXT`,
   `ALTER TABLE order_shortages ADD COLUMN IF NOT EXISTS customer_responded_at TIMESTAMPTZ`,
+  // إشعارات الهاتف (Web Push)
+  `CREATE TABLE IF NOT EXISTS push_subscriptions (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     actor_type TEXT NOT NULL, actor_id UUID NOT NULL,
+     endpoint TEXT NOT NULL UNIQUE, p256dh TEXT, auth TEXT,
+     last_peek_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  `CREATE INDEX IF NOT EXISTS push_sub_actor_idx ON push_subscriptions (actor_type, actor_id)`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMPTZ`,
   // ترقيم الطلبيات بتسلسل داخل القاعدة (يبدأ بعد أكبر رقم موجود)
   `DO $$ BEGIN
      IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relkind = 'S' AND relname = 'order_number_seq') THEN

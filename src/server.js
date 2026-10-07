@@ -16,6 +16,8 @@ import { employeeRouter } from "./routes/employees.js";
 import { accountsRouter } from "./routes/accounts.js";
 import { deliveryRouter } from "./routes/delivery.js";
 import { engagementRouter } from "./routes/engagement.js";
+import { pushRouter } from "./routes/push.js";
+import { dispatchPushQueue } from "./lib/push.js";
 import { supportRouter } from "./routes/support.js";
 import { assetsRouter } from "./routes/assets.js";
 import { uploadRouter } from "./routes/uploads.js";
@@ -75,6 +77,7 @@ app.use("/api/finance", financeRouter);
 app.use("/api/employees", employeeRouter);
 app.use("/api/accounts", accountsRouter);
 app.use("/api/delivery", deliveryRouter);
+app.use("/api/push", pushRouter);
 app.use("/api/engagement", engagementRouter);
 app.use("/api/support", supportRouter);
 app.use("/api/assets", assetsRouter);
@@ -149,6 +152,7 @@ setTimeout(() => {
   }
 }, 3000);
 
+const pushTimer = setInterval(() => { dispatchPushQueue().catch((e) => console.error("[push]", e.message)); }, 8_000);
 const whatsappTimer = setInterval(() => {
   dispatchWhatsappQueue().catch((e) => console.error("[WhatsApp]", e.message));
 }, 30_000);
@@ -178,6 +182,7 @@ process.on("uncaughtException", (err) => { console.error("[uncaughtException]", 
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(whatsappTimer);
+    clearInterval(pushTimer);
     clearInterval(voucherAlertTimer);
     clearInterval(remindersTimer);
     clearInterval(dailyReportTimer);
