@@ -27,7 +27,7 @@ import { cartRouter } from "./routes/carts.js";
 import { searchLogRouter } from "./routes/searchlog.js";
 import { runBootstrap } from "./lib/bootstrap.js";
 import { ensureSchema, logServerError, systemRouter } from "./lib/system.js";
-import { dispatchManagerVoucherAlerts, dispatchWhatsappQueue, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
+import { dispatchManagerVoucherAlerts, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
 
@@ -153,9 +153,7 @@ setTimeout(() => {
 }, 3000);
 
 const pushTimer = setInterval(() => { dispatchPushQueue().catch((e) => console.error("[push]", e.message)); }, 8_000);
-const whatsappTimer = setInterval(() => {
-  dispatchWhatsappQueue().catch((e) => console.error("[WhatsApp]", e.message));
-}, 30_000);
+// الواتساب ملغي: لا يوجد طابور إرسال
 
 const voucherAlertTimer = setInterval(() => {
   dispatchManagerVoucherAlerts().catch((e) => console.error("[VoucherAlerts]", e.message));
@@ -181,7 +179,6 @@ process.on("unhandledRejection", (err) => { console.error("[unhandledRejection]"
 process.on("uncaughtException", (err) => { console.error("[uncaughtException]", err); logServerError({ err, status: 500 }); });
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
-    clearInterval(whatsappTimer);
     clearInterval(pushTimer);
     clearInterval(voucherAlertTimer);
     clearInterval(remindersTimer);

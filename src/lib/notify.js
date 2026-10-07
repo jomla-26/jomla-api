@@ -21,7 +21,7 @@ export async function queueNotification(client, {
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
     [templateCode, recipientType, recipientId, tpl.title,
      render(tpl.body_template, vars), orderId, sectionId,
-     tpl.send_whatsapp && whatsapp ? "queued" : null]
+     null /* الواتساب ملغي: إشعارات داخل التطبيق فقط */]
   );
 }
 

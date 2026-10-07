@@ -86,6 +86,9 @@ const STEPS = [
 const ONCE = [
   ["whatsapp_trim_v1", `UPDATE notification_templates SET send_whatsapp = FALSE
      WHERE code IN ('delivery.scheduled','order.ready','invoice.issued','message.received','feedback.resolved','product.restocked','stock.new_arrival')`],
+  // قرار المؤسس: إلغاء الواتساب نهائيًا، كل الإشعارات داخل التطبيق فقط
+  ["whatsapp_off_v1", `UPDATE notification_templates SET send_whatsapp = FALSE`],
+  ["whatsapp_off_v1_queue", `UPDATE notifications SET whatsapp_status = NULL WHERE whatsapp_status IN ('queued','sending')`],
 ];
 
 export async function ensureSchema() {
