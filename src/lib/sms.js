@@ -2,6 +2,9 @@
 // المتغيرات المطلوبة:
 //   twilio : TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM  (رقم أو اسم مرسل)
 //   infobip: INFOBIP_BASE_URL (مثل xxxx.api.infobip.com), INFOBIP_API_KEY, INFOBIP_FROM
+// مفتاح أمان: الإرسال الفعلي مقفول افتراضيًا (يوفر الرصيد أثناء التجربة). يُفتح بإضافة SMS_ENABLED=1 في Railway.
+export const smsEnabled = () => process.env.SMS_ENABLED === "1";
+
 export function smsConfigured() {
   const p = process.env.SMS_PROVIDER;
   if (p === "twilio") return Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM);
@@ -18,6 +21,7 @@ export function toInternational(rawPhone) {
 }
 
 export async function sendSms(phone, text) {
+  if (!smsEnabled()) throw new Error("SMS مقفول (SMS_ENABLED غير مفعّل)");
   const to = toInternational(phone);
   const provider = process.env.SMS_PROVIDER;
   if (provider === "twilio") {

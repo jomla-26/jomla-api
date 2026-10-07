@@ -1,4 +1,4 @@
-import { smsConfigured, sendSms } from "../lib/sms.js";
+import { smsConfigured, smsEnabled, sendSms } from "../lib/sms.js";
 import crypto from "node:crypto";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
@@ -139,6 +139,10 @@ authRouter.post("/otp/request", ...otpRequestLimiters, asyncRoute(async (req, re
   }
 
   const fixedTestOtp = testOtpFor(normalized);
+  // أثناء التجربة الإرسال مقفول: ما يتولد رمز ولا يتصرف رصيد ولا تنبعت رسالة (أرقام التجربة بالكود الثابت مستثناة)
+  if (!fixedTestOtp && !smsEnabled()) {
+    throw new ApiError(403, "الدخول برمز SMS متوقف حاليًا — اطلب من الإدارة رمز دخول", "SMS_OFF");
+  }
   const otp = fixedTestOtp ?? generateOtp();
   const hash = await hashOtp(otp);
   // رمز جديد = عدّاد محاولات جديد
