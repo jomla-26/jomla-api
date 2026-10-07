@@ -234,28 +234,40 @@ export async function dispatchWhatsappQueue() {
 const managerPhone = () => process.env.WHATSAPP_MANAGER_PHONE || "0913363363";
 const partnerPhone = () => process.env.WHATSAPP_PARTNER_PHONE || "0910911991";
 
-// (مُبقى للتوافق مع routes/agent.js) رسالة مباشرة لرقم المدير — لا تُستخدم لأي شيء جديد
-export async function notifyManager(message) {
-  try {
-    await sendWhatsapp(managerPhone(), message);
-  } catch (err) {
-    console.error("[إشعار المدير]", err.message);
-  }
+// الإدارة العليا (المدير العام وشريكه): الموظفون ذوو الجلسة المفتوحة، أو اللي رقمهم هو رقم المدير/الشريك.
+// قرار المؤسس (واتساب انحظر): التقارير والإيصالات توصل داخل التطبيق كإشعارات (+ إشعار الجهاز Push) بدل واتساب.
+async function managementRecipientIds() {
+  const { rows } = await query(
+    `SELECT id FROM employees WHERE is_active AND (long_session OR phone = ANY($1::TEXT[]))`,
+    [[managerPhone(), partnerPhone()].filter(Boolean)]
+  );
+  return rows.map((r) => r.id);
 }
 
-// يرجّع عدد الأرقام اللي وصلتها الرسالة فعلًا
-async function notifyReportRecipients(message) {
-  const phones = [...new Set([managerPhone(), partnerPhone()].filter(Boolean))];
-  let sent = 0;
-  for (const phone of phones) {
-    try {
-      await sendWhatsapp(phone, message);
-      sent++;
-    } catch (err) {
-      console.error("[تقرير]", phone, err.message);
-    }
+// يرسل إشعارًا داخل التطبيق لكل الإدارة العليا. السطر الأول من النص = العنوان، والباقي = المحتوى.
+// يرجّع عدد المستلمين.
+export async function notifyManagementInApp(message) {
+  const [title, ...rest] = String(message).split("\n");
+  const body = rest.join("\n").trim() || title;
+  const ids = await managementRecipientIds();
+  for (const id of ids) {
+    await createInAppNotification({ query: (...a) => query(...a) }, {
+      recipientType: "employee", recipientId: id, title: title.slice(0, 150), body,
+    });
   }
-  return sent;
+  return ids.length;
+}
+
+// (مُبقى للتوافق مع routes/agent.js)
+export async function notifyManager(message) {
+  try { await notifyManagementInApp(message); }
+  catch (err) { console.error("[إشعار المدير]", err.message); }
+}
+
+// يرجّع عدد المستلمين اللي وصلهم التقرير فعلًا
+async function notifyReportRecipients(message) {
+  try { return await notifyManagementInApp(message); }
+  catch (err) { console.error("[تقرير]", err.message); return 0; }
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +551,7 @@ export async function dispatchManagerVoucherAlerts() {
         SELECT id FROM vouchers
          WHERE approval_status = 'approved'
            AND NOT (manager_notified AND partner_notified)
+           AND created_at > now() - interval '2 days'
            AND (voucher_alert_claimed_at IS NULL OR voucher_alert_claimed_at < now() - interval '2 minutes')
          ORDER BY created_at
          LIMIT 20
@@ -562,10 +575,6 @@ export async function dispatchManagerVoucherAlerts() {
 
   const partyLabel = { customer: "عميل", supplier: "مورد", driver: "مندوب", employee: "موظف", other: "طرف آخر" };
   const methodLabel = { cash: "نقدًا", transfer: "حوالة", card: "بطاقة" };
-  const mPhone = managerPhone();
-  const pPhone = partnerPhone();
-  const samePhone = mPhone === pPhone;
-
   for (const v of rows) {
     const isReceipt = v.voucher_type === "receipt";
     const msg =
@@ -575,27 +584,11 @@ export async function dispatchManagerVoucherAlerts() {
       (v.order_number ? `الطلبية: ${v.order_number}\n` : "") +
       (v.off_treasury ? "الحركة: نقدًا خارج الخزينة (مباشرة مع المندوب/المورد)" : `الخزينة: ${v.treasury_name}`) +
       (v.note ? `\nملاحظة: ${v.note}` : "");
-
-    let managerOk = v.manager_notified;
-    let partnerOk = v.partner_notified;
-
-    if (!managerOk) {
-      try {
-        await sendWhatsapp(mPhone, msg);
-        managerOk = true;
-        await query(`UPDATE vouchers SET manager_notified = TRUE WHERE id = $1`, [v.id]);
-      } catch (err) { console.error("[إيصال - المدير]", v.voucher_number, err.message); }
-    }
-    if (!partnerOk) {
-      if (samePhone) {
-        // نفس الرقم للمدير والشريك: ما نبعتش مرتين
-        partnerOk = managerOk;
-      } else {
-        try { await sendWhatsapp(pPhone, msg); partnerOk = true; }
-        catch (err) { console.error("[إيصال - الشريك]", v.voucher_number, err.message); }
-      }
-      if (partnerOk) await query(`UPDATE vouchers SET partner_notified = TRUE WHERE id = $1`, [v.id]);
-    }
+    try {
+      // إشعار داخل التطبيق (+Push) للمدير وشريكه؛ مرة واحدة لكل سند
+      const n = await notifyManagementInApp(msg);
+      if (n > 0) await query(`UPDATE vouchers SET manager_notified = TRUE, partner_notified = TRUE WHERE id = $1`, [v.id]);
+    } catch (err) { console.error("[إيصال]", v.voucher_number, err.message); }
   }
   return rows.length;
 }
