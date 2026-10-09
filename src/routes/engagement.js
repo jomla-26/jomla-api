@@ -23,6 +23,7 @@ function assertEmployeeOrdersAccess(req) {
 // orderSupplierId من عدمه — بدل ما كل شي كان يسقط على محادثة العميل افتراضيًا
 function resolveThreadType(actor, orderSupplierId) {
   if (actor.type === "supplier") return "supplier_admin";
+  if (actor.type === "employee" && actor.role === "driver") return "customer_support";
   if (actor.type === "employee" && orderSupplierId) return "supplier_admin";
   return "customer_support";
 }
@@ -37,6 +38,13 @@ async function assertThreadAccess(req, orderId, threadType, orderSupplierId) {
   const { rows: ord } = await query(`SELECT id, customer_id, order_number FROM orders WHERE id = $1`, [orderId]);
   if (!ord.length) throw new ApiError(404, "الطلبية غير موجودة");
   const deny = () => new ApiError(403, "لا تملك صلاحية الاطلاع على هذه المحادثة");
+
+  // المندوب: يدردش مع العميل فقط، وفقط على طلبياته المسندة إليه
+  if (actor.type === "employee" && actor.role === "driver") {
+    const { rows: d } = await query(`SELECT driver_id FROM orders WHERE id = $1`, [orderId]);
+    if (threadType !== "customer_support" || d[0]?.driver_id !== actor.id) throw deny();
+    return { orderSupplierId: null, order: ord[0] };
+  }
 
   if (actor.type === "employee") {
     await assertEmployeeOrdersAccess(req);
@@ -123,6 +131,17 @@ engagementRouter.post("/orders/:orderId/messages", asyncRoute(async (req, res) =
         orderId: req.params.orderId,
         vars: { order_number: order.order_number, sender: req.actor.name || (req.actor.type === "supplier" ? "مورد" : "عميل") },
       });
+      // لو العميل رد → ينبَّه المندوب المسند للطلبية أيضًا
+      if (req.actor.type === "customer") {
+        const dr = await query(`SELECT driver_id FROM orders WHERE id = $1`, [req.params.orderId]);
+        if (dr.rows[0]?.driver_id) {
+          await queueNotification(pool, {
+            templateCode: "message.staff_received", recipientType: "employee",
+            recipientId: dr.rows[0].driver_id, orderId: req.params.orderId,
+            vars: { order_number: order.order_number, sender: req.actor.name || "عميل" },
+          });
+        }
+      }
     }
   } catch (e) {
     console.error("[CHAT_NOTIFY]", e);
