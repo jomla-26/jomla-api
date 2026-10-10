@@ -605,6 +605,8 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
       if (discrepancyC !== 0) {
         noteParts.push(`فرق ${discrepancyC > 0 ? "زيادة" : "نقص"} قدره ${fmt(Math.abs(discrepancyC))} د.ل عن المحسوب (${fmt(expectedC)} د.ل)`);
       }
+      // مصدر الفلوس: الطلبيات اللي اتسوّت في هذا الإيصال (رقم الطلبية والمبلغ)
+      const ordersLine = "الطلبيات: " + pending.map((o) => `${o.order_number} (${fmt(toCents(o.cod_amount))} د.ل)`).join("، ");
       const { rows: [v] } = await client.query(
         `INSERT INTO vouchers
            (voucher_number, voucher_type, party_type, party_id, party_name,
@@ -612,7 +614,7 @@ financeRouter.post("/drivers/:id/settle", requirePermission("finance.vouchers"),
          VALUES ($1,'receipt','driver',$2,$3,$4,'cash',$5,'approved',$6,now(),$7,$6)
          RETURNING *`,
         [vNumber, req.params.id, drv.name ?? "مندوب", fromCents(declaredC), tr[0].id, req.actor.id,
-         noteParts.join(" — ")]
+         noteParts.join(" — ") + "\n" + ordersLine]
       );
       voucher = v;
     }
