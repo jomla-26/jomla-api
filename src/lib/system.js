@@ -158,6 +158,10 @@ export async function ensureSchema() {
   try {
     await pool.query(`INSERT INTO permissions (code, description) VALUES ('accounts.issue_code','إصدار رمز دخول مؤقت لحساب نسي كلمة مروره') ON CONFLICT (code) DO NOTHING`);
   } catch (e) { console.error("[schema-perm3]", e.message); }
+  // صلاحية تصدير كشف الأصناف إلى Excel: المدير العام تلقائيًا (يتزامن تحت)، وتنعطى لغيره من شاشة الصلاحيات
+  try {
+    await pool.query(`INSERT INTO permissions (code, description) VALUES ('inventory.export','تصدير كشف الأصناف والمخزون إلى Excel') ON CONFLICT (code) DO NOTHING`);
+  } catch (e) { console.error("[schema-perm4]", e.message); }
   // جلسة مفتوحة (بدون انتهاء 12 ساعة) للمدير العام وشريكه
   try {
     await pool.query(
