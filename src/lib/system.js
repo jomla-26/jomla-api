@@ -10,6 +10,17 @@ import { notifyStaffInApp } from "./notify.js";
  * ------------------------------------------------------------------ */
 const STEPS = [
   // سجل ترحيلات "مرة واحدة"
+  `ALTER TABLE products ADD COLUMN IF NOT EXISTS low_level SMALLINT NOT NULL DEFAULT 0`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS low_level SMALLINT NOT NULL DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS driver_locations (
+     driver_id  UUID PRIMARY KEY REFERENCES employees(id) ON DELETE CASCADE,
+     lat        DOUBLE PRECISION NOT NULL,
+     lng        DOUBLE PRECISION NOT NULL,
+     accuracy   REAL,
+     speed      REAL,
+     heading    REAL,
+     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
   `CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
   // دخول بكلمة المرور: أعمدة على الجداول الثلاثة (كلمة مشفّرة، عدّاد محاولات، قفل مؤقت، رمز دخول مؤقت، رمز استرجاع، نسخة جلسة)
   ...["customers", "suppliers", "employees"].flatMap((t) => [

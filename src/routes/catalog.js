@@ -6,6 +6,7 @@ import { searchTokens, sqlNorm } from "../lib/searchTokens.js";
 import { parseRange, addRange, andClause } from "../lib/dateRange.js";
 import { authenticate, requirePermission, requireAnyPermission, requireActorType, assertCustomerSection } from "../middleware/auth.js";
 import { notifyFavoriteRestock, queueNotification } from "../lib/notify.js";
+import { STOCK_ITEMS_SQL, LOW_STOCK_LIMIT } from "../lib/lowstock.js";
 
 export const catalogRouter = Router();
 catalogRouter.use(authenticate);
@@ -241,6 +242,25 @@ catalogRouter.patch("/sections/:id", requirePermission("accounts.sections"), asy
   });
 
   res.json(result);
+}));
+
+// شاشة النواقص: الأصناف/الأنواع اللي كميتها أقل من الحد (أو نفدت). المورد يشوف أصنافه فقط، والإدارة (صلاحية الأصناف أو التقارير) تشوف الكل.
+catalogRouter.get("/low-stock", asyncRoute(async (req, res) => {
+  let supplierId = null;
+  if (req.actor.type === "supplier") supplierId = req.actor.id;
+  else if (req.actor.type === "employee") {
+    await new Promise((resolve, reject) => requireAnyPermission("catalog.manage", "reports.view")(req, null, (e) => (e ? reject(e) : resolve())));
+    supplierId = req.query.supplierId || null;
+  } else throw new ApiError(403, "غير مسموح");
+  const { rows } = await query(
+    `SELECT x.kind, x.item_id, x.product_id, x.supplier_id, s.business_name AS supplier_name,
+            x.name, x.label, x.unit, x.stock_qty, x.sku
+       FROM (${STOCK_ITEMS_SQL}) AS x JOIN suppliers s ON s.id = x.supplier_id
+      WHERE x.stock_qty < $1 AND ($2::uuid IS NULL OR x.supplier_id = $2)
+      ORDER BY x.stock_qty ASC, x.name`,
+    [LOW_STOCK_LIMIT, supplierId]
+  );
+  res.json({ limit: LOW_STOCK_LIMIT, items: rows });
 }));
 
 catalogRouter.get("/products", asyncRoute(async (req, res) => {

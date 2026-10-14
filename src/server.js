@@ -27,6 +27,8 @@ import { cartRouter } from "./routes/carts.js";
 import { searchLogRouter } from "./routes/searchlog.js";
 import { runBootstrap } from "./lib/bootstrap.js";
 import { ensureSchema, logServerError, systemRouter } from "./lib/system.js";
+import { trackingRouter } from "./routes/tracking.js";
+import { runLowStockAlerts } from "./lib/lowstock.js";
 import { dispatchManagerVoucherAlerts, runCreditDueReminders, maybeSendDailyProfitReport, maybeSendMonthlyProfitReport } from "./lib/notify.js";
 
 const app = express();
@@ -77,6 +79,7 @@ app.use("/api/finance", financeRouter);
 app.use("/api/employees", employeeRouter);
 app.use("/api/accounts", accountsRouter);
 app.use("/api/delivery", deliveryRouter);
+app.use("/api/tracking", trackingRouter);
 app.use("/api/push", pushRouter);
 app.use("/api/engagement", engagementRouter);
 app.use("/api/support", supportRouter);
@@ -159,6 +162,11 @@ const voucherAlertTimer = setInterval(() => {
   dispatchManagerVoucherAlerts().catch((e) => console.error("[VoucherAlerts]", e.message));
 }, 30_000);
 
+// نواقص المخزون: كل دقيقتين نفحص الأصناف تحت الحد وننبّه المورد مرة وحدة لكل تدهور
+const lowStockTimer = setInterval(() => {
+  runLowStockAlerts().catch((e) => console.error("[LowStock]", e.message));
+}, 2 * 60 * 1000);
+
 const remindersTimer = setInterval(() => {
   runCreditDueReminders().catch((e) => console.error("[Reminders]", e.message));
 }, 6 * 60 * 60 * 1000);
@@ -181,6 +189,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     clearInterval(pushTimer);
     clearInterval(voucherAlertTimer);
+    clearInterval(lowStockTimer);
     clearInterval(remindersTimer);
     clearInterval(dailyReportTimer);
     clearInterval(monthlyReportTimer);
