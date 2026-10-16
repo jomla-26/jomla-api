@@ -1,0 +1,28 @@
+name: Build Android APKs
+on:
+  workflow_dispatch:
+  push:
+    paths: ["android/**", ".github/workflows/android-apk.yml"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { app: customer, url: "https://jomla-ly.com",          name: "جملة",          id: "ly.jomla.customer" }
+          - { app: supplier, url: "https://supplier.jomla-ly.com", name: "جملة — مورد",   id: "ly.jomla.supplier" }
+          - { app: driver,   url: "https://driver.jomla-ly.com",   name: "جملة — مندوب",  id: "ly.jomla.driver" }
+          - { app: admin,    url: "https://admin.jomla-ly.com",    name: "جملة — إدارة",  id: "ly.jomla.admin" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: android-actions/setup-android@v3
+      - run: bash android/build.sh "${{ matrix.app }}" "${{ matrix.url }}" "${{ matrix.name }}" "${{ matrix.id }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jomla-${{ matrix.app }}-apk
+          path: android/out/jomla-${{ matrix.app }}.apk
